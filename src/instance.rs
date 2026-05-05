@@ -191,6 +191,7 @@ fn handle_client(
                         &bpm,
                         &lock_manager,
                         &wal,
+                        &tm,
                         &catalog,
                         &mut tx,
                         &instance,
@@ -227,6 +228,7 @@ fn run_query(
     bpm: &BufferPool,
     lm: &LockManager,
     wal: &WalManager,
+    tm: &TransactionManager,
     catalog: &Catalog,
     tx: &mut Transaction,
     instance: &InstanceHandle,
@@ -237,7 +239,7 @@ fn run_query(
     match &analyzed {
         AnalyzedStatement::Select(s) => {
             let columns: Vec<ColumnDesc> = s.select_items.iter().map(column_desc_for).collect();
-            let out = execute(bpm, lm, wal, catalog, &analyzed, tx)?;
+            let out = execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             let rows = match out {
                 Output::Rows(r) => r,
                 other => bail!("SELECT yielded non-Rows output: {other:?}"),
@@ -250,27 +252,27 @@ fn run_query(
             conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
         }
         AnalyzedStatement::Insert(_) => {
-            let n = expect_affected(execute(bpm, lm, wal, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("INSERT 0 {n}"))?;
         }
         AnalyzedStatement::Delete(_) => {
-            let n = expect_affected(execute(bpm, lm, wal, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("DELETE {n}"))?;
         }
         AnalyzedStatement::Update(_) => {
-            let n = expect_affected(execute(bpm, lm, wal, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("UPDATE {n}"))?;
         }
         AnalyzedStatement::Begin => {
-            execute(bpm, lm, wal, catalog, &analyzed, tx)?;
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("BEGIN")?;
         }
         AnalyzedStatement::Commit => {
-            execute(bpm, lm, wal, catalog, &analyzed, tx)?;
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("COMMIT")?;
         }
         AnalyzedStatement::Rollback => {
-            execute(bpm, lm, wal, catalog, &analyzed, tx)?;
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("ROLLBACK")?;
         }
         AnalyzedStatement::Checkpoint => {

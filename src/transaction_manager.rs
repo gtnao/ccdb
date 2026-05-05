@@ -6,16 +6,43 @@
 //! the ATT so recovery's analysis phase can start from a known good
 //! state instead of scanning from the beginning of the WAL.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::tuple::TxnId;
 use crate::wal::Lsn;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TxnStatus {
+    InProgress,
+    Committed,
+    Aborted,
+}
+
+/// Snapshot of the database state as of a transaction's start, used by
+/// MVCC visibility to honour Snapshot Isolation.
+#[derive(Debug, Clone)]
+pub struct Snapshot {
+    /// The owning transaction's id.
+    pub txn_id: TxnId,
+    /// Highest txn_id that the snapshot considers "future" — anything >=
+    /// xmax was started after our snapshot.
+    pub xmax: TxnId,
+    /// Transactions that were in progress when the snapshot was taken.
+    /// Their writes (xmin) and deletes (xmax) are *not* visible.
+    pub active: HashSet<TxnId>,
+}
 
 #[derive(Debug)]
 pub struct TransactionManager {
     next_txn_id: AtomicU64,
+    /// Active Transaction Table: txn_id → last_lsn.
     att: Mutex<HashMap<u64, Lsn>>,
+    /// Status of finished transactions. `InProgress` is the implicit default
+    /// for any txn_id not in this map. Day15 swaps this for a persistent
+    /// CLOG.
+    status: Mutex<HashMap<TxnId, TxnStatus>>,
 }
 
 impl TransactionManager {
@@ -23,10 +50,10 @@ impl TransactionManager {
         Self {
             next_txn_id: AtomicU64::new(1),
             att: Mutex::new(HashMap::new()),
+            status: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Allocate a fresh txn_id and add it to the ATT with last_lsn=0.
     pub fn begin(&self) -> u64 {
         let id = self.next_txn_id.fetch_add(1, Ordering::SeqCst);
         self.att.lock().unwrap().insert(id, 0);
@@ -41,20 +68,67 @@ impl TransactionManager {
 
     pub fn commit(&self, txn_id: u64) {
         self.att.lock().unwrap().remove(&txn_id);
+        // First decision wins — once a txn is recorded as Committed or
+        // Aborted, later calls (e.g. a stale refresh_autocommit() after a
+        // ROLLBACK) must not flip it.
+        self.status
+            .lock()
+            .unwrap()
+            .entry(txn_id)
+            .or_insert(TxnStatus::Committed);
     }
 
     pub fn abort(&self, txn_id: u64) {
         self.att.lock().unwrap().remove(&txn_id);
+        self.status
+            .lock()
+            .unwrap()
+            .entry(txn_id)
+            .or_insert(TxnStatus::Aborted);
     }
 
-    /// Snapshot of the ATT for inclusion in a Checkpoint record.
     pub fn att_snapshot(&self) -> HashMap<u64, Lsn> {
         self.att.lock().unwrap().clone()
     }
 
-    /// Used by recovery to advance the counter past txn_ids already on disk.
     pub fn set_next_txn_id(&self, id: u64) {
         self.next_txn_id.store(id, Ordering::SeqCst);
+    }
+
+    /// Take a visibility snapshot. Captures every txn currently in the ATT
+    /// (i.e. in-progress) and the xmax frontier.
+    pub fn snapshot(&self, txn_id: TxnId) -> Snapshot {
+        let att = self.att.lock().unwrap();
+        let active: HashSet<TxnId> = att.keys().copied().collect();
+        let xmax = self.next_txn_id.load(Ordering::SeqCst);
+        Snapshot {
+            txn_id,
+            xmax,
+            active,
+        }
+    }
+
+    /// Look up a transaction's persisted commit/abort status. Defaults to
+    /// `Aborted` for unknown txn_ids — recovery treats unfinished txns as
+    /// aborted, and live in-progress txns are filtered earlier via the
+    /// snapshot's `active` set.
+    pub fn status(&self, txn_id: TxnId) -> TxnStatus {
+        match self.status.lock().unwrap().get(&txn_id).copied() {
+            Some(s) => s,
+            None => {
+                // If still in ATT it's in progress; otherwise default Aborted.
+                if self.att.lock().unwrap().contains_key(&txn_id) {
+                    TxnStatus::InProgress
+                } else {
+                    TxnStatus::Aborted
+                }
+            }
+        }
+    }
+
+    /// Recovery uses this to seed status for txns observed in the WAL.
+    pub fn record_status(&self, txn_id: TxnId, status: TxnStatus) {
+        self.status.lock().unwrap().insert(txn_id, status);
     }
 }
 

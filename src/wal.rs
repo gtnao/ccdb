@@ -31,9 +31,11 @@ pub enum WalRecordType {
         rid: Rid,
         data: Vec<u8>,
     },
+    /// MVCC logical delete: only the xmax field of the slot's tuple is
+    /// updated; the original bytes stay on the page.
     Delete {
         rid: Rid,
-        data: Vec<u8>,
+        xmax: u64,
     },
     /// Compensation Log Record. Written during undo (normal rollback or
     /// recovery's undo phase) so that a crash mid-undo is recoverable.
@@ -55,7 +57,8 @@ pub enum WalRecordType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ClrRedo {
     UndoInsert { rid: Rid },
-    UndoDelete { rid: Rid, data: Vec<u8> },
+    /// MVCC undo of a Delete: reset xmax back to its prior value.
+    UndoDelete { rid: Rid, old_xmax: u64 },
 }
 
 const TAG_BEGIN: u8 = 0;
@@ -97,12 +100,12 @@ impl WalRecord {
                 buf.extend_from_slice(&slot.to_le_bytes());
                 buf.extend_from_slice(data);
             }
-            WalRecordType::Delete { rid, data } => {
+            WalRecordType::Delete { rid, xmax } => {
                 buf.push(TAG_DELETE);
                 let (pid, slot) = *rid;
                 buf.extend_from_slice(&pid.to_le_bytes());
                 buf.extend_from_slice(&slot.to_le_bytes());
-                buf.extend_from_slice(data);
+                buf.extend_from_slice(&xmax.to_le_bytes());
             }
             WalRecordType::Clr { undo_next_lsn, redo } => {
                 buf.push(TAG_CLR);
@@ -114,12 +117,12 @@ impl WalRecord {
                         buf.extend_from_slice(&pid.to_le_bytes());
                         buf.extend_from_slice(&slot.to_le_bytes());
                     }
-                    ClrRedo::UndoDelete { rid, data } => {
+                    ClrRedo::UndoDelete { rid, old_xmax } => {
                         buf.push(CLR_UNDO_DELETE);
                         let (pid, slot) = *rid;
                         buf.extend_from_slice(&pid.to_le_bytes());
                         buf.extend_from_slice(&slot.to_le_bytes());
-                        buf.extend_from_slice(data);
+                        buf.extend_from_slice(&old_xmax.to_le_bytes());
                     }
                 }
             }
@@ -153,23 +156,28 @@ impl WalRecord {
             TAG_BEGIN => WalRecordType::Begin,
             TAG_COMMIT => WalRecordType::Commit,
             TAG_ABORT => WalRecordType::Abort,
-            TAG_INSERT | TAG_DELETE => {
+            TAG_INSERT => {
                 if rest.len() < 6 {
-                    bail!("Insert/Delete record missing rid bytes");
+                    bail!("Insert record missing rid bytes");
                 }
                 let pid = u32::from_le_bytes(rest[0..4].try_into().unwrap());
                 let slot = u16::from_le_bytes(rest[4..6].try_into().unwrap());
                 let data = rest[6..].to_vec();
-                if tag == TAG_INSERT {
-                    WalRecordType::Insert {
-                        rid: (pid, slot),
-                        data,
-                    }
-                } else {
-                    WalRecordType::Delete {
-                        rid: (pid, slot),
-                        data,
-                    }
+                WalRecordType::Insert {
+                    rid: (pid, slot),
+                    data,
+                }
+            }
+            TAG_DELETE => {
+                if rest.len() < 14 {
+                    bail!("Delete record missing rid+xmax bytes");
+                }
+                let pid = u32::from_le_bytes(rest[0..4].try_into().unwrap());
+                let slot = u16::from_le_bytes(rest[4..6].try_into().unwrap());
+                let xmax = u64::from_le_bytes(rest[6..14].try_into().unwrap());
+                WalRecordType::Delete {
+                    rid: (pid, slot),
+                    xmax,
                 }
             }
             TAG_CLR => {
@@ -189,15 +197,15 @@ impl WalRecord {
                         ClrRedo::UndoInsert { rid: (pid, slot) }
                     }
                     CLR_UNDO_DELETE => {
-                        if redo_rest.len() < 6 {
-                            bail!("CLR UndoDelete missing rid");
+                        if redo_rest.len() < 14 {
+                            bail!("CLR UndoDelete missing rid+old_xmax");
                         }
                         let pid = u32::from_le_bytes(redo_rest[0..4].try_into().unwrap());
                         let slot = u16::from_le_bytes(redo_rest[4..6].try_into().unwrap());
-                        let data = redo_rest[6..].to_vec();
+                        let old_xmax = u64::from_le_bytes(redo_rest[6..14].try_into().unwrap());
                         ClrRedo::UndoDelete {
                             rid: (pid, slot),
-                            data,
+                            old_xmax,
                         }
                     }
                     other => bail!("unknown CLR redo tag: {other}"),

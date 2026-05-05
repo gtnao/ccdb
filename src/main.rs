@@ -19,6 +19,7 @@ mod recovery;
 mod transaction;
 mod transaction_manager;
 mod tuple;
+mod visibility;
 mod wal;
 
 use anyhow::Result;

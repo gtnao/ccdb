@@ -150,6 +150,25 @@ impl Page {
         Ok(())
     }
 
+    /// Update the `xmax` field of an MVCC tuple in place. Used by logical
+    /// DELETE / UPDATE — the row's bytes stay on the page, only the MVCC
+    /// header changes so visibility checks know who deleted it.
+    pub fn set_tuple_xmax(&mut self, slot_id: SlotId, xmax: u64) -> Result<()> {
+        if slot_id >= self.tuple_count() {
+            bail!("slot {slot_id} out of range");
+        }
+        let (offset, length) = self.read_slot(slot_id);
+        if length == 0 {
+            bail!("slot {slot_id} is tombstoned (legacy delete)");
+        }
+        if (length as usize) < 16 {
+            bail!("slot {slot_id} too short for MVCC header");
+        }
+        let xmax_off = offset as usize + 8;
+        self.data[xmax_off..xmax_off + 8].copy_from_slice(&xmax.to_le_bytes());
+        Ok(())
+    }
+
     /// Reverse of `delete`: revives a tombstoned slot by writing the saved
     /// bytes back at the original offset and restoring the slot length.
     /// Relies on the invariant that `delete` does not reclaim space, so the

@@ -11,7 +11,7 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use crate::page::Rid;
-use crate::transaction_manager::TransactionManager;
+use crate::transaction_manager::{Snapshot, TransactionManager};
 use crate::wal::Lsn;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,11 +46,15 @@ pub struct Transaction {
     held_locks: HashSet<Rid>,
     last_lsn: Lsn,
     tm: Arc<TransactionManager>,
+    /// Snapshot taken at BEGIN (or at every auto-commit boundary). MVCC
+    /// reads filter visibility against this.
+    snapshot: Option<Snapshot>,
 }
 
 impl Transaction {
     pub fn new(tm: Arc<TransactionManager>) -> Self {
         let id = tm.begin();
+        let snapshot = tm.snapshot(id);
         Self {
             state: TxState::Inactive,
             id,
@@ -58,7 +62,16 @@ impl Transaction {
             held_locks: HashSet::new(),
             last_lsn: 0,
             tm,
+            snapshot: Some(snapshot),
         }
+    }
+
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.snapshot.as_ref()
+    }
+
+    pub fn tm(&self) -> &Arc<TransactionManager> {
+        &self.tm
     }
 
     pub fn id(&self) -> u64 {
@@ -86,6 +99,7 @@ impl Transaction {
         self.log.clear();
         self.held_locks.clear();
         self.last_lsn = 0;
+        self.snapshot = Some(self.tm.snapshot(self.id));
     }
 
     pub fn commit(&mut self) {
@@ -93,18 +107,19 @@ impl Transaction {
         self.state = TxState::Inactive;
         self.last_lsn = 0;
         self.tm.commit(self.id);
+        self.snapshot = None;
     }
 
     /// Start a fresh auto-commit boundary. No-op while explicit BEGIN is in
     /// effect.
     pub fn refresh_autocommit(&mut self) {
         if !self.is_active() {
-            // Close the previous auto-commit's ATT entry.
             self.tm.commit(self.id);
             self.id = self.tm.begin();
             self.log.clear();
             self.held_locks.clear();
             self.last_lsn = 0;
+            self.snapshot = Some(self.tm.snapshot(self.id));
         }
     }
 
@@ -125,6 +140,7 @@ impl Transaction {
         self.state = TxState::Inactive;
         self.last_lsn = 0;
         self.tm.abort(self.id);
+        self.snapshot = None;
     }
 
     pub fn take_held_locks(&mut self) -> HashSet<Rid> {

@@ -1,5 +1,12 @@
 use anyhow::{Result, bail};
 
+/// Transaction id used in MVCC tuple headers (xmin/xmax).
+pub type TxnId = u64;
+/// Sentinel meaning "no deletion yet" in `xmax`.
+pub const INVALID_TXN_ID: TxnId = 0;
+/// Bytes occupied by the per-tuple MVCC header: xmin (8) + xmax (8).
+pub const MVCC_HEADER_SIZE: usize = 16;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Int,
@@ -111,6 +118,35 @@ pub fn deserialize_tuple(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
         offset += len;
     }
     Ok(values)
+}
+
+// -- MVCC tuple format -------------------------------------------------------
+//
+// On-disk layout: `[xmin: u64][xmax: u64][bitmap][values...]`. xmin is the
+// txn that created the row; xmax is the txn that deleted it (0 = not
+// deleted). Visibility check (in `visibility.rs`) interprets these against
+// a snapshot.
+
+pub fn serialize_tuple_mvcc(xmin: TxnId, xmax: TxnId, values: &[Value]) -> Vec<u8> {
+    let payload = serialize_tuple(values);
+    let mut buf = Vec::with_capacity(MVCC_HEADER_SIZE + payload.len());
+    buf.extend_from_slice(&xmin.to_le_bytes());
+    buf.extend_from_slice(&xmax.to_le_bytes());
+    buf.extend_from_slice(&payload);
+    buf
+}
+
+pub fn deserialize_tuple_mvcc(
+    data: &[u8],
+    schema: &Schema,
+) -> Result<(TxnId, TxnId, Vec<Value>)> {
+    if data.len() < MVCC_HEADER_SIZE {
+        bail!("tuple truncated: missing MVCC header");
+    }
+    let xmin = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let xmax = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let values = deserialize_tuple(&data[MVCC_HEADER_SIZE..], schema)?;
+    Ok((xmin, xmax, values))
 }
 
 #[cfg(test)]
