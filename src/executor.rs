@@ -2162,6 +2162,80 @@ fn coerce_for_storage(v: Value, target: DataType) -> Result<Value> {
 /// Visit all *visible* rows of a table under the given snapshot, returning
 /// (rid, values) pairs for predicate evaluation. Tuples invisible to the
 /// snapshot (uncommitted others, future-tx, already-deleted) are skipped.
+/// Visible rows that match a WHERE predicate. Picks an index-driven path
+/// when the predicate has an `indexed_col = lit` or BETWEEN shape; falls
+/// back to a full heap scan otherwise. Used by UPDATE/DELETE so they don't
+/// scan the whole table on every statement when an equality predicate on
+/// an indexed column is available.
+fn matching_rows(
+    bpm: &BufferPool,
+    catalog: &Catalog,
+    table_id: usize,
+    where_clause: &Option<AnalyzedExpr>,
+    snapshot: &Snapshot,
+    tm: &TransactionManager,
+) -> Result<(Schema, Vec<(PageId, SlotId, Vec<Value>)>)> {
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table id {table_id} not in catalog"))?;
+    let schema = table.to_schema();
+
+    if let Some((idx, range, key_type)) = find_indexable_predicate(where_clause, table_id, catalog)?
+    {
+        let mut out = Vec::new();
+        let start_key = match &range {
+            IndexRange::Eq { key } => key.clone(),
+            IndexRange::Between { low, .. } => low.clone(),
+        };
+        let mut cursor = crate::btree::first_ge(bpm, idx.root_page_id, &start_key, key_type)?;
+        while let Some(c) = cursor {
+            let (key, rid, next) = crate::btree::read_at(bpm, c)?;
+            cursor = next;
+            // Stop once we've stepped past the upper bound.
+            let past = match &range {
+                IndexRange::Eq { key: target } => {
+                    crate::btree::compare_keys(&key, target, key_type)? != std::cmp::Ordering::Equal
+                }
+                IndexRange::Between { high, .. } => {
+                    crate::btree::compare_keys(&key, high, key_type)? == std::cmp::Ordering::Greater
+                }
+            };
+            if past {
+                break;
+            }
+            let g = bpm.fetch_page(rid.0)?;
+            let p = g.read();
+            let Some(raw) = p.get_tuple(rid.1) else {
+                continue;
+            };
+            let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &schema)?;
+            if !visibility::is_visible(xmin, xmax, snapshot, tm) {
+                continue;
+            }
+            // Re-check the full predicate: stale index entries, AND-clauses
+            // beyond the indexable one, etc.
+            let t = Tuple::new(values.clone());
+            if !matches(where_clause.as_ref(), &t)? {
+                continue;
+            }
+            out.push((rid.0, rid.1, values));
+        }
+        return Ok((schema, out));
+    }
+
+    // No usable index — full scan, applying the predicate row-by-row so
+    // the contract stays "returned rows already passed WHERE."
+    let (schema, all) = visible_rows(bpm, catalog, table_id, snapshot, tm)?;
+    let mut out = Vec::with_capacity(all.len());
+    for (pid, slot, values) in all {
+        let t = Tuple::new(values.clone());
+        if matches(where_clause.as_ref(), &t)? {
+            out.push((pid, slot, values));
+        }
+    }
+    Ok((schema, out))
+}
+
 fn visible_rows(
     bpm: &BufferPool,
     catalog: &Catalog,
@@ -2217,14 +2291,13 @@ fn perform_delete(
         .snapshot()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
-    let (_schema, rows) = visible_rows(bpm, catalog, stmt.table_id, &snapshot, tm)?;
-    let mut victims: Vec<(Rid, Vec<Value>)> = Vec::new();
-    for (pid, slot, values) in rows {
-        let t = Tuple::new(values);
-        if matches(stmt.where_clause.as_ref(), &t)? {
-            victims.push(((pid, slot), t.values));
-        }
-    }
+    let (_schema, rows) = matching_rows(
+        bpm, catalog, stmt.table_id, &stmt.where_clause, &snapshot, tm,
+    )?;
+    let victims: Vec<(Rid, Vec<Value>)> = rows
+        .into_iter()
+        .map(|(pid, slot, values)| ((pid, slot), values))
+        .collect();
     for ((pid, slot), values) in &victims {
         lm.lock(tx.id(), (*pid, *slot), LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (*pid, *slot)))?;
@@ -2264,7 +2337,9 @@ fn perform_update(
         .snapshot()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
-    let (_schema, rows) = visible_rows(bpm, catalog, stmt.table_id, &snapshot, tm)?;
+    let (_schema, rows) = matching_rows(
+        bpm, catalog, stmt.table_id, &stmt.where_clause, &snapshot, tm,
+    )?;
     let table = catalog
         .table_by_id(stmt.table_id)?
         .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
@@ -2272,9 +2347,6 @@ fn perform_update(
 
     for (pid, slot, values) in rows {
         let t = Tuple::new(values);
-        if !matches(stmt.where_clause.as_ref(), &t)? {
-            continue;
-        }
         let old_values = t.values.clone();
         let mut new_values = t.values.clone();
         for a in &stmt.assignments {
