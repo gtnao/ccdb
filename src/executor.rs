@@ -12,8 +12,8 @@ use crate::analyzer::{
     AnalyzedCreateSequenceStatement, AnalyzedDeleteStatement, AnalyzedDropIndexStatement,
     AnalyzedDropSequenceStatement, AnalyzedDropTableStatement, AnalyzedExpr, AnalyzedFrom,
     AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedOrderBy, AnalyzedSelectStatement,
-    AnalyzedStatement, AnalyzedTruncateStatement, AnalyzedUpdateStatement, LiteralValue,
-    SequenceFnKind, TableSource,
+    AnalyzedStatement, AnalyzedTruncateStatement, AnalyzedUpdateStatement, AnalyzedVacuumStatement,
+    LiteralValue, SequenceFnKind, TableSource,
 };
 use crate::ast::{BinaryOperator, JoinType, OrderDir, UnaryOperator};
 use crate::buffer_pool::BufferPool;
@@ -21,9 +21,9 @@ use crate::catalog::Catalog;
 use crate::lock_manager::{LockManager, LockMode};
 use crate::page::{PageId, Rid, SlotId};
 use crate::transaction::Transaction;
-use crate::transaction_manager::{Snapshot, TransactionManager};
+use crate::transaction_manager::{Snapshot, TransactionManager, TxnStatus};
 use crate::tuple::{
-    DataType, INVALID_TXN_ID, Schema, Value, deserialize_tuple_mvcc, serialize_tuple_mvcc,
+    DataType, INVALID_TXN_ID, Schema, TxnId, Value, deserialize_tuple_mvcc, serialize_tuple_mvcc,
 };
 use crate::visibility;
 use crate::wal::{Lsn, WalManager, WalRecordType};
@@ -1556,12 +1556,18 @@ fn perform_create_sequence(
     }
     let new_seq_id = max_id + 1;
 
-    // Allocate the sequence relation page.
+    // Allocate the sequence relation page. Flush right away so the
+    // SequenceRel page_kind is on disk — recovery has no WAL record that
+    // would re-tag a Heap page as SequenceRel.
     let seq_page_id = {
         let g = bpm.new_page()?;
         let pid = g.page_id();
-        let mut p = g.write();
-        crate::sequence::init_sequence_page(&mut p);
+        {
+            let mut p = g.write();
+            crate::sequence::init_sequence_page(&mut p);
+        }
+        drop(g);
+        bpm.flush_page(pid)?;
         pid
     };
 
@@ -1699,6 +1705,132 @@ fn perform_truncate(
         }
     }
     Ok(stmt.tables.len())
+}
+
+/// `VACUUM [tables]` — physically reclaim space from tuples that no live txn
+/// can possibly see. Two pieces of work per heap page:
+///   1. tombstone every dead tuple's slot (length=0) and `vacuum_compact()`
+///      the page so the byte range is reusable.
+///   2. for each index on the table, remove the (key, rid) entry pointing at
+///      each reclaimed heap slot.
+///
+/// "Dead" means: the creating txn aborted, or the deleting txn committed
+/// before the oldest currently-active txn started. We don't log per-page
+/// vacuum records — instead we stamp every modified page's `page_lsn` with
+/// a fresh marker LSN so recovery's redo skips earlier WAL records that
+/// would otherwise try to set xmax on now-tombstoned slots.
+fn perform_vacuum(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    stmt: &AnalyzedVacuumStatement,
+    tx: &mut Transaction,
+) -> Result<()> {
+    let oldest_xmin = tm.oldest_active_xmin();
+
+    // Marker LSN to stamp every page we vacuum. Bracketed by Begin/Commit
+    // so recovery's analyze pass sees a clean closed transaction (no DML
+    // records, so it ends up classified as committed-no-op).
+    let stamp_lsn = log_record(wal, tx, WalRecordType::Begin)?;
+
+    for (table_id, _name) in &stmt.tables {
+        let table = catalog
+            .table_by_id(*table_id)?
+            .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", table_id))?;
+        let schema = table.to_schema();
+        let indexes = catalog.indexes_for_table(*table_id)?;
+        let index_meta: Vec<(PageId, usize, DataType)> = indexes
+            .iter()
+            .map(|i| {
+                let dt = table.columns[i.column_index].data_type;
+                (i.root_page_id, i.column_index, dt)
+            })
+            .collect();
+
+        let mut cur = table.first_page_id;
+        while cur != crate::page::NO_NEXT_PAGE && cur < bpm.page_count() {
+            let g = bpm.fetch_page(cur)?;
+            let next;
+            let mut dead: Vec<(SlotId, Vec<Value>)> = Vec::new();
+            {
+                let p = g.read();
+                next = p.next_page_id();
+                if !matches!(p.page_kind(), crate::page::PageKind::Heap) {
+                    drop(p);
+                    drop(g);
+                    cur = next;
+                    continue;
+                }
+                let tc = p.tuple_count();
+                for slot in 0..tc {
+                    let raw = match p.get_tuple(slot) {
+                        Some(r) => r,
+                        None => continue,
+                    };
+                    let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &schema)?;
+                    if is_tuple_dead(xmin, xmax, oldest_xmin, tm) {
+                        dead.push((slot, values));
+                    }
+                }
+            }
+            if !dead.is_empty() {
+                let mut p = g.write();
+                for (slot, _) in &dead {
+                    p.delete(*slot)?;
+                }
+                p.vacuum_compact();
+                if p.page_lsn() < stamp_lsn {
+                    p.set_page_lsn(stamp_lsn);
+                }
+            }
+            drop(g);
+
+            // Index cleanup: drop (key, rid) entries for every reclaimed heap
+            // tuple. Done after releasing the heap page guard so the btree
+            // can take its own latches without deadlock.
+            for (root, col_idx, dt) in &index_meta {
+                for (slot, values) in &dead {
+                    let key_value = &values[*col_idx];
+                    if matches!(key_value, Value::Null) {
+                        // NULL keys are not indexed (matches CREATE INDEX).
+                        continue;
+                    }
+                    let key = crate::btree::encode_key(key_value);
+                    let _ = crate::btree::delete(bpm, *root, &key, (cur, *slot), *dt)?;
+                }
+            }
+            cur = next;
+        }
+    }
+
+    log_record(wal, tx, WalRecordType::Commit)?;
+    wal.flush()?;
+    Ok(())
+}
+
+/// A tuple is dead — physically reclaimable — when no live or future txn
+/// could see it. Two cases:
+///   - xmin aborted: never committed, so already invisible to everyone.
+///   - xmax committed AND xmax < oldest_active_xmin: every active txn
+///     started after the delete committed, so they all see the row as
+///     deleted; the pre-image is unreachable.
+fn is_tuple_dead(
+    xmin: TxnId,
+    xmax: TxnId,
+    oldest_xmin: TxnId,
+    tm: &TransactionManager,
+) -> bool {
+    if matches!(tm.status(xmin), TxnStatus::Aborted) {
+        return true;
+    }
+    if xmax != INVALID_TXN_ID
+        && xmax < oldest_xmin
+        && matches!(tm.status(xmax), TxnStatus::Committed)
+    {
+        return true;
+    }
+    false
 }
 
 /// Walk a catalog page chain; for every visible row whose values satisfy
@@ -2366,6 +2498,14 @@ pub fn execute(
         }
         AnalyzedStatement::DropSequence(s) => {
             perform_drop_sequence(bpm, wal, s, tx)?;
+            Ok(Output::Affected(0))
+        }
+        AnalyzedStatement::Vacuum(s) => {
+            perform_vacuum(bpm, wal, tm, catalog, s, tx)?;
+            Ok(Output::Affected(0))
+        }
+        AnalyzedStatement::AnalyzeNoop => {
+            // Phase 9 will collect real statistics; for now it's parse-and-accept.
             Ok(Output::Affected(0))
         }
         AnalyzedStatement::Checkpoint => {

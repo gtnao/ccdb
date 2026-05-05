@@ -41,6 +41,8 @@ impl Parser {
             Some(Token::Drop) => self.parse_drop()?,
             Some(Token::Truncate) => self.parse_truncate()?,
             Some(Token::Alter) => self.parse_alter()?,
+            Some(Token::Vacuum) => self.parse_vacuum()?,
+            Some(Token::Analyze) => self.parse_analyze()?,
             Some(Token::Begin) => {
                 self.bump();
                 Statement::Begin
@@ -483,6 +485,55 @@ impl Parser {
             }
             other => bail!("expected TABLE / INDEX / SEQUENCE after DROP, got {other:?}"),
         }
+    }
+
+    /// `VACUUM [(option [, ...])] [ANALYZE] [table_list]` —
+    /// option list (FULL, FREEZE, VERBOSE, …) is parse-and-ignored.
+    fn parse_vacuum(&mut self) -> Result<Statement> {
+        self.expect(&Token::Vacuum)?;
+        // Optional `( opt [, opt] )` block — eat until matching ).
+        if matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            let mut depth = 1;
+            while depth > 0 {
+                match self.peek() {
+                    Some(Token::LParen) => depth += 1,
+                    Some(Token::RParen) => depth -= 1,
+                    None => bail!("unterminated VACUUM ( ... )"),
+                    _ => {}
+                }
+                self.bump();
+            }
+        }
+        let analyze = if matches!(self.peek(), Some(Token::Analyze)) {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        let mut tables = Vec::new();
+        if matches!(self.peek(), Some(Token::Ident(_))) {
+            tables.push(self.parse_ident()?);
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                tables.push(self.parse_ident()?);
+            }
+        }
+        Ok(Statement::Vacuum(VacuumStatement { tables, analyze }))
+    }
+
+    /// `ANALYZE [table_list]`.
+    fn parse_analyze(&mut self) -> Result<Statement> {
+        self.expect(&Token::Analyze)?;
+        let mut tables = Vec::new();
+        if matches!(self.peek(), Some(Token::Ident(_))) {
+            tables.push(self.parse_ident()?);
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                tables.push(self.parse_ident()?);
+            }
+        }
+        Ok(Statement::Analyze(AnalyzeStatement { tables }))
     }
 
     /// `TRUNCATE [TABLE] name [, name, ...]`.

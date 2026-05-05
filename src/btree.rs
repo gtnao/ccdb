@@ -757,7 +757,10 @@ pub fn delete(
 // ---- bootstrap helpers ----------------------------------------------------
 
 /// Allocate a fresh empty leaf and return its page id. Used by CREATE INDEX
-/// before any rows exist.
+/// before any rows exist. Force-flushes so the BTreeLeaf page_kind is on disk
+/// before any crash — there is no WAL record that would let recovery
+/// reconstruct the page kind otherwise, and a crash with the on-disk image
+/// tagged as Heap would make subsequent btree::insert fail with "non-btree page".
 pub fn new_empty_root(bpm: &BufferPool) -> Result<PageId> {
     let g = bpm.new_page()?;
     let pid = g.page_id();
@@ -765,6 +768,8 @@ pub fn new_empty_root(bpm: &BufferPool) -> Result<PageId> {
         let mut p = g.write();
         init_leaf(&mut p);
     }
+    drop(g);
+    bpm.flush_page(pid)?;
     Ok(pid)
 }
 

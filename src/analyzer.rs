@@ -14,11 +14,11 @@ use std::mem;
 use anyhow::{Result, bail};
 
 use crate::ast::{
-    self, AlterTableAction, AlterTableStatement, BinaryOperator, CreateIndexStatement,
-    CreateSequenceStatement, CreateTableStatement, DeleteStatement, DropIndexStatement,
-    DropSequenceStatement, DropTableStatement, Expr, FromClause, FuncArgs, InsertStatement,
-    JoinType, Literal, OrderDir, SelectColumn, SelectStatement, Statement, TableRef,
-    TruncateStatement, UnaryOperator, UpdateStatement,
+    self, AlterTableAction, AlterTableStatement, AnalyzeStatement, BinaryOperator,
+    CreateIndexStatement, CreateSequenceStatement, CreateTableStatement, DeleteStatement,
+    DropIndexStatement, DropSequenceStatement, DropTableStatement, Expr, FromClause, FuncArgs,
+    InsertStatement, JoinType, Literal, OrderDir, SelectColumn, SelectStatement, Statement,
+    TableRef, TruncateStatement, UnaryOperator, UpdateStatement, VacuumStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -62,6 +62,10 @@ pub enum AnalyzedStatement {
     AlterTableAddIndex(AnalyzedCreateIndexStatement),
     CreateSequence(AnalyzedCreateSequenceStatement),
     DropSequence(AnalyzedDropSequenceStatement),
+    Vacuum(AnalyzedVacuumStatement),
+    /// ANALYZE on its own — parse it, no-op execute (real stats arrive
+    /// in Phase 9).
+    AnalyzeNoop,
     Begin,
     Commit,
     Rollback,
@@ -250,6 +254,12 @@ pub struct AnalyzedCreateSequenceStatement {
 #[derive(Debug, Clone)]
 pub struct AnalyzedDropSequenceStatement {
     pub seqs: Vec<(usize, String, crate::page::PageId)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedVacuumStatement {
+    /// Resolved (table_id, name). Empty source means "all user tables".
+    pub tables: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -1040,6 +1050,34 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_vacuum(&self, s: &VacuumStatement) -> Result<AnalyzedVacuumStatement> {
+        let mut tables = Vec::new();
+        if s.tables.is_empty() {
+            // `VACUUM` (no list) → every user table.
+            for t in self.catalog.user_tables()? {
+                tables.push((t.table_id, t.name));
+            }
+        } else {
+            for name in &s.tables {
+                let (id, _) = self
+                    .catalog
+                    .find_table(name)?
+                    .ok_or_else(|| anyhow::anyhow!("table '{name}' not found"))?;
+                tables.push((id, name.clone()));
+            }
+        }
+        Ok(AnalyzedVacuumStatement { tables })
+    }
+
+    fn analyze_analyze_noop(&self, s: &AnalyzeStatement) -> Result<()> {
+        for name in &s.tables {
+            if self.catalog.find_table(name)?.is_none() {
+                bail!("table '{name}' not found");
+            }
+        }
+        Ok(())
+    }
+
     fn analyze_drop_sequence(
         &self,
         s: &DropSequenceStatement,
@@ -1593,6 +1631,11 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
         }
         Statement::DropSequence(s) => {
             AnalyzedStatement::DropSequence(a.analyze_drop_sequence(s)?)
+        }
+        Statement::Vacuum(s) => AnalyzedStatement::Vacuum(a.analyze_vacuum(s)?),
+        Statement::Analyze(s) => {
+            a.analyze_analyze_noop(s)?;
+            AnalyzedStatement::AnalyzeNoop
         }
         Statement::Begin => AnalyzedStatement::Begin,
         Statement::Commit => AnalyzedStatement::Commit,

@@ -139,6 +139,19 @@ impl TransactionManager {
     pub fn record_status(&self, txn_id: TxnId, status: TxnStatus) {
         let _ = self.clog.set(txn_id, status);
     }
+
+    /// Smallest txn_id of any in-progress transaction. Used by VACUUM as
+    /// the cutoff: a tuple whose `xmax` is committed and `< oldest_xmin`
+    /// can no longer be seen by anyone, so it's safe to physically reclaim.
+    /// When no transactions are active, returns `next_txn_id` (everything
+    /// is in the past).
+    pub fn oldest_active_xmin(&self) -> TxnId {
+        let att = self.att.lock().unwrap();
+        att.keys()
+            .copied()
+            .min()
+            .unwrap_or_else(|| self.next_txn_id.load(Ordering::SeqCst))
+    }
 }
 
 

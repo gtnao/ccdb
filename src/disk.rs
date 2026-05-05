@@ -4,7 +4,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-use crate::page::{PAGE_SIZE, PageId};
+use crate::page::{PAGE_SIZE, Page, PageId};
 
 pub struct DiskManager {
     file: std::fs::File,
@@ -47,8 +47,14 @@ impl DiskManager {
     pub fn allocate_page(&mut self) -> Result<PageId> {
         let new_id = self.page_count;
         self.page_count += 1;
-        let blank = [0u8; PAGE_SIZE];
-        self.write_page(new_id, &blank)?;
+        // Write a properly-initialised empty page rather than zeros. Zeros decode
+        // as `free_space_offset = 0` (so the page looks "full" the moment it's
+        // read back) and `next_page_id = 0` (which falsely points at page 0).
+        // This matters on restart: if the buffer pool hasn't re-touched the
+        // page since it was allocated, recovery's `fetch_page` reads what's on
+        // disk verbatim — so the on-disk image must already be a valid empty
+        // page.
+        self.write_page(new_id, Page::new(new_id).as_bytes())?;
         Ok(new_id)
     }
 }

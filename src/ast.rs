@@ -14,6 +14,8 @@ pub enum Statement {
     AlterTable(AlterTableStatement),
     CreateSequence(CreateSequenceStatement),
     DropSequence(DropSequenceStatement),
+    Vacuum(VacuumStatement),
+    Analyze(AnalyzeStatement),
     Begin,
     Commit,
     Rollback,
@@ -165,6 +167,20 @@ pub struct CreateSequenceStatement {
 pub struct DropSequenceStatement {
     pub names: Vec<String>,
     pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VacuumStatement {
+    /// Empty = vacuum every user table. Otherwise just the listed ones.
+    pub tables: Vec<String>,
+    /// VACUUM ANALYZE — at the moment ANALYZE is a no-op until Phase 9
+    /// adds real statistics collection. We still parse and accept it.
+    pub analyze: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AnalyzeStatement {
+    pub tables: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

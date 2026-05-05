@@ -489,6 +489,14 @@ fn run_query_with_options(
             execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("DROP SEQUENCE")?;
         }
+        AnalyzedStatement::Vacuum(_) => {
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("VACUUM")?;
+        }
+        AnalyzedStatement::AnalyzeNoop => {
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("ANALYZE")?;
+        }
     }
     Ok(())
 }

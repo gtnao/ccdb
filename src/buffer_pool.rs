@@ -136,6 +136,16 @@ impl BufferPool {
         self.inner.lock().unwrap().flush_all_locked()
     }
 
+    /// Flush a single page synchronously. Used when the page's *structural*
+    /// state (page_kind, etc.) must be on disk before a crash, because there
+    /// is no WAL record that would let recovery rebuild it. The B+Tree leaf
+    /// allocation is the current case: `init_leaf` only mutates the in-memory
+    /// page, so without this, a crash before eviction leaves the on-disk
+    /// page tagged as Heap.
+    pub fn flush_page(&self, page_id: PageId) -> Result<()> {
+        self.inner.lock().unwrap().flush_page_locked(page_id)
+    }
+
     fn release(&self, page_id: PageId, mutated: bool) {
         let mut inner = self.inner.lock().unwrap();
         inner.release_locked(page_id, mutated);
@@ -241,6 +251,23 @@ impl Inner {
                 self.replacer.unpin(fid);
             }
         }
+    }
+
+    fn flush_page_locked(&mut self, page_id: PageId) -> Result<()> {
+        let Some(&fid) = self.page_table.get(&page_id) else {
+            return Ok(()); // not resident — disk image is already authoritative
+        };
+        let f = &mut self.frames[fid];
+        if !f.dirty {
+            return Ok(());
+        }
+        let pg = f.page.read().unwrap();
+        self.wal.flush_to(pg.page_lsn())?;
+        self.disk.write_page(page_id, pg.as_bytes())?;
+        drop(pg);
+        f.dirty = false;
+        self.dpt.remove(&page_id);
+        Ok(())
     }
 
     fn flush_all_locked(&mut self) -> Result<()> {

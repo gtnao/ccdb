@@ -224,6 +224,40 @@ impl Page {
         Ok(())
     }
 
+    /// Compact the data area in place. Tombstoned slots (length=0) keep
+    /// their slot id but free up their byte range; live slots get repacked
+    /// against the back of the page. Slot ids are preserved so external
+    /// references (RIDs, index entries) stay valid.
+    ///
+    /// Used by VACUUM after dead tuples are tombstoned. Idempotent.
+    pub fn vacuum_compact(&mut self) {
+        let n = self.tuple_count();
+        // Snapshot every live tuple's bytes in slot order.
+        let mut live: Vec<(SlotId, Vec<u8>)> = Vec::new();
+        for slot in 0..n {
+            let (off, len) = self.read_slot(slot);
+            if len == 0 {
+                continue;
+            }
+            let bytes = self.data[off as usize..(off + len) as usize].to_vec();
+            live.push((slot, bytes));
+        }
+        // Reset the data area to "all free" and rewrite each live tuple
+        // from the back, just like fresh inserts. Tombstoned slots keep
+        // their (offset=0, length=0) entries.
+        let mut free_off = PAGE_SIZE as u16;
+        for slot in 0..n {
+            self.write_slot(slot, 0, 0);
+        }
+        for (slot, bytes) in &live {
+            let len = bytes.len() as u16;
+            free_off -= len;
+            self.data[free_off as usize..(free_off + len) as usize].copy_from_slice(bytes);
+            self.write_slot(*slot, free_off, len);
+        }
+        self.set_free_space_offset(free_off);
+    }
+
     /// Reverse of `delete`: revives a tombstoned slot by writing the saved
     /// bytes back at the original offset and restoring the slot length.
     /// Relies on the invariant that `delete` does not reclaim space, so the
