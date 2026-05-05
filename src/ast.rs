@@ -7,6 +7,9 @@ pub enum Statement {
     Delete(DeleteStatement),
     Update(UpdateStatement),
     CreateTable(CreateTableStatement),
+    /// `CREATE INDEX ...` — accepted to keep sysbench happy; index is not
+    /// actually built. Replaced with real DDL when indexes land.
+    CreateIndexNoop,
     Begin,
     Commit,
     Rollback,
@@ -94,7 +97,8 @@ pub enum SelectColumn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
     pub table: String,
-    pub values: Vec<Expr>,
+    /// One Vec<Expr> per row. Multi-row form: VALUES (...), (...), ... .
+    pub rows: Vec<Vec<Expr>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

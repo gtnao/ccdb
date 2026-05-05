@@ -937,30 +937,33 @@ fn perform_insert(
     stmt: &AnalyzedInsertStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
-    let raw: Vec<Value> = stmt
-        .values
-        .iter()
-        .map(|e| match e {
-            AnalyzedExpr::Literal(lit) => Ok(literal_to_value(lit)),
-            _ => bail!("INSERT VALUES must be literals (no exprs yet)"),
-        })
-        .collect::<Result<_>>()?;
     let table = catalog
         .table_by_id(stmt.table_id)?
         .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
-    // Coerce values to the column's storage type. The analyzer accepts INT
-    // values for DOUBLE columns; the storage layer needs the exact width.
-    let values: Vec<Value> = raw
-        .into_iter()
-        .zip(table.columns.iter())
-        .map(|(v, c)| coerce_for_storage(v, c.data_type))
-        .collect::<Result<_>>()?;
-    let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &values);
-    let (rid, _lsn) = insert_bytes(bpm, wal, tx, table.first_page_id, &bytes)?;
-    lm.lock(tx.id(), rid, LockMode::Exclusive)
-        .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
-    tx.add_lock(rid);
-    Ok(1)
+    let mut count = 0;
+    for row in &stmt.rows {
+        let raw: Vec<Value> = row
+            .iter()
+            .map(|e| match e {
+                AnalyzedExpr::Literal(lit) => Ok(literal_to_value(lit)),
+                _ => bail!("INSERT VALUES must be literals (no exprs yet)"),
+            })
+            .collect::<Result<_>>()?;
+        // Coerce values to the column's storage type. The analyzer accepts INT
+        // values for DOUBLE columns; the storage layer needs the exact width.
+        let values: Vec<Value> = raw
+            .into_iter()
+            .zip(table.columns.iter())
+            .map(|(v, c)| coerce_for_storage(v, c.data_type))
+            .collect::<Result<_>>()?;
+        let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &values);
+        let (rid, _lsn) = insert_bytes(bpm, wal, tx, table.first_page_id, &bytes)?;
+        lm.lock(tx.id(), rid, LockMode::Exclusive)
+            .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
+        tx.add_lock(rid);
+        count += 1;
+    }
+    Ok(count)
 }
 
 /// Coerce an evaluated value into the column's declared storage type.
@@ -1296,6 +1299,8 @@ pub fn execute(
             perform_create_table(bpm, wal, catalog, s, tx)?;
             Ok(Output::Affected(0))
         }
+        // Accepted-but-unimplemented CREATE INDEX. Real index DDL lands later.
+        AnalyzedStatement::CreateIndexNoop => Ok(Output::Affected(0)),
         AnalyzedStatement::Checkpoint => {
             // Handled at the connection layer (instance.rs) — has access to
             // the global ATT and DPT, which the executor doesn't.

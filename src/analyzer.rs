@@ -53,6 +53,8 @@ pub enum AnalyzedStatement {
     Delete(AnalyzedDeleteStatement),
     Update(AnalyzedUpdateStatement),
     CreateTable(AnalyzedCreateTableStatement),
+    /// Accepted-but-unimplemented `CREATE INDEX`; executor returns Affected(0).
+    CreateIndexNoop,
     Begin,
     Commit,
     Rollback,
@@ -188,7 +190,8 @@ pub struct AnalyzedSelectItem {
 pub struct AnalyzedInsertStatement {
     pub table_id: usize,
     pub table_name: String,
-    pub values: Vec<AnalyzedExpr>,
+    /// One Vec<AnalyzedExpr> per row.
+    pub rows: Vec<Vec<AnalyzedExpr>>,
 }
 
 #[derive(Debug, Clone)]
@@ -728,39 +731,43 @@ impl<'a> Analyzer<'a> {
             .catalog
             .find_table(&s.table)?
             .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
-        if s.values.len() != table.columns.len() {
-            bail!(
-                "INSERT has {} values but table has {} columns",
-                s.values.len(),
-                table.columns.len()
-            );
-        }
 
-        let mut values = Vec::with_capacity(s.values.len());
-        for (i, v) in s.values.iter().enumerate() {
-            let expr = self.analyze_expr(v)?;
-            let col = &table.columns[i];
-            match expr.data_type() {
-                None => {
-                    if !col.nullable {
-                        bail!("column '{}' is not nullable", col.name);
-                    }
-                }
-                Some(t) if assignable(t, col.data_type) => {}
-                Some(t) => bail!(
-                    "type mismatch for column '{}': expected {:?}, got {:?}",
-                    col.name,
-                    col.data_type,
-                    t
-                ),
+        let mut analyzed_rows = Vec::with_capacity(s.rows.len());
+        for row in &s.rows {
+            if row.len() != table.columns.len() {
+                bail!(
+                    "INSERT has {} values but table has {} columns",
+                    row.len(),
+                    table.columns.len()
+                );
             }
-            values.push(expr);
+            let mut values = Vec::with_capacity(row.len());
+            for (i, v) in row.iter().enumerate() {
+                let expr = self.analyze_expr(v)?;
+                let col = &table.columns[i];
+                match expr.data_type() {
+                    None => {
+                        if !col.nullable {
+                            bail!("column '{}' is not nullable", col.name);
+                        }
+                    }
+                    Some(t) if assignable(t, col.data_type) => {}
+                    Some(t) => bail!(
+                        "type mismatch for column '{}': expected {:?}, got {:?}",
+                        col.name,
+                        col.data_type,
+                        t
+                    ),
+                }
+                values.push(expr);
+            }
+            analyzed_rows.push(values);
         }
 
         Ok(AnalyzedInsertStatement {
             table_id,
             table_name: s.table.clone(),
-            values,
+            rows: analyzed_rows,
         })
     }
 
@@ -1131,6 +1138,7 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
         Statement::Delete(s) => AnalyzedStatement::Delete(a.analyze_delete(s)?),
         Statement::Update(s) => AnalyzedStatement::Update(a.analyze_update(s)?),
         Statement::CreateTable(s) => AnalyzedStatement::CreateTable(a.analyze_create_table(s)?),
+        Statement::CreateIndexNoop => AnalyzedStatement::CreateIndexNoop,
         Statement::Begin => AnalyzedStatement::Begin,
         Statement::Commit => AnalyzedStatement::Commit,
         Statement::Rollback => AnalyzedStatement::Rollback,

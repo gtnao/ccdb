@@ -40,6 +40,12 @@ pub enum Token {
     Desc,
     Limit,
     Is,
+    Default,
+    Char,
+    Primary,
+    Key,
+    Index,
+    Between,
 
     // Identifiers and literals
     Ident(String),
@@ -256,6 +262,12 @@ impl Lexer {
             "DESC" => Token::Desc,
             "LIMIT" => Token::Limit,
             "IS" => Token::Is,
+            "DEFAULT" => Token::Default,
+            "CHAR" => Token::Char,
+            "PRIMARY" => Token::Primary,
+            "KEY" => Token::Key,
+            "INDEX" => Token::Index,
+            "BETWEEN" => Token::Between,
             _ => Token::Ident(s),
         }
     }

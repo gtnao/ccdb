@@ -208,6 +208,16 @@ fn handle_client(
 
     let mut tx = Transaction::new(Arc::clone(&tm));
 
+    // Extended-protocol scratchpad. Statements/portals are scoped to the
+    // session and survive across Sync boundaries.
+    let mut statements: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut portals: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    // Tracks whether the current extended-protocol message group has hit
+    // an error — once set, we skip everything until Sync (per spec).
+    let mut extended_error = false;
+
     let result = (|| -> Result<()> {
         loop {
             match conn.read_message()? {
@@ -235,6 +245,123 @@ fn handle_client(
                         conn.send_error(&e.to_string())?;
                     }
                     conn.send_ready_for_query()?;
+                }
+                Some(FrontendMessage::Parse {
+                    name,
+                    query,
+                    param_types: _,
+                }) => {
+                    if extended_error {
+                        continue;
+                    }
+                    statements.insert(name, query);
+                    conn.send_parse_complete()?;
+                }
+                Some(FrontendMessage::Bind {
+                    portal,
+                    statement,
+                    param_formats: _,
+                    params,
+                    result_formats: _,
+                }) => {
+                    if extended_error {
+                        continue;
+                    }
+                    let template = match statements.get(&statement) {
+                        Some(s) => s.clone(),
+                        None => {
+                            extended_error = true;
+                            conn.send_error(&format!(
+                                "prepared statement '{statement}' not found"
+                            ))?;
+                            continue;
+                        }
+                    };
+                    let bound = substitute_params(&template, &params);
+                    portals.insert(portal, bound);
+                    conn.send_bind_complete()?;
+                }
+                Some(FrontendMessage::Describe { kind, name }) => {
+                    if extended_error {
+                        continue;
+                    }
+                    // For a statement (S) the spec also asks us to send
+                    // ParameterDescription first. For a portal (P) we
+                    // skip directly to row info.
+                    if kind == b'S' {
+                        let pcount = statements
+                            .get(&name)
+                            .map(|s| count_placeholders(s))
+                            .unwrap_or(0);
+                        conn.send_parameter_description(pcount)?;
+                    }
+                    let sql = match kind {
+                        b'P' => portals.get(&name).cloned(),
+                        _ => statements.get(&name).cloned(),
+                    };
+                    let sql = sql.unwrap_or_default();
+                    // For Describe-statement we don't yet know parameter
+                    // values; analyzer would fail on placeholders. Send
+                    // NoData and let the client figure it out from
+                    // RowDescription that arrives after Bind+Describe-portal.
+                    if kind == b'S' || sql.is_empty() {
+                        conn.send_no_data()?;
+                    } else {
+                        match describe_columns(&sql, &catalog) {
+                            Ok(Some(cols)) => conn.send_row_description(&cols)?,
+                            Ok(None) => conn.send_no_data()?,
+                            Err(e) => {
+                                extended_error = true;
+                                conn.send_error(&e.to_string())?;
+                            }
+                        }
+                    }
+                }
+                Some(FrontendMessage::Execute { portal, max_rows: _ }) => {
+                    if extended_error {
+                        continue;
+                    }
+                    let sql = match portals.get(&portal) {
+                        Some(s) => s.clone(),
+                        None => {
+                            extended_error = true;
+                            conn.send_error(&format!(
+                                "portal '{portal}' not found"
+                            ))?;
+                            continue;
+                        }
+                    };
+                    if let Err(e) = run_query_with_options(
+                        &sql,
+                        &mut conn,
+                        &bpm,
+                        &lock_manager,
+                        &wal,
+                        &tm,
+                        &catalog,
+                        &mut tx,
+                        &instance,
+                        false, // RowDescription was sent at Describe-portal time.
+                    ) {
+                        eprintln!("execute error: {e}");
+                        extended_error = true;
+                        conn.send_error(&e.to_string())?;
+                    }
+                }
+                Some(FrontendMessage::Close { kind, name }) => {
+                    if kind == b'S' {
+                        statements.remove(&name);
+                    } else {
+                        portals.remove(&name);
+                    }
+                    conn.send_close_complete()?;
+                }
+                Some(FrontendMessage::Sync) => {
+                    extended_error = false;
+                    conn.send_ready_for_query()?;
+                }
+                Some(FrontendMessage::Flush) => {
+                    // We already flush after every send.
                 }
             }
         }
@@ -268,6 +395,24 @@ fn run_query(
     tx: &mut Transaction,
     instance: &InstanceHandle,
 ) -> Result<()> {
+    run_query_with_options(sql, conn, bpm, lm, wal, tm, catalog, tx, instance, true)
+}
+
+/// `send_row_description` controls whether to emit `T` before data rows.
+/// Simple-Q always wants it; extended-protocol Execute wants it suppressed
+/// because the client already received it from the prior Describe.
+fn run_query_with_options(
+    sql: &str,
+    conn: &mut Connection<TcpStream>,
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    tx: &mut Transaction,
+    instance: &InstanceHandle,
+    send_row_description: bool,
+) -> Result<()> {
     let stmt = parse(sql)?;
     let analyzed = analyze(catalog, &stmt)?;
 
@@ -279,7 +424,9 @@ fn run_query(
                 Output::Rows(r) => r,
                 other => bail!("SELECT yielded non-Rows output: {other:?}"),
             };
-            conn.send_row_description(&columns)?;
+            if send_row_description {
+                conn.send_row_description(&columns)?;
+            }
             for row in &rows {
                 let vals: Vec<Option<String>> = row.values.iter().map(value_to_text).collect();
                 conn.send_data_row(&vals)?;
@@ -318,6 +465,10 @@ fn run_query(
             execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("CREATE TABLE")?;
         }
+        AnalyzedStatement::CreateIndexNoop => {
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("CREATE INDEX")?;
+        }
     }
     Ok(())
 }
@@ -327,6 +478,128 @@ fn expect_affected(out: Output) -> Result<usize> {
         Output::Affected(n) => Ok(n),
         other => bail!("expected affected-row count, got {other:?}"),
     }
+}
+
+/// Replace `$N` placeholders in `sql` with the textual form of the
+/// corresponding `params` entry. Numeric values are inlined raw; everything
+/// else is wrapped in single quotes (with `'` doubled). NULL params become
+/// the SQL keyword `NULL`. Skips placeholders that occur inside quoted
+/// string literals.
+fn substitute_params(sql: &str, params: &[Option<Vec<u8>>]) -> String {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut out = String::with_capacity(sql.len());
+    let mut i = 0;
+    let mut in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            // Inside '...' — only single-quote toggles state, with '' escape.
+            out.push(c);
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    out.push(chars[i + 1]);
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            in_string = true;
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            let n: usize = chars[i + 1..j].iter().collect::<String>().parse().unwrap_or(0);
+            if n >= 1 && n <= params.len() {
+                out.push_str(&format_param(&params[n - 1]));
+            } else {
+                out.push_str("NULL");
+            }
+            i = j;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+fn format_param(p: &Option<Vec<u8>>) -> String {
+    match p {
+        None => "NULL".to_string(),
+        Some(bytes) => {
+            let s = std::str::from_utf8(bytes).unwrap_or("");
+            // Numeric pattern → inline raw. Everything else gets quoted.
+            if !s.is_empty() && s.parse::<f64>().is_ok() {
+                s.to_string()
+            } else {
+                let escaped = s.replace('\'', "''");
+                format!("'{escaped}'")
+            }
+        }
+    }
+}
+
+/// Count `$N` placeholders in a SQL string (skipping those inside string
+/// literals). Used for ParameterDescription.
+fn count_placeholders(sql: &str) -> usize {
+    let chars: Vec<char> = sql.chars().collect();
+    let mut max_n = 0;
+    let mut i = 0;
+    let mut in_string = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if in_string {
+            if c == '\'' {
+                if i + 1 < chars.len() && chars[i + 1] == '\'' {
+                    i += 2;
+                    continue;
+                }
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == '\'' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if c == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_digit() {
+            let mut j = i + 1;
+            while j < chars.len() && chars[j].is_ascii_digit() {
+                j += 1;
+            }
+            if let Ok(n) = chars[i + 1..j].iter().collect::<String>().parse::<usize>() {
+                max_n = max_n.max(n);
+            }
+            i = j;
+            continue;
+        }
+        i += 1;
+    }
+    max_n
+}
+
+/// Parse + analyze `sql` to figure out the row description for a SELECT.
+/// Returns `Some(cols)` for SELECT and `None` for everything else.
+fn describe_columns(sql: &str, catalog: &Catalog) -> Result<Option<Vec<ColumnDesc>>> {
+    let stmt = parse(sql)?;
+    let analyzed = analyze(catalog, &stmt)?;
+    Ok(match analyzed {
+        AnalyzedStatement::Select(s) => {
+            Some(s.select_items.iter().map(column_desc_for).collect())
+        }
+        _ => None,
+    })
 }
 
 fn column_desc_for(item: &AnalyzedSelectItem) -> ColumnDesc {

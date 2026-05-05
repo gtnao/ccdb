@@ -177,38 +177,123 @@ impl Parser {
         self.expect(&Token::Insert)?;
         self.expect(&Token::Into)?;
         let table = self.parse_ident()?;
+        // Optional column list: `INSERT INTO t (a, b) VALUES (...)`. We
+        // currently require all columns in declaration order; the column
+        // list is parsed and ignored.
+        if matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            while !matches!(self.peek(), Some(Token::RParen) | None) {
+                self.bump();
+            }
+            self.expect(&Token::RParen)?;
+        }
         self.expect(&Token::Values)?;
-        self.expect(&Token::LParen)?;
-        let mut values = Vec::new();
+        let mut rows = Vec::new();
         loop {
-            values.push(self.parse_expr()?);
+            self.expect(&Token::LParen)?;
+            let mut values = Vec::new();
+            loop {
+                values.push(self.parse_expr()?);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
+            self.expect(&Token::RParen)?;
+            rows.push(values);
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.bump();
             } else {
                 break;
             }
         }
-        self.expect(&Token::RParen)?;
-        Ok(Statement::Insert(InsertStatement { table, values }))
+        Ok(Statement::Insert(InsertStatement { table, rows }))
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
         self.expect(&Token::Create)?;
+        // CREATE INDEX ... — recognized as a no-op so sysbench's index DDL
+        // doesn't error out. Real index support comes later.
+        if matches!(self.peek(), Some(Token::Index)) {
+            return self.parse_create_index_noop();
+        }
         self.expect(&Token::Table)?;
         let table = self.parse_ident()?;
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
+            // Table-level constraint: `PRIMARY KEY (col, ...)` — parse, ignore.
+            if matches!(self.peek(), Some(Token::Primary)) {
+                self.bump();
+                self.expect(&Token::Key)?;
+                self.expect(&Token::LParen)?;
+                // Skip column list.
+                while !matches!(self.peek(), Some(Token::RParen)) {
+                    self.bump();
+                }
+                self.expect(&Token::RParen)?;
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                } else {
+                    break;
+                }
+            }
+            // Table-level KEY/UNIQUE/INDEX clauses also tolerated as no-ops
+            // (none enforced).
+            if matches!(self.peek(), Some(Token::Key) | Some(Token::Index)) {
+                self.bump();
+                // Skip optional name + parenthesized column list.
+                if matches!(self.peek(), Some(Token::Ident(_))) {
+                    self.bump();
+                }
+                if matches!(self.peek(), Some(Token::LParen)) {
+                    let mut depth = 1;
+                    self.bump();
+                    while depth > 0 {
+                        match self.peek() {
+                            Some(Token::LParen) => depth += 1,
+                            Some(Token::RParen) => depth -= 1,
+                            None => bail!("unterminated KEY/INDEX clause"),
+                            _ => {}
+                        }
+                        self.bump();
+                    }
+                }
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                } else {
+                    break;
+                }
+            }
             let name = self.parse_ident()?;
             let data_type = self.parse_data_type()?;
-            // Optional `NOT NULL`. Default is nullable.
-            let nullable = if matches!(self.peek(), Some(Token::Not)) {
-                self.bump();
-                self.expect(&Token::Null)?;
-                false
-            } else {
-                true
-            };
+            // Trailing column constraints in any order. We accept them and
+            // mostly ignore — only NOT NULL has runtime meaning.
+            let mut nullable = true;
+            loop {
+                match self.peek() {
+                    Some(Token::Not) => {
+                        self.bump();
+                        self.expect(&Token::Null)?;
+                        nullable = false;
+                    }
+                    // `DEFAULT <expr>` — value is parsed and discarded.
+                    Some(Token::Default) => {
+                        self.bump();
+                        let _ = self.parse_expr()?;
+                    }
+                    // `PRIMARY KEY` inline on a column — ignored (uniqueness
+                    // not enforced).
+                    Some(Token::Primary) => {
+                        self.bump();
+                        self.expect(&Token::Key)?;
+                    }
+                    _ => break,
+                }
+            }
             columns.push(ColumnDef {
                 name,
                 data_type,
@@ -227,21 +312,60 @@ impl Parser {
         }))
     }
 
+    /// `CREATE INDEX [name] ON tbl (cols)` — accepted as a no-op so sysbench's
+    /// index DDL doesn't fail. Returns a Begin/Commit-shaped Statement
+    /// because we don't yet have a dedicated AST node for it.
+    fn parse_create_index_noop(&mut self) -> Result<Statement> {
+        self.expect(&Token::Index)?;
+        // Optional index name (anything that's an Ident).
+        if matches!(self.peek(), Some(Token::Ident(_))) {
+            self.bump();
+        }
+        // Skip `ON <table> (cols)`. We just consume tokens until end of statement.
+        while let Some(t) = self.peek() {
+            if matches!(t, Token::Semicolon) {
+                break;
+            }
+            self.bump();
+        }
+        Ok(Statement::CreateIndexNoop)
+    }
+
     fn parse_data_type(&mut self) -> Result<DataType> {
         match self.peek() {
             Some(Token::Int) => {
                 self.bump();
+                self.skip_optional_size();
                 Ok(DataType::Int)
             }
-            Some(Token::Varchar) => {
+            Some(Token::Varchar) | Some(Token::Char) => {
                 self.bump();
+                // CHAR/VARCHAR optionally take a size like (120). We don't
+                // enforce length yet, so just consume and ignore.
+                self.skip_optional_size();
                 Ok(DataType::Varchar)
             }
             Some(Token::Double) => {
                 self.bump();
+                self.skip_optional_size();
                 Ok(DataType::Double)
             }
             other => bail!("expected data type, got {other:?}"),
+        }
+    }
+
+    /// Consume `(N)` after a type if present (e.g. `CHAR(120)`). Stored size
+    /// is not enforced at runtime — VARCHAR is unbounded already.
+    fn skip_optional_size(&mut self) {
+        if matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            // Allow integer or comma-separated digits (NUMERIC(p,s) etc).
+            while !matches!(self.peek(), Some(Token::RParen) | None) {
+                self.bump();
+            }
+            if matches!(self.peek(), Some(Token::RParen)) {
+                self.bump();
+            }
         }
     }
 
@@ -394,6 +518,36 @@ impl Parser {
             return Ok(Expr::IsNull {
                 expr: Box::new(left),
                 negated,
+            });
+        }
+        // `expr BETWEEN low AND high` — desugar to `expr >= low AND expr <= high`.
+        // Cloning the left side is fine here; expressions are tree-shaped and
+        // small. NOT BETWEEN gets the negation wrapped on the outside.
+        if matches!(self.peek(), Some(Token::Between))
+            || (matches!(self.peek(), Some(Token::Not))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::Between)))
+        {
+            let negated = if matches!(self.peek(), Some(Token::Not)) {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            self.bump(); // BETWEEN
+            let low = self.parse_additive()?;
+            self.expect(&Token::And)?;
+            let high = self.parse_additive()?;
+            let lhs1 = left.clone();
+            let ge = bin(lhs1, BinaryOperator::Ge, low);
+            let le = bin(left, BinaryOperator::Le, high);
+            let combined = bin(ge, BinaryOperator::And, le);
+            return Ok(if negated {
+                Expr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(combined),
+                }
+            } else {
+                combined
             });
         }
         let op = match self.peek() {
@@ -747,13 +901,40 @@ mod tests {
             panic!()
         };
         assert_eq!(ins.table, "users");
-        assert_eq!(ins.values.len(), 3);
-        assert_eq!(ins.values[0], lit_int(1));
-        assert_eq!(
-            ins.values[1],
-            Expr::Literal(Literal::String("Alice".into()))
-        );
-        assert_eq!(ins.values[2], Expr::Literal(Literal::Null));
+        assert_eq!(ins.rows.len(), 1);
+        let row = &ins.rows[0];
+        assert_eq!(row.len(), 3);
+        assert_eq!(row[0], lit_int(1));
+        assert_eq!(row[1], Expr::Literal(Literal::String("Alice".into())));
+        assert_eq!(row[2], Expr::Literal(Literal::Null));
+    }
+
+    #[test]
+    fn insert_multi_row() {
+        let s = parse("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')").unwrap();
+        let Statement::Insert(ins) = s else { panic!() };
+        assert_eq!(ins.rows.len(), 3);
+        assert_eq!(ins.rows[1][0], lit_int(2));
+    }
+
+    #[test]
+    fn create_table_with_default_and_pk_and_char() {
+        // sysbench-style DDL — should parse without error.
+        let s = parse(
+            "CREATE TABLE sbtest1 (id INTEGER NOT NULL, k INTEGER DEFAULT 0 NOT NULL, c CHAR(120) DEFAULT '' NOT NULL, pad CHAR(60) DEFAULT '' NOT NULL, PRIMARY KEY (id))"
+        ).unwrap();
+        let Statement::CreateTable(c) = s else { panic!() };
+        assert_eq!(c.columns.len(), 4);
+        assert_eq!(c.columns[0].name, "id");
+        assert!(!c.columns[0].nullable);
+        // CHAR maps to VARCHAR.
+        assert_eq!(c.columns[2].data_type, DataType::Varchar);
+    }
+
+    #[test]
+    fn create_index_noop() {
+        let s = parse("CREATE INDEX k_1 ON sbtest1(k)").unwrap();
+        assert!(matches!(s, Statement::CreateIndexNoop));
     }
 
     #[test]

@@ -1,4 +1,10 @@
-//! PostgreSQL Wire Protocol v3 (simple Q-protocol only).
+//! PostgreSQL Wire Protocol v3 — simple-Q + minimal extended protocol.
+//!
+//! The extended path supports Parse/Bind/Describe/Execute/Sync as a thin
+//! shim: Bind substitutes parameter values into the stored query text,
+//! then Execute runs the result through the same machinery as a simple
+//! `Query`. Good enough for libpq-based clients (psql, sysbench) that
+//! issue parameterized queries through PQexecParams or PQprepare.
 //!
 //! Generic over the underlying byte stream so the wire framing can be
 //! exercised in unit tests via in-memory pairs (rather than spinning up
@@ -63,6 +69,32 @@ pub struct StartupMessage {
 #[derive(Debug)]
 pub enum FrontendMessage {
     Query(String),
+    /// `P` — pre-register a SQL string under `name` (empty = unnamed
+    /// statement). `param_types` may be all-zero (= unspecified).
+    Parse {
+        name: String,
+        query: String,
+        param_types: Vec<i32>,
+    },
+    /// `B` — bind values to a parsed statement, producing a portal.
+    Bind {
+        portal: String,
+        statement: String,
+        param_formats: Vec<i16>,
+        params: Vec<Option<Vec<u8>>>,
+        result_formats: Vec<i16>,
+    },
+    /// `D` — describe a statement (kind=`S`) or portal (kind=`P`).
+    Describe { kind: u8, name: String },
+    /// `E` — run a portal. `max_rows = 0` means no cap.
+    Execute { portal: String, max_rows: i32 },
+    /// `C` — close a statement or portal.
+    Close { kind: u8, name: String },
+    /// `S` — terminate the extended-protocol message group; reply with
+    /// ReadyForQuery.
+    Sync,
+    /// `H` — flush; we already flush after every send, so it's a no-op.
+    Flush,
     Terminate,
     Unknown(u8),
 }
@@ -124,6 +156,13 @@ impl<S: Read + Write> Connection<S> {
                 }
                 FrontendMessage::Query(std::str::from_utf8(&buf[..buf.len() - 1])?.to_string())
             }
+            b'P' => parse_parse(&buf)?,
+            b'B' => parse_bind(&buf)?,
+            b'D' => parse_describe(&buf)?,
+            b'E' => parse_execute(&buf)?,
+            b'C' => parse_close(&buf)?,
+            b'S' => FrontendMessage::Sync,
+            b'H' => FrontendMessage::Flush,
             b'X' => FrontendMessage::Terminate,
             other => FrontendMessage::Unknown(other),
         }))
@@ -210,6 +249,36 @@ impl<S: Read + Write> Connection<S> {
         self.write_message(b'I', &[])
     }
 
+    /// `1` — Parse complete.
+    pub fn send_parse_complete(&mut self) -> Result<()> {
+        self.write_message(b'1', &[])
+    }
+
+    /// `2` — Bind complete.
+    pub fn send_bind_complete(&mut self) -> Result<()> {
+        self.write_message(b'2', &[])
+    }
+
+    /// `n` — Statement/portal returns no rows.
+    pub fn send_no_data(&mut self) -> Result<()> {
+        self.write_message(b'n', &[])
+    }
+
+    /// `t` — Parameter type list. We always report unspecified (0).
+    pub fn send_parameter_description(&mut self, n: usize) -> Result<()> {
+        let mut buf = Vec::with_capacity(2 + n * 4);
+        buf.extend_from_slice(&(n as i16).to_be_bytes());
+        for _ in 0..n {
+            buf.extend_from_slice(&0i32.to_be_bytes());
+        }
+        self.write_message(b't', &buf)
+    }
+
+    /// `3` — Close complete.
+    pub fn send_close_complete(&mut self) -> Result<()> {
+        self.write_message(b'3', &[])
+    }
+
     // --- low level ---
 
     fn write_message(&mut self, msg_type: u8, body: &[u8]) -> Result<()> {
@@ -226,6 +295,117 @@ impl<S: Read + Write> Connection<S> {
         self.stream.read_exact(&mut b)?;
         Ok(i32::from_be_bytes(b))
     }
+}
+
+/// Read a NUL-terminated C string from `buf` starting at `*i`. Advances `*i`
+/// past the terminator on success.
+fn read_cstr(buf: &[u8], i: &mut usize) -> Result<String> {
+    let end = buf[*i..]
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| anyhow::anyhow!("expected NUL-terminated string"))?;
+    let s = std::str::from_utf8(&buf[*i..*i + end])?.to_string();
+    *i += end + 1;
+    Ok(s)
+}
+
+fn read_i16(buf: &[u8], i: &mut usize) -> Result<i16> {
+    if buf.len() < *i + 2 {
+        bail!("short read i16");
+    }
+    let v = i16::from_be_bytes(buf[*i..*i + 2].try_into().unwrap());
+    *i += 2;
+    Ok(v)
+}
+
+fn read_i32(buf: &[u8], i: &mut usize) -> Result<i32> {
+    if buf.len() < *i + 4 {
+        bail!("short read i32");
+    }
+    let v = i32::from_be_bytes(buf[*i..*i + 4].try_into().unwrap());
+    *i += 4;
+    Ok(v)
+}
+
+fn parse_parse(buf: &[u8]) -> Result<FrontendMessage> {
+    let mut i = 0;
+    let name = read_cstr(buf, &mut i)?;
+    let query = read_cstr(buf, &mut i)?;
+    let n = read_i16(buf, &mut i)? as usize;
+    let mut param_types = Vec::with_capacity(n);
+    for _ in 0..n {
+        param_types.push(read_i32(buf, &mut i)?);
+    }
+    Ok(FrontendMessage::Parse {
+        name,
+        query,
+        param_types,
+    })
+}
+
+fn parse_bind(buf: &[u8]) -> Result<FrontendMessage> {
+    let mut i = 0;
+    let portal = read_cstr(buf, &mut i)?;
+    let statement = read_cstr(buf, &mut i)?;
+    let nf = read_i16(buf, &mut i)? as usize;
+    let mut param_formats = Vec::with_capacity(nf);
+    for _ in 0..nf {
+        param_formats.push(read_i16(buf, &mut i)?);
+    }
+    let np = read_i16(buf, &mut i)? as usize;
+    let mut params = Vec::with_capacity(np);
+    for _ in 0..np {
+        let len = read_i32(buf, &mut i)?;
+        if len < 0 {
+            params.push(None);
+        } else {
+            let len = len as usize;
+            if buf.len() < i + len {
+                bail!("Bind: short param value");
+            }
+            params.push(Some(buf[i..i + len].to_vec()));
+            i += len;
+        }
+    }
+    let nr = read_i16(buf, &mut i)? as usize;
+    let mut result_formats = Vec::with_capacity(nr);
+    for _ in 0..nr {
+        result_formats.push(read_i16(buf, &mut i)?);
+    }
+    Ok(FrontendMessage::Bind {
+        portal,
+        statement,
+        param_formats,
+        params,
+        result_formats,
+    })
+}
+
+fn parse_describe(buf: &[u8]) -> Result<FrontendMessage> {
+    if buf.is_empty() {
+        bail!("Describe: empty body");
+    }
+    let kind = buf[0];
+    let mut i = 1;
+    let name = read_cstr(buf, &mut i)?;
+    Ok(FrontendMessage::Describe { kind, name })
+}
+
+fn parse_execute(buf: &[u8]) -> Result<FrontendMessage> {
+    let mut i = 0;
+    let portal = read_cstr(buf, &mut i)?;
+    let max_rows = read_i32(buf, &mut i)?;
+    Ok(FrontendMessage::Execute { portal, max_rows })
+}
+
+fn parse_close(buf: &[u8]) -> Result<FrontendMessage> {
+    if buf.is_empty() {
+        bail!("Close: empty body");
+    }
+    let kind = buf[0];
+    let mut i = 1;
+    let name = read_cstr(buf, &mut i)?;
+    Ok(FrontendMessage::Close { kind, name })
 }
 
 fn parse_kv_pairs(buf: &[u8]) -> Result<Vec<(String, String)>> {
