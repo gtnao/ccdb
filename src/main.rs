@@ -19,6 +19,7 @@ mod page;
 mod parser;
 mod protocol;
 mod recovery;
+mod sequence;
 mod transaction;
 mod transaction_manager;
 mod tuple;

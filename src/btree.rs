@@ -263,7 +263,9 @@ fn decode_internal_entry_or_leaf_key(bytes: &[u8], kind: PageKind) -> (KeyBytes,
             let (k, child) = decode_internal_entry(bytes);
             (k, child as u64)
         }
-        PageKind::Heap => panic!("rightmost_le on heap page"),
+        PageKind::Heap | PageKind::SequenceRel => {
+            panic!("rightmost_le on non-btree page")
+        }
     }
 }
 
@@ -300,7 +302,9 @@ pub fn descend_to_leaf(
                 // is acquired in the next loop iteration's fetch_page.
                 current = next;
             }
-            PageKind::Heap => bail!("descend hit a heap page (corruption)"),
+            PageKind::Heap | PageKind::SequenceRel => {
+                bail!("descend hit a non-btree page (corruption)")
+            }
         }
     }
 }
@@ -701,7 +705,9 @@ fn insert_recursive(
                 }
             }
         }
-        PageKind::Heap => bail!("insert hit a heap page (corruption)"),
+        PageKind::Heap | PageKind::SequenceRel => {
+            bail!("insert hit a non-btree page (corruption)")
+        }
     }
 }
 

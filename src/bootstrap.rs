@@ -20,9 +20,11 @@ pub const SYSTEM_TXN_ID: u64 = 1;
 pub const PG_CLASS_TABLE_ID: i32 = 0;
 pub const PG_ATTRIBUTE_TABLE_ID: i32 = 1;
 pub const PG_INDEX_TABLE_ID: i32 = 2;
+pub const PG_SEQUENCE_TABLE_ID: i32 = 3;
 pub const PG_CLASS_PAGE_ID: PageId = 0;
 pub const PG_ATTRIBUTE_PAGE_ID: PageId = 1;
 pub const PG_INDEX_PAGE_ID: PageId = 2;
+pub const PG_SEQUENCE_PAGE_ID: PageId = 3;
 
 pub const DT_INT: i32 = 0;
 pub const DT_VARCHAR: i32 = 1;
@@ -43,6 +45,7 @@ pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
             (PG_CLASS_TABLE_ID, "pg_class", PG_CLASS_PAGE_ID as i32),
             (PG_ATTRIBUTE_TABLE_ID, "pg_attribute", PG_ATTRIBUTE_PAGE_ID as i32),
             (PG_INDEX_TABLE_ID, "pg_index", PG_INDEX_PAGE_ID as i32),
+            (PG_SEQUENCE_TABLE_ID, "pg_sequence", PG_SEQUENCE_PAGE_ID as i32),
         ] {
             let bytes = serialize_tuple_mvcc(
                 SYSTEM_TXN_ID,
@@ -76,6 +79,13 @@ pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
             (PG_INDEX_TABLE_ID, "table_id", DT_INT, false, 2),
             (PG_INDEX_TABLE_ID, "column_index", DT_INT, false, 3),
             (PG_INDEX_TABLE_ID, "root_page_id", DT_INT, false, 4),
+            (PG_SEQUENCE_TABLE_ID, "seq_id", DT_INT, false, 0),
+            (PG_SEQUENCE_TABLE_ID, "name", DT_VARCHAR, false, 1),
+            (PG_SEQUENCE_TABLE_ID, "seq_page_id", DT_INT, false, 2),
+            (PG_SEQUENCE_TABLE_ID, "increment", DT_INT, false, 3),
+            (PG_SEQUENCE_TABLE_ID, "start_value", DT_INT, false, 4),
+            (PG_SEQUENCE_TABLE_ID, "min_value", DT_INT, false, 5),
+            (PG_SEQUENCE_TABLE_ID, "max_value", DT_INT, false, 6),
         ];
         for (tid, cname, dt, nul, ord) in cols {
             let bytes = serialize_tuple_mvcc(
@@ -97,6 +107,13 @@ pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
     {
         let g = bpm.new_page()?;
         debug_assert_eq!(g.page_id(), PG_INDEX_PAGE_ID);
+        let _p = g.write();
+    }
+
+    // -- pg_sequence at page 3 (empty until CREATE SEQUENCE runs) --
+    {
+        let g = bpm.new_page()?;
+        debug_assert_eq!(g.page_id(), PG_SEQUENCE_PAGE_ID);
         let _p = g.write();
     }
 

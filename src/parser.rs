@@ -233,6 +233,9 @@ impl Parser {
         if matches!(self.peek(), Some(Token::Index)) {
             return self.parse_create_index_noop();
         }
+        if matches!(self.peek(), Some(Token::Sequence)) {
+            return self.parse_create_sequence();
+        }
         self.expect(&Token::Table)?;
         // Optional `IF NOT EXISTS` — accepted but not enforced. Re-creating
         // an existing table will still fail in analyze_create_table.
@@ -334,6 +337,83 @@ impl Parser {
         }))
     }
 
+    /// `CREATE SEQUENCE [IF NOT EXISTS] name
+    ///     [INCREMENT [BY] n] [START [WITH] n] [MINVALUE n] [MAXVALUE n]`
+    /// Cycle / cache / owned-by are not parsed yet.
+    fn parse_create_sequence(&mut self) -> Result<Statement> {
+        self.expect(&Token::Sequence)?;
+        let if_not_exists = if matches!(self.peek(), Some(Token::If)) {
+            self.bump();
+            self.expect(&Token::Not)?;
+            self.expect(&Token::Exists)?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_ident()?;
+        let mut increment: i64 = 1;
+        let mut start_value: Option<i64> = None;
+        let mut min_value: Option<i64> = None;
+        let mut max_value: Option<i64> = None;
+        // Loop over option keywords. They're plain idents (we don't dedicate
+        // tokens to every option), so we eat them via parse_ident lookahead.
+        while let Some(Token::Ident(s)) = self.peek() {
+            let kw = s.to_ascii_uppercase();
+            match kw.as_str() {
+                "INCREMENT" => {
+                    self.bump();
+                    if matches!(self.peek(), Some(Token::Ident(b)) if b.eq_ignore_ascii_case("BY"))
+                    {
+                        self.bump();
+                    }
+                    increment = self.parse_signed_int()?;
+                }
+                "START" => {
+                    self.bump();
+                    if matches!(self.peek(), Some(Token::Ident(w)) if w.eq_ignore_ascii_case("WITH"))
+                    {
+                        self.bump();
+                    }
+                    start_value = Some(self.parse_signed_int()?);
+                }
+                "MINVALUE" => {
+                    self.bump();
+                    min_value = Some(self.parse_signed_int()?);
+                }
+                "MAXVALUE" => {
+                    self.bump();
+                    max_value = Some(self.parse_signed_int()?);
+                }
+                _ => break,
+            }
+        }
+        Ok(Statement::CreateSequence(CreateSequenceStatement {
+            name,
+            if_not_exists,
+            increment,
+            start_value,
+            min_value,
+            max_value,
+        }))
+    }
+
+    fn parse_signed_int(&mut self) -> Result<i64> {
+        let neg = if matches!(self.peek(), Some(Token::Minus)) {
+            self.bump();
+            true
+        } else {
+            false
+        };
+        match self.peek() {
+            Some(Token::Integer(n)) => {
+                let v = *n;
+                self.bump();
+                Ok(if neg { -v } else { v })
+            }
+            other => bail!("expected integer, got {other:?}"),
+        }
+    }
+
     /// `DROP TABLE [IF EXISTS] name [, name, ...] [CASCADE | RESTRICT]`
     /// or `DROP INDEX [IF EXISTS] name`.
     fn parse_drop(&mut self) -> Result<Statement> {
@@ -374,7 +454,6 @@ impl Parser {
                 self.bump();
                 let if_exists = if matches!(self.peek(), Some(Token::If)) {
                     self.bump();
-                    self.expect(&Token::Not)?;
                     self.expect(&Token::Exists)?;
                     true
                 } else {
@@ -383,7 +462,26 @@ impl Parser {
                 let name = self.parse_ident()?;
                 Ok(Statement::DropIndex(DropIndexStatement { name, if_exists }))
             }
-            other => bail!("expected TABLE or INDEX after DROP, got {other:?}"),
+            Some(Token::Sequence) => {
+                self.bump();
+                let if_exists = if matches!(self.peek(), Some(Token::If)) {
+                    self.bump();
+                    self.expect(&Token::Exists)?;
+                    true
+                } else {
+                    false
+                };
+                let mut names = vec![self.parse_ident()?];
+                while matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    names.push(self.parse_ident()?);
+                }
+                Ok(Statement::DropSequence(DropSequenceStatement {
+                    names,
+                    if_exists,
+                }))
+            }
+            other => bail!("expected TABLE / INDEX / SEQUENCE after DROP, got {other:?}"),
         }
     }
 

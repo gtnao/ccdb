@@ -60,6 +60,15 @@ pub enum WalRecordType {
         key: Vec<u8>,
         rid: Rid,
     },
+    /// Sequence state advance — `last_value` of the sequence relation page
+    /// is being set to `new_last_value` (a 32-batch reservation, or a
+    /// `setval` user override). Recovery's redo writes this into the
+    /// page so post-crash state matches the logged guarantee. Never
+    /// undone — sequences are non-transactional.
+    SequenceAdvance {
+        seq_page_id: PageId,
+        new_last_value: i64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -77,6 +86,7 @@ const TAG_DELETE: u8 = 4;
 const TAG_CLR: u8 = 5;
 const TAG_CHECKPOINT: u8 = 6;
 const TAG_INDEX_INSERT: u8 = 7;
+const TAG_SEQ_ADVANCE: u8 = 8;
 
 const CLR_UNDO_INSERT: u8 = 0;
 const CLR_UNDO_DELETE: u8 = 1;
@@ -143,6 +153,11 @@ impl WalRecord {
                 let (pid, slot) = *rid;
                 buf.extend_from_slice(&pid.to_le_bytes());
                 buf.extend_from_slice(&slot.to_le_bytes());
+            }
+            WalRecordType::SequenceAdvance { seq_page_id, new_last_value } => {
+                buf.push(TAG_SEQ_ADVANCE);
+                buf.extend_from_slice(&seq_page_id.to_le_bytes());
+                buf.extend_from_slice(&new_last_value.to_le_bytes());
             }
             WalRecordType::Checkpoint { att, dpt } => {
                 buf.push(TAG_CHECKPOINT);
@@ -249,6 +264,17 @@ impl WalRecord {
                     index_id,
                     key,
                     rid: (pid, slot),
+                }
+            }
+            TAG_SEQ_ADVANCE => {
+                if rest.len() < 12 {
+                    bail!("SequenceAdvance record too short");
+                }
+                let seq_page_id = u32::from_le_bytes(rest[0..4].try_into().unwrap());
+                let new_last_value = i64::from_le_bytes(rest[4..12].try_into().unwrap());
+                WalRecordType::SequenceAdvance {
+                    seq_page_id,
+                    new_last_value,
                 }
             }
             TAG_CHECKPOINT => {

@@ -15,9 +15,10 @@ use anyhow::{Result, bail};
 
 use crate::ast::{
     self, AlterTableAction, AlterTableStatement, BinaryOperator, CreateIndexStatement,
-    CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, Expr,
-    FromClause, FuncArgs, InsertStatement, JoinType, Literal, OrderDir, SelectColumn,
-    SelectStatement, Statement, TableRef, TruncateStatement, UnaryOperator, UpdateStatement,
+    CreateSequenceStatement, CreateTableStatement, DeleteStatement, DropIndexStatement,
+    DropSequenceStatement, DropTableStatement, Expr, FromClause, FuncArgs, InsertStatement,
+    JoinType, Literal, OrderDir, SelectColumn, SelectStatement, Statement, TableRef,
+    TruncateStatement, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -59,6 +60,8 @@ pub enum AnalyzedStatement {
     DropIndex(AnalyzedDropIndexStatement),
     Truncate(AnalyzedTruncateStatement),
     AlterTableAddIndex(AnalyzedCreateIndexStatement),
+    CreateSequence(AnalyzedCreateSequenceStatement),
+    DropSequence(AnalyzedDropSequenceStatement),
     Begin,
     Commit,
     Rollback,
@@ -236,6 +239,20 @@ pub struct AnalyzedTruncateStatement {
 }
 
 #[derive(Debug, Clone)]
+pub struct AnalyzedCreateSequenceStatement {
+    pub name: String,
+    pub increment: i64,
+    pub start_value: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedDropSequenceStatement {
+    pub seqs: Vec<(usize, String, crate::page::PageId)>,
+}
+
+#[derive(Debug, Clone)]
 pub struct AnalyzedColumnDef {
     pub name: String,
     pub data_type: DataType,
@@ -266,6 +283,24 @@ pub enum AnalyzedExpr {
     /// start timestamp. Replaced with a Literal at the executor entry once
     /// `tx.start_ts()` is known. Always typed as TIMESTAMP.
     Now,
+    /// `nextval('seq')` / `setval('seq', n)` placeholder. Resolved against
+    /// the live sequence relation at evaluation time. Always returns INT.
+    SequenceCall {
+        kind: SequenceFnKind,
+        seq_id: usize,
+        seq_page_id: crate::page::PageId,
+        increment: i64,
+        start_value: i64,
+        /// For setval(seq, n) and setval(seq, n, is_called).
+        setval_arg: Option<i64>,
+        setval_is_called: bool,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceFnKind {
+    Nextval,
+    Setval,
 }
 
 #[derive(Debug, Clone)]
@@ -306,6 +341,7 @@ impl AnalyzedExpr {
             | AnalyzedExpr::UnaryOp { result_type, .. } => Some(*result_type),
             AnalyzedExpr::IsNull { .. } => Some(DataType::Bool),
             AnalyzedExpr::Now => Some(DataType::Timestamp),
+            AnalyzedExpr::SequenceCall { .. } => Some(DataType::Int),
         }
     }
 }
@@ -443,7 +479,7 @@ impl<'a> Analyzer<'a> {
                 })
             }
             Expr::FuncCall { name, args } => {
-                if let Some(builtin) = analyze_scalar_builtin(name, args)? {
+                if let Some(builtin) = self.analyze_scalar_builtin(name, args)? {
                     return Ok(builtin);
                 }
                 if AggKind::from_name(name).is_some() {
@@ -759,7 +795,7 @@ impl<'a> Analyzer<'a> {
                 })
             }
             Expr::FuncCall { name, args } => {
-                if let Some(builtin) = analyze_scalar_builtin(name, args)? {
+                if let Some(builtin) = self.analyze_scalar_builtin(name, args)? {
                     return Ok(builtin);
                 }
                 let kind = AggKind::from_name(name)
@@ -971,6 +1007,54 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_create_sequence(
+        &self,
+        s: &CreateSequenceStatement,
+    ) -> Result<AnalyzedCreateSequenceStatement> {
+        if !s.if_not_exists && self.catalog.find_sequence(&s.name)?.is_some() {
+            bail!("sequence '{}' already exists", s.name);
+        }
+        let increment = s.increment;
+        if increment == 0 {
+            bail!("sequence INCREMENT must not be zero");
+        }
+        let (default_min, default_max) = if increment > 0 {
+            (1i64, i32::MAX as i64)
+        } else {
+            (i32::MIN as i64, -1i64)
+        };
+        let min_value = s.min_value.unwrap_or(default_min);
+        let max_value = s.max_value.unwrap_or(default_max);
+        let start_value = s
+            .start_value
+            .unwrap_or(if increment > 0 { min_value } else { max_value });
+        if start_value < min_value || start_value > max_value {
+            bail!("START value out of [MINVALUE, MAXVALUE] range");
+        }
+        Ok(AnalyzedCreateSequenceStatement {
+            name: s.name.clone(),
+            increment,
+            start_value,
+            min_value,
+            max_value,
+        })
+    }
+
+    fn analyze_drop_sequence(
+        &self,
+        s: &DropSequenceStatement,
+    ) -> Result<AnalyzedDropSequenceStatement> {
+        let mut seqs = Vec::new();
+        for name in &s.names {
+            match self.catalog.find_sequence(name)? {
+                Some(seq) => seqs.push((seq.seq_id, name.clone(), seq.seq_page_id)),
+                None if s.if_exists => continue,
+                None => bail!("sequence '{name}' not found"),
+            }
+        }
+        Ok(AnalyzedDropSequenceStatement { seqs })
+    }
+
     fn analyze_drop_table(
         &self,
         s: &DropTableStatement,
@@ -1146,22 +1230,95 @@ fn substitute_aliases(e: &Expr, aliases: &[(String, Expr)]) -> Expr {
     }
 }
 
-/// Recognise a scalar built-in by name, returning its analyzed form when
-/// matched. Returns `None` for unknown names so callers can try aggregates
-/// or fall back to error.
-fn analyze_scalar_builtin(name: &str, args: &FuncArgs) -> Result<Option<AnalyzedExpr>> {
-    let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        "now" | "current_timestamp" | "transaction_timestamp" => {
-            match args {
+impl<'a> Analyzer<'a> {
+    /// Recognise a scalar built-in by name, returning its analyzed form when
+    /// matched. Returns `None` for unknown names so callers can try
+    /// aggregates or fall back to error.
+    fn analyze_scalar_builtin(
+        &self,
+        name: &str,
+        args: &FuncArgs,
+    ) -> Result<Option<AnalyzedExpr>> {
+        let lower = name.to_ascii_lowercase();
+        match lower.as_str() {
+            "now" | "current_timestamp" | "transaction_timestamp" => match args {
                 FuncArgs::Star => bail!("{lower}() does not take *"),
                 FuncArgs::Exprs(es) if !es.is_empty() => {
                     bail!("{lower}() takes no arguments")
                 }
                 _ => Ok(Some(AnalyzedExpr::Now)),
-            }
+            },
+            "nextval" => self.analyze_sequence_call(SequenceFnKind::Nextval, args),
+            "setval" => self.analyze_sequence_call(SequenceFnKind::Setval, args),
+            _ => Ok(None),
         }
-        _ => Ok(None),
+    }
+
+    fn analyze_sequence_call(
+        &self,
+        kind: SequenceFnKind,
+        args: &FuncArgs,
+    ) -> Result<Option<AnalyzedExpr>> {
+        let exprs = match args {
+            FuncArgs::Exprs(es) => es,
+            FuncArgs::Star => bail!("nextval/setval do not take *"),
+        };
+        let (name, setval_arg, setval_is_called) = match (kind, exprs.len()) {
+            (SequenceFnKind::Nextval, 1) => (extract_string_literal(&exprs[0])?, None, false),
+            (SequenceFnKind::Setval, 2) => (
+                extract_string_literal(&exprs[0])?,
+                Some(extract_int_literal(&exprs[1])?),
+                true,
+            ),
+            (SequenceFnKind::Setval, 3) => (
+                extract_string_literal(&exprs[0])?,
+                Some(extract_int_literal(&exprs[1])?),
+                extract_bool_literal(&exprs[2])?,
+            ),
+            (k, n) => bail!("{:?} expects {} arg(s), got {n}", k, match k {
+                SequenceFnKind::Nextval => "1",
+                SequenceFnKind::Setval => "2 or 3",
+            }),
+        };
+        let seq = self
+            .catalog
+            .find_sequence(&name)?
+            .ok_or_else(|| anyhow::anyhow!("sequence '{name}' not found"))?;
+        Ok(Some(AnalyzedExpr::SequenceCall {
+            kind,
+            seq_id: seq.seq_id,
+            seq_page_id: seq.seq_page_id,
+            increment: seq.increment,
+            start_value: seq.start_value,
+            setval_arg,
+            setval_is_called,
+        }))
+    }
+}
+
+fn extract_string_literal(e: &Expr) -> Result<String> {
+    match e {
+        Expr::Literal(Literal::String(s)) => Ok(s.clone()),
+        _ => bail!("expected string literal"),
+    }
+}
+fn extract_int_literal(e: &Expr) -> Result<i64> {
+    match e {
+        Expr::Literal(Literal::Integer(n)) => Ok(*n),
+        Expr::UnaryOp {
+            op: ast::UnaryOperator::Neg,
+            expr,
+        } => match expr.as_ref() {
+            Expr::Literal(Literal::Integer(n)) => Ok(-*n),
+            _ => bail!("expected integer literal"),
+        },
+        _ => bail!("expected integer literal"),
+    }
+}
+fn extract_bool_literal(e: &Expr) -> Result<bool> {
+    match e {
+        Expr::Literal(Literal::Boolean(b)) => Ok(*b),
+        _ => bail!("expected boolean literal"),
     }
 }
 
@@ -1251,6 +1408,22 @@ fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
             },
         ) => n1 == n2 && same_expr(e1, e2),
         (AnalyzedExpr::Now, AnalyzedExpr::Now) => true,
+        (
+            AnalyzedExpr::SequenceCall {
+                kind: k1,
+                seq_id: i1,
+                setval_arg: a1,
+                setval_is_called: c1,
+                ..
+            },
+            AnalyzedExpr::SequenceCall {
+                kind: k2,
+                seq_id: i2,
+                setval_arg: a2,
+                setval_is_called: c2,
+                ..
+            },
+        ) => k1 == k2 && i1 == i2 && a1 == a2 && c1 == c2,
         _ => false,
     }
 }
@@ -1414,6 +1587,12 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
         Statement::TruncateTable(s) => AnalyzedStatement::Truncate(a.analyze_truncate(s)?),
         Statement::AlterTable(s) => {
             AnalyzedStatement::AlterTableAddIndex(a.analyze_alter_table(s)?)
+        }
+        Statement::CreateSequence(s) => {
+            AnalyzedStatement::CreateSequence(a.analyze_create_sequence(s)?)
+        }
+        Statement::DropSequence(s) => {
+            AnalyzedStatement::DropSequence(a.analyze_drop_sequence(s)?)
         }
         Statement::Begin => AnalyzedStatement::Begin,
         Statement::Commit => AnalyzedStatement::Commit,

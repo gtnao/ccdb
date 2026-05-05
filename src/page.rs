@@ -41,6 +41,9 @@ pub enum PageKind {
     Heap = 0,
     BTreeLeaf = 1,
     BTreeInternal = 2,
+    /// Single-row relation holding a sequence's mutable state (last_value,
+    /// log_cnt, is_called) at fixed byte offsets after the standard header.
+    SequenceRel = 3,
 }
 
 impl PageKind {
@@ -48,6 +51,7 @@ impl PageKind {
         match b {
             1 => PageKind::BTreeLeaf,
             2 => PageKind::BTreeInternal,
+            3 => PageKind::SequenceRel,
             _ => PageKind::Heap,
         }
     }

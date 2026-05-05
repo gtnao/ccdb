@@ -127,7 +127,8 @@ fn analyze(records: &[WalRecord]) -> Analysis {
             }
             WalRecordType::Insert { .. }
             | WalRecordType::Delete { .. }
-            | WalRecordType::IndexInsert { .. } => {
+            | WalRecordType::IndexInsert { .. }
+            | WalRecordType::SequenceAdvance { .. } => {
                 wrote_dml.insert(r.txn_id);
             }
             WalRecordType::Clr { .. } => {
@@ -164,6 +165,11 @@ fn redo_from(bpm: &BufferPool, records: &[WalRecord], start_lsn: Lsn) -> Result<
             }
             WalRecordType::Delete { rid, xmax } => {
                 if redo_set_xmax(bpm, *rid, *xmax, r.lsn)? {
+                    count += 1;
+                }
+            }
+            WalRecordType::SequenceAdvance { seq_page_id, new_last_value } => {
+                if redo_seq_advance(bpm, *seq_page_id, *new_last_value, r.lsn)? {
                     count += 1;
                 }
             }
@@ -246,6 +252,33 @@ fn redo_index_inserts(
         count += 1;
     }
     Ok(count)
+}
+
+fn redo_seq_advance(
+    bpm: &BufferPool,
+    seq_page_id: u32,
+    new_last_value: i64,
+    record_lsn: Lsn,
+) -> Result<bool> {
+    ensure_page_allocated(bpm, seq_page_id)?;
+    let g = bpm.fetch_page(seq_page_id)?;
+    let mut p = g.write();
+    if p.page_lsn() >= record_lsn {
+        return Ok(false);
+    }
+    if p.page_kind() != crate::page::PageKind::SequenceRel {
+        // The page hasn't been initialised as a sequence relation yet —
+        // shouldn't happen if the catalog row's CREATE SEQUENCE made it
+        // through redo first, but be defensive.
+        crate::sequence::init_sequence_page(&mut p);
+    }
+    let mut s = crate::sequence::read_state(&p);
+    s.last_value = new_last_value;
+    s.log_cnt = 0;
+    s.is_called = true;
+    crate::sequence::write_state(&mut p, s);
+    p.set_page_lsn(record_lsn);
+    Ok(true)
 }
 
 fn ensure_page_allocated(bpm: &BufferPool, page_id: u32) -> Result<()> {

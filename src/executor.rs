@@ -8,11 +8,12 @@
 use anyhow::{Result, bail};
 
 use crate::analyzer::{
-    AggArg, AggKind, AnalyzedAggregate, AnalyzedCreateIndexStatement, AnalyzedDeleteStatement,
-    AnalyzedDropIndexStatement, AnalyzedDropTableStatement, AnalyzedExpr, AnalyzedFrom,
+    AggArg, AggKind, AnalyzedAggregate, AnalyzedCreateIndexStatement,
+    AnalyzedCreateSequenceStatement, AnalyzedDeleteStatement, AnalyzedDropIndexStatement,
+    AnalyzedDropSequenceStatement, AnalyzedDropTableStatement, AnalyzedExpr, AnalyzedFrom,
     AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedOrderBy, AnalyzedSelectStatement,
     AnalyzedStatement, AnalyzedTruncateStatement, AnalyzedUpdateStatement, LiteralValue,
-    TableSource,
+    SequenceFnKind, TableSource,
 };
 use crate::ast::{BinaryOperator, JoinType, OrderDir, UnaryOperator};
 use crate::buffer_pool::BufferPool;
@@ -994,6 +995,9 @@ fn evaluate_expr(expr: &AnalyzedExpr, tuple: &Tuple) -> Result<Value> {
         AnalyzedExpr::Now => bail!(
             "internal: AnalyzedExpr::Now reached evaluator (should be substituted at execute() entry)"
         ),
+        AnalyzedExpr::SequenceCall { .. } => bail!(
+            "internal: AnalyzedExpr::SequenceCall reached evaluator (must be pre-evaluated)"
+        ),
         AnalyzedExpr::IsNull { expr, negated } => {
             let v = evaluate_expr(expr, tuple)?;
             let is_null = matches!(v, Value::Null);
@@ -1086,13 +1090,65 @@ fn substitute_now_in_expr(e: &mut AnalyzedExpr, ts: i64) {
                 data_type: Some(DataType::Timestamp),
             });
         }
-        AnalyzedExpr::Literal(_) | AnalyzedExpr::ColumnRef(_) => {}
+        AnalyzedExpr::Literal(_)
+        | AnalyzedExpr::ColumnRef(_)
+        | AnalyzedExpr::SequenceCall { .. } => {}
         AnalyzedExpr::BinaryOp { left, right, .. } => {
             substitute_now_in_expr(left, ts);
             substitute_now_in_expr(right, ts);
         }
         AnalyzedExpr::UnaryOp { expr, .. } => substitute_now_in_expr(expr, ts),
         AnalyzedExpr::IsNull { expr, .. } => substitute_now_in_expr(expr, ts),
+    }
+}
+
+/// Walk an analyzed expression and execute every SequenceCall, replacing
+/// it with the resulting Literal::Int. Each call advances/reads the live
+/// sequence relation, so this MUST be called per-row evaluation context
+/// (once per output row in INSERT / SELECT-no-FROM).
+fn evaluate_sequence_calls_in_expr(
+    e: &mut AnalyzedExpr,
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tx: &mut Transaction,
+) -> Result<()> {
+    match e {
+        AnalyzedExpr::SequenceCall {
+            kind,
+            seq_page_id,
+            increment,
+            start_value,
+            setval_arg,
+            setval_is_called,
+            ..
+        } => {
+            let v = match kind {
+                SequenceFnKind::Nextval => crate::sequence::nextval(
+                    bpm,
+                    wal,
+                    tx,
+                    *seq_page_id,
+                    *start_value,
+                    *increment,
+                )?,
+                SequenceFnKind::Setval => {
+                    let n = setval_arg.ok_or_else(|| anyhow::anyhow!("setval missing arg"))?;
+                    crate::sequence::setval(bpm, wal, tx, *seq_page_id, n, *setval_is_called)?
+                }
+            };
+            *e = AnalyzedExpr::Literal(AnalyzedLiteral {
+                value: LiteralValue::Integer(v),
+                data_type: Some(DataType::Int),
+            });
+            Ok(())
+        }
+        AnalyzedExpr::BinaryOp { left, right, .. } => {
+            evaluate_sequence_calls_in_expr(left, bpm, wal, tx)?;
+            evaluate_sequence_calls_in_expr(right, bpm, wal, tx)
+        }
+        AnalyzedExpr::UnaryOp { expr, .. } => evaluate_sequence_calls_in_expr(expr, bpm, wal, tx),
+        AnalyzedExpr::IsNull { expr, .. } => evaluate_sequence_calls_in_expr(expr, bpm, wal, tx),
+        _ => Ok(()),
     }
 }
 
@@ -1348,8 +1404,9 @@ fn perform_create_table(
         max_id = max_id.max(table.table_id as i32);
     }
     // System tables occupy 0 and 1; user tables start at 2.
-    // System tables 0=pg_class, 1=pg_attribute, 2=pg_index. User tables start at 3.
-    let new_table_id = (max_id + 1).max(3);
+    // System tables 0..=3 (pg_class, pg_attribute, pg_index, pg_sequence).
+    // User tables start at 4.
+    let new_table_id = (max_id + 1).max(4);
 
     // Allocate the table's first heap page.
     let new_page_id = {
@@ -1482,6 +1539,68 @@ fn perform_create_index(
     Ok(())
 }
 
+/// `CREATE SEQUENCE` — allocate a sequence relation page, initialise it,
+/// and register the new sequence in `pg_sequence`.
+fn perform_create_sequence(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    catalog: &Catalog,
+    stmt: &AnalyzedCreateSequenceStatement,
+    tx: &mut Transaction,
+) -> Result<()> {
+    use crate::bootstrap::PG_SEQUENCE_PAGE_ID;
+    // Pick a fresh seq_id (max existing + 1).
+    let mut max_id: i32 = -1;
+    for s in catalog.all_sequences()? {
+        max_id = max_id.max(s.seq_id as i32);
+    }
+    let new_seq_id = max_id + 1;
+
+    // Allocate the sequence relation page.
+    let seq_page_id = {
+        let g = bpm.new_page()?;
+        let pid = g.page_id();
+        let mut p = g.write();
+        crate::sequence::init_sequence_page(&mut p);
+        pid
+    };
+
+    // Insert into pg_sequence.
+    let row = serialize_tuple_mvcc(
+        tx.id(),
+        INVALID_TXN_ID,
+        &[
+            Value::Int(new_seq_id),
+            Value::Varchar(stmt.name.clone()),
+            Value::Int(seq_page_id as i32),
+            Value::Int(stmt.increment as i32),
+            Value::Int(stmt.start_value as i32),
+            Value::Int(stmt.min_value as i32),
+            Value::Int(stmt.max_value as i32),
+        ],
+    );
+    insert_bytes(bpm, wal, tx, PG_SEQUENCE_PAGE_ID, &row)?;
+    Ok(())
+}
+
+/// `DROP SEQUENCE` — tombstone pg_sequence rows. Sequence relation pages
+/// become orphaned; VACUUM later. (Phase 1-8.)
+fn perform_drop_sequence(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    stmt: &AnalyzedDropSequenceStatement,
+    tx: &mut Transaction,
+) -> Result<()> {
+    use crate::bootstrap::PG_SEQUENCE_PAGE_ID;
+    for (seq_id, _name, _page) in &stmt.seqs {
+        let id = *seq_id;
+        tombstone_catalog_rows(bpm, wal, tx, PG_SEQUENCE_PAGE_ID, |vals| {
+            matches!(&vals[0], Value::Int(n) if *n as usize == id)
+        })?;
+    }
+    Ok(())
+}
+
 /// `DROP TABLE` — tombstone the catalog rows for the table and its indexes.
 /// Heap pages and index pages become orphaned; VACUUM reclaims them later.
 fn perform_drop_table(
@@ -1592,12 +1711,15 @@ fn tombstone_catalog_rows(
     first_page: PageId,
     pred: impl Fn(&[Value]) -> bool,
 ) -> Result<()> {
-    use crate::catalog::{pg_attribute_schema, pg_class_schema, pg_index_schema};
-    use crate::bootstrap::{PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID, PG_INDEX_PAGE_ID};
+    use crate::catalog::{pg_attribute_schema, pg_class_schema, pg_index_schema, pg_sequence_schema};
+    use crate::bootstrap::{
+        PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID, PG_INDEX_PAGE_ID, PG_SEQUENCE_PAGE_ID,
+    };
     let schema = match first_page {
         PG_CLASS_PAGE_ID => pg_class_schema(),
         PG_ATTRIBUTE_PAGE_ID => pg_attribute_schema(),
         PG_INDEX_PAGE_ID => pg_index_schema(),
+        PG_SEQUENCE_PAGE_ID => pg_sequence_schema(),
         _ => bail!("tombstone_catalog_rows: unknown catalog page {first_page}"),
     };
     let mut victims: Vec<(PageId, SlotId)> = Vec::new();
@@ -1710,7 +1832,13 @@ fn perform_insert(
     let empty = Tuple::new(Vec::new());
     let mut count = 0;
     for row in &stmt.rows {
-        let raw: Vec<Value> = row
+        // Pre-evaluate SequenceCalls per row so each row gets a fresh
+        // nextval. Other expression nodes are left intact.
+        let mut row_owned = row.clone();
+        for e in row_owned.iter_mut() {
+            evaluate_sequence_calls_in_expr(e, bpm, wal, tx)?;
+        }
+        let raw: Vec<Value> = row_owned
             .iter()
             .map(|e| evaluate_expr(e, &empty))
             .collect::<Result<_>>()?;
@@ -2143,6 +2271,17 @@ pub fn execute(
 
     let result: Result<Output> = (|| match stmt {
         AnalyzedStatement::Select(s) => {
+            // Pre-evaluate SequenceCalls in select_items / where / etc.
+            // Only safe when the source is OneRowRelation (no FROM) — for
+            // FROM-based SELECTs, sequence calls in projections would need
+            // per-row evaluation which isn't wired in Phase 1-7.
+            let mut s_owned = s.clone();
+            if matches!(s_owned.from, AnalyzedFrom::Empty) {
+                for it in &mut s_owned.select_items {
+                    evaluate_sequence_calls_in_expr(&mut it.expr, bpm, wal, tx)?;
+                }
+            }
+            let s = &s_owned;
             let snapshot = tx
                 .snapshot()
                 .cloned()
@@ -2221,6 +2360,14 @@ pub fn execute(
         AnalyzedStatement::Truncate(s) => Ok(Output::Affected(perform_truncate(
             bpm, wal, catalog, s, tx,
         )?)),
+        AnalyzedStatement::CreateSequence(s) => {
+            perform_create_sequence(bpm, wal, catalog, s, tx)?;
+            Ok(Output::Affected(0))
+        }
+        AnalyzedStatement::DropSequence(s) => {
+            perform_drop_sequence(bpm, wal, s, tx)?;
+            Ok(Output::Affected(0))
+        }
         AnalyzedStatement::Checkpoint => {
             // Handled at the connection layer (instance.rs) — has access to
             // the global ATT and DPT, which the executor doesn't.

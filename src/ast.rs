@@ -12,6 +12,8 @@ pub enum Statement {
     DropIndex(DropIndexStatement),
     TruncateTable(TruncateStatement),
     AlterTable(AlterTableStatement),
+    CreateSequence(CreateSequenceStatement),
+    DropSequence(DropSequenceStatement),
     Begin,
     Commit,
     Rollback,
@@ -147,6 +149,22 @@ pub struct TruncateStatement {
 pub struct AlterTableStatement {
     pub table: String,
     pub action: AlterTableAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateSequenceStatement {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub increment: i64,
+    pub start_value: Option<i64>,
+    pub min_value: Option<i64>,
+    pub max_value: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropSequenceStatement {
+    pub names: Vec<String>,
+    pub if_exists: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -11,7 +11,8 @@ use anyhow::Result;
 
 use crate::bootstrap::{
     datatype_from_int, PG_ATTRIBUTE_PAGE_ID, PG_ATTRIBUTE_TABLE_ID, PG_CLASS_PAGE_ID,
-    PG_CLASS_TABLE_ID, PG_INDEX_PAGE_ID, PG_INDEX_TABLE_ID,
+    PG_CLASS_TABLE_ID, PG_INDEX_PAGE_ID, PG_INDEX_TABLE_ID, PG_SEQUENCE_PAGE_ID,
+    PG_SEQUENCE_TABLE_ID,
 };
 use crate::buffer_pool::BufferPool;
 use crate::page::{PageId, NO_NEXT_PAGE};
@@ -41,6 +42,17 @@ pub struct IndexDef {
     /// Position of the indexed column inside the table's column list.
     pub column_index: usize,
     pub root_page_id: PageId,
+}
+
+#[derive(Debug, Clone)]
+pub struct SequenceDef {
+    pub seq_id: usize,
+    pub name: String,
+    pub seq_page_id: PageId,
+    pub increment: i64,
+    pub start_value: i64,
+    pub min_value: i64,
+    pub max_value: i64,
 }
 
 impl TableDef {
@@ -141,6 +153,7 @@ impl Catalog {
             if table_id == PG_CLASS_TABLE_ID
                 || table_id == PG_ATTRIBUTE_TABLE_ID
                 || table_id == PG_INDEX_TABLE_ID
+                || table_id == PG_SEQUENCE_TABLE_ID
             {
                 continue;
             }
@@ -292,6 +305,55 @@ impl Catalog {
     pub fn find_index(&self, name: &str) -> Result<Option<IndexDef>> {
         Ok(self.all_indexes()?.into_iter().find(|i| i.name == name))
     }
+
+    pub fn all_sequences(&self) -> Result<Vec<SequenceDef>> {
+        let schema = pg_sequence_schema();
+        let mut out = Vec::new();
+        for (_, _, _, values) in self.scan_chain(PG_SEQUENCE_PAGE_ID, &schema)? {
+            let seq_id = match &values[0] {
+                Value::Int(n) => *n as usize,
+                _ => continue,
+            };
+            let name = match &values[1] {
+                Value::Varchar(s) => s.clone(),
+                _ => continue,
+            };
+            let seq_page_id = match &values[2] {
+                Value::Int(n) => *n as PageId,
+                _ => continue,
+            };
+            let increment = match &values[3] {
+                Value::Int(n) => *n as i64,
+                _ => continue,
+            };
+            let start_value = match &values[4] {
+                Value::Int(n) => *n as i64,
+                _ => continue,
+            };
+            let min_value = match &values[5] {
+                Value::Int(n) => *n as i64,
+                _ => continue,
+            };
+            let max_value = match &values[6] {
+                Value::Int(n) => *n as i64,
+                _ => continue,
+            };
+            out.push(SequenceDef {
+                seq_id,
+                name,
+                seq_page_id,
+                increment,
+                start_value,
+                min_value,
+                max_value,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn find_sequence(&self, name: &str) -> Result<Option<SequenceDef>> {
+        Ok(self.all_sequences()?.into_iter().find(|s| s.name == name))
+    }
 }
 
 pub fn pg_class_schema() -> Schema {
@@ -307,6 +369,41 @@ pub fn pg_class_schema() -> Schema {
             },
             Column {
                 name: "first_page_id".to_string(),
+                data_type: DataType::Int,
+            },
+        ],
+    }
+}
+
+pub fn pg_sequence_schema() -> Schema {
+    Schema {
+        columns: vec![
+            Column {
+                name: "seq_id".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "name".to_string(),
+                data_type: DataType::Varchar,
+            },
+            Column {
+                name: "seq_page_id".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "increment".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "start_value".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "min_value".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "max_value".to_string(),
                 data_type: DataType::Int,
             },
         ],

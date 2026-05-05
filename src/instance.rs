@@ -481,6 +481,14 @@ fn run_query_with_options(
             let n = expect_affected(execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("TRUNCATE TABLE {n}"))?;
         }
+        AnalyzedStatement::CreateSequence(_) => {
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("CREATE SEQUENCE")?;
+        }
+        AnalyzedStatement::DropSequence(_) => {
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("DROP SEQUENCE")?;
+        }
     }
     Ok(())
 }
