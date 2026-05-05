@@ -17,13 +17,6 @@ pub struct TableDef {
 }
 
 impl TableDef {
-    pub fn find_column(&self, name: &str) -> Option<(usize, &ColumnDef)> {
-        self.columns
-            .iter()
-            .enumerate()
-            .find(|(_, c)| c.name == name)
-    }
-
     pub fn to_schema(&self) -> Schema {
         Schema {
             columns: self
@@ -70,7 +63,6 @@ impl Catalog {
             .find(|(_, t)| t.name == name)
     }
 
-    #[allow(dead_code)]
     pub fn table_by_id(&self, id: usize) -> Option<&TableDef> {
         self.tables.get(id)
     }

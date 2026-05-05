@@ -78,15 +78,11 @@ fn null_bitmap_size(num_columns: usize) -> usize {
 
 // Tuple layout: [null bitmap (ceil(N/8) bytes)] [non-null values, in column order]
 // Bitmap convention: bit i set => column i IS NULL.
-pub fn serialize_tuple(values: &[Value], schema: &Schema) -> Result<Vec<u8>> {
-    if values.len() != schema.columns.len() {
-        bail!(
-            "tuple arity mismatch: got {} values, schema has {} columns",
-            values.len(),
-            schema.columns.len()
-        );
-    }
-    let bitmap_len = null_bitmap_size(schema.columns.len());
+//
+// Arity validation is the caller's responsibility (the analyzer already
+// enforces it for INSERT). This keeps the function dependency-free.
+pub fn serialize_tuple(values: &[Value]) -> Vec<u8> {
+    let bitmap_len = null_bitmap_size(values.len());
     let mut buf = vec![0u8; bitmap_len];
     for (i, value) in values.iter().enumerate() {
         if matches!(value, Value::Null) {
@@ -96,7 +92,7 @@ pub fn serialize_tuple(values: &[Value], schema: &Schema) -> Result<Vec<u8>> {
     for value in values {
         serialize_value(value, &mut buf);
     }
-    Ok(buf)
+    buf
 }
 
 pub fn deserialize_tuple(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
@@ -146,16 +142,10 @@ mod tests {
             vec![Value::Null, Value::Null],
         ];
         for original in cases {
-            let bytes = serialize_tuple(&original, &schema).unwrap();
+            let bytes = serialize_tuple(&original);
             let decoded = deserialize_tuple(&bytes, &schema).unwrap();
             assert_eq!(decoded, original);
         }
-    }
-
-    #[test]
-    fn arity_mismatch_is_rejected() {
-        let schema = schema_2col();
-        assert!(serialize_tuple(&[Value::Int(1)], &schema).is_err());
     }
 
     #[test]
@@ -176,7 +166,7 @@ mod tests {
             vec![Value::Bool(true), Value::Bool(false)],
             vec![Value::Null, Value::Bool(true)],
         ] {
-            let bytes = serialize_tuple(&vs, &schema).unwrap();
+            let bytes = serialize_tuple(&vs);
             assert_eq!(deserialize_tuple(&bytes, &schema).unwrap(), vs);
         }
     }

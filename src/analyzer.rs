@@ -4,6 +4,11 @@
 //! can be added without restructuring later. day05 only ever produces a single
 //! base-table RTE per SELECT.
 
+// Many analyzed-AST fields (column_name, rte_index, table_name, ...) are public
+// surface that later days will read (wire protocol, errors, planner). The
+// day06 executor doesn't yet consume all of them.
+#![allow(dead_code)]
+
 use std::mem;
 
 use anyhow::{Result, bail};
