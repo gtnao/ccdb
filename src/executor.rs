@@ -8,9 +8,10 @@
 use anyhow::{Result, bail};
 
 use crate::analyzer::{
-    AggArg, AggKind, AnalyzedAggregate, AnalyzedDeleteStatement, AnalyzedExpr, AnalyzedFrom,
-    AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedOrderBy, AnalyzedSelectStatement,
-    AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue, TableSource,
+    AggArg, AggKind, AnalyzedAggregate, AnalyzedCreateIndexStatement, AnalyzedDeleteStatement,
+    AnalyzedExpr, AnalyzedFrom, AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedOrderBy,
+    AnalyzedSelectStatement, AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue,
+    TableSource,
 };
 use crate::ast::{BinaryOperator, JoinType, OrderDir, UnaryOperator};
 use crate::buffer_pool::BufferPool;
@@ -133,6 +134,125 @@ impl Executor for SeqScan<'_> {
             self.cur_slot = 0;
         }
         Ok(None)
+    }
+}
+
+// -- IndexScan ---------------------------------------------------------------
+
+/// Range over which `IndexScan` walks the leaf chain. `Eq` is just a special
+/// case of a closed range over a single key, kept separate so the planner
+/// can talk about it cleanly.
+#[derive(Debug, Clone)]
+pub enum IndexRange {
+    /// Equality lookup: only entries whose key is exactly `key`.
+    Eq { key: crate::btree::KeyBytes },
+    /// Closed range `low ≤ key ≤ high` (sysbench's BETWEEN translates here).
+    Between {
+        low: crate::btree::KeyBytes,
+        high: crate::btree::KeyBytes,
+    },
+}
+
+/// MVCC-aware scan that walks an index leaf chain instead of the table's
+/// heap pages. For each `(key, rid)` it pulls the heap tuple at `rid` and
+/// runs a visibility check.
+pub struct IndexScan<'a> {
+    bpm: &'a BufferPool,
+    schema: Schema,
+    root: PageId,
+    range: IndexRange,
+    key_type: DataType,
+    snapshot: Snapshot,
+    tm: &'a TransactionManager,
+    cursor: Option<crate::btree::LeafCursor>,
+    initialized: bool,
+}
+
+impl<'a> IndexScan<'a> {
+    pub fn new(
+        bpm: &'a BufferPool,
+        catalog: &Catalog,
+        table_id: usize,
+        root: PageId,
+        range: IndexRange,
+        key_type: DataType,
+        snapshot: Snapshot,
+        tm: &'a TransactionManager,
+    ) -> Result<Self> {
+        let table = catalog
+            .table_by_id(table_id)?
+            .ok_or_else(|| anyhow::anyhow!("table id {table_id} not in catalog"))?;
+        Ok(Self {
+            bpm,
+            schema: table.to_schema(),
+            root,
+            range,
+            key_type,
+            snapshot,
+            tm,
+            cursor: None,
+            initialized: false,
+        })
+    }
+
+    fn start_key(&self) -> &[u8] {
+        match &self.range {
+            IndexRange::Eq { key } => key,
+            IndexRange::Between { low, .. } => low,
+        }
+    }
+
+    /// True if `key` is past the upper bound of `range` (so we should stop).
+    fn key_past_upper(&self, key: &[u8]) -> Result<bool> {
+        match &self.range {
+            IndexRange::Eq { key: target } => {
+                Ok(crate::btree::compare_keys(key, target, self.key_type)?
+                    != std::cmp::Ordering::Equal)
+            }
+            IndexRange::Between { high, .. } => Ok(crate::btree::compare_keys(
+                key,
+                high,
+                self.key_type,
+            )? == std::cmp::Ordering::Greater),
+        }
+    }
+}
+
+impl Executor for IndexScan<'_> {
+    fn open(&mut self) -> Result<()> {
+        if !self.initialized {
+            self.cursor =
+                crate::btree::first_ge(self.bpm, self.root, self.start_key(), self.key_type)?;
+            self.initialized = true;
+        }
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        loop {
+            let Some(c) = self.cursor else {
+                return Ok(None);
+            };
+            let (key, rid, next_cursor) = crate::btree::read_at(self.bpm, c)?;
+            self.cursor = next_cursor;
+            if self.key_past_upper(&key)? {
+                self.cursor = None;
+                return Ok(None);
+            }
+            // Visibility filter at the heap level. The same row can match the
+            // index multiple times if it was updated in place; visibility
+            // ensures we surface only the snapshot's chosen version.
+            let g = self.bpm.fetch_page(rid.0)?;
+            let p = g.read();
+            let Some(raw) = p.get_tuple(rid.1) else {
+                continue; // tombstoned slot
+            };
+            let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &self.schema)?;
+            if !visibility::is_visible(xmin, xmax, &self.snapshot, self.tm) {
+                continue;
+            }
+            return Ok(Some(Tuple::new(values)));
+        }
     }
 }
 
@@ -885,7 +1005,8 @@ fn perform_create_table(
         max_id = max_id.max(table.table_id as i32);
     }
     // System tables occupy 0 and 1; user tables start at 2.
-    let new_table_id = (max_id + 1).max(2);
+    // System tables 0=pg_class, 1=pg_attribute, 2=pg_index. User tables start at 3.
+    let new_table_id = (max_id + 1).max(3);
 
     // Allocate the table's first heap page.
     let new_page_id = {
@@ -929,6 +1050,78 @@ fn perform_create_table(
     Ok(())
 }
 
+/// Build a B+Tree index over an existing table.
+///
+/// Steps:
+///   1. Pick a fresh `index_id` (max existing + 1).
+///   2. Allocate an empty leaf as the initial root.
+///   3. Scan the table's heap, inserting every committed-and-visible
+///      `(key, rid)` pair into the tree. We use the system snapshot here —
+///      uncommitted concurrent writes get re-indexed on their commit (the
+///      DML path inserts into every index for the table).
+///   4. Insert the corresponding row into `pg_index`.
+///
+/// Logged via per-page LSNs as part of the regular WAL machinery.
+fn perform_create_index(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    catalog: &Catalog,
+    stmt: &AnalyzedCreateIndexStatement,
+    tx: &mut Transaction,
+) -> Result<()> {
+    use crate::bootstrap::PG_INDEX_PAGE_ID;
+
+    // Pick a fresh index_id.
+    let mut max_id: i32 = -1;
+    for idx in catalog.all_indexes()? {
+        max_id = max_id.max(idx.index_id as i32);
+    }
+    let new_index_id = max_id + 1;
+
+    // Allocate root.
+    let root = crate::btree::new_empty_root(bpm)?;
+
+    // Bulk insert: scan heap, push each (key, rid) into the tree. We use a
+    // system snapshot so we see all rows; visibility is checked at scan time
+    // (so aborted/uncommitted-other rows are skipped).
+    let table = catalog
+        .table_by_id(stmt.table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
+    let snapshot = tx
+        .snapshot()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
+    let (_schema, rows) = visible_rows(bpm, catalog, stmt.table_id, &snapshot, tx.tm())?;
+    let mut current_root = root;
+    for (pid, slot, values) in rows {
+        let key_value = &values[stmt.column_index];
+        if matches!(key_value, Value::Null) {
+            // Convention: NULL keys are not indexed (matches PostgreSQL with
+            // partial indexes; equality lookups for NULL would need IS NULL
+            // which is a separate syntactic path anyway).
+            continue;
+        }
+        let key = crate::btree::encode_key(key_value);
+        current_root = crate::btree::insert(bpm, current_root, &key, (pid, slot), stmt.data_type)?;
+    }
+
+    // Register in pg_index.
+    let row = serialize_tuple_mvcc(
+        tx.id(),
+        INVALID_TXN_ID,
+        &[
+            Value::Int(new_index_id),
+            Value::Varchar(stmt.name.clone()),
+            Value::Int(stmt.table_id as i32),
+            Value::Int(stmt.column_index as i32),
+            Value::Int(current_root as i32),
+        ],
+    );
+    insert_bytes(bpm, wal, tx, PG_INDEX_PAGE_ID, &row)?;
+    let _ = table; // referenced for the catalog read; suppress unused warning
+    Ok(())
+}
+
 fn perform_insert(
     bpm: &BufferPool,
     lm: &LockManager,
@@ -961,9 +1154,137 @@ fn perform_insert(
         lm.lock(tx.id(), rid, LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
         tx.add_lock(rid);
+        // Maintain every index on this table. Index lookup of `key → rid`
+        // and heap visibility check work together to keep aborts correct:
+        // if this txn aborts, the index entry stays but the heap tuple has
+        // an aborted xmin so visibility filters it out.
+        index_insert_for_row(bpm, catalog, stmt.table_id, &values, rid)?;
         count += 1;
     }
     Ok(count)
+}
+
+/// Walk every index on `table_id` and add a `(key, rid)` entry for each.
+/// Treats NULL values as not-indexed (matches `perform_create_index`).
+fn index_insert_for_row(
+    bpm: &BufferPool,
+    catalog: &Catalog,
+    table_id: usize,
+    values: &[Value],
+    rid: Rid,
+) -> Result<()> {
+    let indexes = catalog.indexes_for_table(table_id)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table {table_id} missing"))?;
+    for idx in indexes {
+        let key_value = &values[idx.column_index];
+        if matches!(key_value, Value::Null) {
+            continue;
+        }
+        let key = crate::btree::encode_key(key_value);
+        let dt = table.columns[idx.column_index].data_type;
+        let new_root = crate::btree::insert(bpm, idx.root_page_id, &key, rid, dt)?;
+        if new_root != idx.root_page_id {
+            update_index_root(bpm, idx.index_id, new_root)?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk the indexes on `table_id` and remove `(key_for_each_index, rid)`.
+/// Used by DELETE and the delete-half of UPDATE.
+fn index_delete_for_row(
+    bpm: &BufferPool,
+    catalog: &Catalog,
+    table_id: usize,
+    values: &[Value],
+    rid: Rid,
+) -> Result<()> {
+    let indexes = catalog.indexes_for_table(table_id)?;
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table {table_id} missing"))?;
+    for idx in indexes {
+        let key_value = &values[idx.column_index];
+        if matches!(key_value, Value::Null) {
+            continue;
+        }
+        let key = crate::btree::encode_key(key_value);
+        let dt = table.columns[idx.column_index].data_type;
+        let _removed = crate::btree::delete(bpm, idx.root_page_id, &key, rid, dt)?;
+        // It's OK if removed=false — the entry might already be gone (e.g.
+        // partial undo of a prior abort that skipped the heap).
+    }
+    Ok(())
+}
+
+/// Patch the `root_page_id` column in the `pg_index` row whose `index_id`
+/// matches. Called when a tree split bubbles up to a brand-new root.
+///
+/// We tombstone the old row and append a new one with the updated root in
+/// the same `pg_index` chain. Since `Catalog::all_indexes` reads the chain
+/// linearly and skips tombstones, lookups see only the latest version.
+fn update_index_root(bpm: &BufferPool, index_id: usize, new_root: PageId) -> Result<()> {
+    use crate::bootstrap::{PG_INDEX_PAGE_ID, SYSTEM_TXN_ID};
+    use crate::catalog::pg_index_schema;
+    let schema = pg_index_schema();
+
+    // Pass 1: find the matching row and snapshot its other columns.
+    let mut found: Option<(PageId, SlotId, Vec<Value>)> = None;
+    let mut cur = PG_INDEX_PAGE_ID;
+    while cur != crate::page::NO_NEXT_PAGE && cur < bpm.page_count() {
+        let g = bpm.fetch_page(cur)?;
+        let p = g.read();
+        let next = p.next_page_id();
+        let n = p.tuple_count();
+        for slot in 0..n {
+            if let Some(raw) = p.get_tuple(slot) {
+                let (_, _, vals) = deserialize_tuple_mvcc(raw, &schema)?;
+                if matches!(&vals[0], Value::Int(n) if *n as usize == index_id) {
+                    found = Some((cur, slot, vals));
+                    break;
+                }
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+        drop(p);
+        drop(g);
+        cur = next;
+    }
+    let (page_id, slot, vals) =
+        found.ok_or_else(|| anyhow::anyhow!("update_index_root: index {index_id} not found"))?;
+
+    // Pass 2: tombstone old, append new. Skip WAL — these rewrites are rare
+    // and the system-txn xmin keeps them visible across crashes.
+    {
+        let g = bpm.fetch_page(page_id)?;
+        let mut p = g.write();
+        p.delete(slot)?;
+    }
+    let new_bytes = serialize_tuple_mvcc(
+        SYSTEM_TXN_ID,
+        INVALID_TXN_ID,
+        &[
+            vals[0].clone(),
+            vals[1].clone(),
+            vals[2].clone(),
+            vals[3].clone(),
+            Value::Int(new_root as i32),
+        ],
+    );
+    let g = bpm.fetch_page(PG_INDEX_PAGE_ID)?;
+    let mut head = g.write();
+    head.insert(&new_bytes)?;
+    Ok(())
 }
 
 /// Coerce an evaluated value into the column's declared storage type.
@@ -1038,30 +1359,35 @@ fn perform_delete(
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
     let (_schema, rows) = visible_rows(bpm, catalog, stmt.table_id, &snapshot, tm)?;
-    let mut victims: Vec<Rid> = Vec::new();
+    let mut victims: Vec<(Rid, Vec<Value>)> = Vec::new();
     for (pid, slot, values) in rows {
         let t = Tuple::new(values);
         if matches(stmt.where_clause.as_ref(), &t)? {
-            victims.push((pid, slot));
+            victims.push(((pid, slot), t.values));
         }
     }
-    for &(pid, slot) in &victims {
-        lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
-            .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
-        tx.add_lock((pid, slot));
+    for ((pid, slot), values) in &victims {
+        lm.lock(tx.id(), (*pid, *slot), LockMode::Exclusive)
+            .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (*pid, *slot)))?;
+        tx.add_lock((*pid, *slot));
         // MVCC logical delete: only the xmax field changes.
-        let g = bpm.fetch_page(pid)?;
-        let mut p = g.write();
-        p.set_tuple_xmax(slot, tx.id())?;
-        let lsn = log_record(
-            wal,
-            tx,
-            WalRecordType::Delete {
-                rid: (pid, slot),
-                xmax: tx.id(),
-            },
-        )?;
-        p.set_page_lsn(lsn);
+        {
+            let g = bpm.fetch_page(*pid)?;
+            let mut p = g.write();
+            p.set_tuple_xmax(*slot, tx.id())?;
+            let lsn = log_record(
+                wal,
+                tx,
+                WalRecordType::Delete {
+                    rid: (*pid, *slot),
+                    xmax: tx.id(),
+                },
+            )?;
+            p.set_page_lsn(lsn);
+        }
+        // Drop the index pointer too. Aborts that re-revive the heap row by
+        // CLR also reinsert into indexes (handled in recovery).
+        index_delete_for_row(bpm, catalog, stmt.table_id, values, (*pid, *slot))?;
     }
     Ok(victims.len())
 }
@@ -1083,13 +1409,14 @@ fn perform_update(
     let table = catalog
         .table_by_id(stmt.table_id)?
         .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
-    let mut work: Vec<(PageId, SlotId, Vec<u8>)> = Vec::new();
+    let mut work: Vec<(PageId, SlotId, Vec<Value>, Vec<Value>, Vec<u8>)> = Vec::new();
 
     for (pid, slot, values) in rows {
         let t = Tuple::new(values);
         if !matches(stmt.where_clause.as_ref(), &t)? {
             continue;
         }
+        let old_values = t.values.clone();
         let mut new_values = t.values.clone();
         for a in &stmt.assignments {
             let v = evaluate_expr(&a.value, &t)?;
@@ -1097,11 +1424,11 @@ fn perform_update(
             new_values[a.column_index] = coerce_for_storage(v, target)?;
         }
         let new_bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
-        work.push((pid, slot, new_bytes));
+        work.push((pid, slot, old_values, new_values, new_bytes));
     }
 
     let count = work.len();
-    for (pid, slot, new_bytes) in work {
+    for (pid, slot, old_values, new_values, new_bytes) in work {
         lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
         tx.add_lock((pid, slot));
@@ -1119,10 +1446,14 @@ fn perform_update(
             )?;
             p.set_page_lsn(lsn);
         }
+        // Index maintenance: remove the old version's entries, then add new
+        // ones once the new heap row has its rid.
+        index_delete_for_row(bpm, catalog, stmt.table_id, &old_values, (pid, slot))?;
         let (new_rid, _) = insert_bytes(bpm, wal, tx, table.first_page_id, &new_bytes)?;
         lm.lock(tx.id(), new_rid, LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
         tx.add_lock(new_rid);
+        index_insert_for_row(bpm, catalog, stmt.table_id, &new_values, new_rid)?;
     }
     Ok(count)
 }
@@ -1299,8 +1630,10 @@ pub fn execute(
             perform_create_table(bpm, wal, catalog, s, tx)?;
             Ok(Output::Affected(0))
         }
-        // Accepted-but-unimplemented CREATE INDEX. Real index DDL lands later.
-        AnalyzedStatement::CreateIndexNoop => Ok(Output::Affected(0)),
+        AnalyzedStatement::CreateIndex(s) => {
+            perform_create_index(bpm, wal, catalog, s, tx)?;
+            Ok(Output::Affected(0))
+        }
         AnalyzedStatement::Checkpoint => {
             // Handled at the connection layer (instance.rs) — has access to
             // the global ATT and DPT, which the executor doesn't.
@@ -1342,7 +1675,36 @@ fn build_select_pipeline<'a>(
     snapshot: Snapshot,
     tm: &'a TransactionManager,
 ) -> Result<Box<dyn Executor + 'a>> {
-    let from_exec = build_from_pipeline(bpm, catalog, &stmt.from, &stmt.range_table, &snapshot, tm)?;
+    // Try to swap a SeqScan for an IndexScan when:
+    //   - FROM is a single base table (no joins)
+    //   - WHERE has an `indexed_col = literal` or `indexed_col BETWEEN x AND y`
+    //     pattern, after BETWEEN's parse-time desugaring to >= AND <=.
+    // The Filter on top stays in place: it's a no-op for the index-driven
+    // predicate but still applies any other AND-clauses, and is harmless if
+    // duplicated.
+    let from_exec = if let AnalyzedFrom::Table { rte_index } = &stmt.from {
+        let rte = &stmt.range_table[*rte_index];
+        let TableSource::BaseTable { table_id, .. } = &rte.source;
+        let table_id = *table_id;
+        if let Some((idx, range, key_type)) =
+            find_indexable_predicate(&stmt.where_clause, table_id, catalog)?
+        {
+            Box::new(IndexScan::new(
+                bpm,
+                catalog,
+                table_id,
+                idx.root_page_id,
+                range,
+                key_type,
+                snapshot.clone(),
+                tm,
+            )?) as Box<dyn Executor + 'a>
+        } else {
+            build_from_pipeline(bpm, catalog, &stmt.from, &stmt.range_table, &snapshot, tm)?
+        }
+    } else {
+        build_from_pipeline(bpm, catalog, &stmt.from, &stmt.range_table, &snapshot, tm)?
+    };
     let filtered: Box<dyn Executor + 'a> = match &stmt.where_clause {
         Some(p) => Box::new(Filter::new(from_exec, p.clone())),
         None => from_exec,
@@ -1380,6 +1742,113 @@ fn build_select_pipeline<'a>(
         .map(|i| i.expr.clone())
         .collect();
     Ok(Box::new(Project::new(limited, exprs)))
+}
+
+/// Look at the WHERE clause and decide whether an IndexScan is applicable.
+/// The first matching pattern wins; any remaining predicate is left to the
+/// Filter on top of the scan.
+fn find_indexable_predicate(
+    where_clause: &Option<AnalyzedExpr>,
+    table_id: usize,
+    catalog: &Catalog,
+) -> Result<Option<(crate::catalog::IndexDef, IndexRange, DataType)>> {
+    let Some(expr) = where_clause else {
+        return Ok(None);
+    };
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table {table_id} missing"))?;
+    let indexes = catalog.indexes_for_table(table_id)?;
+    if indexes.is_empty() {
+        return Ok(None);
+    }
+
+    // Try equality first.
+    if let Some((col_idx, lit)) = match_eq_col_literal(expr) {
+        if let Some(idx) = indexes.iter().find(|i| i.column_index == col_idx) {
+            let dt = table.columns[col_idx].data_type;
+            let key = crate::btree::encode_key(&literal_to_value(&lit));
+            return Ok(Some((idx.clone(), IndexRange::Eq { key }, dt)));
+        }
+    }
+
+    // Then closed range `col >= L AND col <= H` (the desugared form of BETWEEN).
+    if let Some((col_idx, low_lit, high_lit)) = match_between(expr) {
+        if let Some(idx) = indexes.iter().find(|i| i.column_index == col_idx) {
+            let dt = table.columns[col_idx].data_type;
+            let low = crate::btree::encode_key(&literal_to_value(&low_lit));
+            let high = crate::btree::encode_key(&literal_to_value(&high_lit));
+            return Ok(Some((idx.clone(), IndexRange::Between { low, high }, dt)));
+        }
+    }
+
+    Ok(None)
+}
+
+/// Match `col = lit` or `lit = col` and return `(column_index, lit)`.
+fn match_eq_col_literal(expr: &AnalyzedExpr) -> Option<(usize, AnalyzedLiteral)> {
+    let AnalyzedExpr::BinaryOp { left, op, right, .. } = expr else {
+        return None;
+    };
+    if !matches!(op, crate::ast::BinaryOperator::Eq) {
+        return None;
+    }
+    if let (AnalyzedExpr::ColumnRef(c), AnalyzedExpr::Literal(l)) = (left.as_ref(), right.as_ref()) {
+        return Some((c.column_index, l.clone()));
+    }
+    if let (AnalyzedExpr::Literal(l), AnalyzedExpr::ColumnRef(c)) = (left.as_ref(), right.as_ref()) {
+        return Some((c.column_index, l.clone()));
+    }
+    None
+}
+
+/// Match `col >= L AND col <= H` (or with operands swapped on either side)
+/// and return `(column_index, low, high)`.
+fn match_between(expr: &AnalyzedExpr) -> Option<(usize, AnalyzedLiteral, AnalyzedLiteral)> {
+    let AnalyzedExpr::BinaryOp { left, op, right, .. } = expr else {
+        return None;
+    };
+    if !matches!(op, crate::ast::BinaryOperator::And) {
+        return None;
+    }
+    let (lcol, lop, llit) = match_cmp_col_literal(left)?;
+    let (rcol, rop, rlit) = match_cmp_col_literal(right)?;
+    if lcol != rcol {
+        return None;
+    }
+    use crate::ast::BinaryOperator::*;
+    match (lop, rop) {
+        (Ge, Le) => Some((lcol, llit, rlit)),
+        (Le, Ge) => Some((lcol, rlit, llit)),
+        _ => None,
+    }
+}
+
+fn match_cmp_col_literal(
+    expr: &AnalyzedExpr,
+) -> Option<(usize, crate::ast::BinaryOperator, AnalyzedLiteral)> {
+    let AnalyzedExpr::BinaryOp { left, op, right, .. } = expr else {
+        return None;
+    };
+    use crate::ast::BinaryOperator::*;
+    if !matches!(op, Eq | Ne | Lt | Le | Gt | Ge) {
+        return None;
+    }
+    if let (AnalyzedExpr::ColumnRef(c), AnalyzedExpr::Literal(l)) = (left.as_ref(), right.as_ref()) {
+        return Some((c.column_index, *op, l.clone()));
+    }
+    if let (AnalyzedExpr::Literal(l), AnalyzedExpr::ColumnRef(c)) = (left.as_ref(), right.as_ref()) {
+        // Swap: `lit OP col` is equivalent to `col SWAP_OP lit`.
+        let swapped = match op {
+            Lt => Gt,
+            Le => Ge,
+            Gt => Lt,
+            Ge => Le,
+            other => *other,
+        };
+        return Some((c.column_index, swapped, l.clone()));
+    }
+    None
 }
 
 fn build_from_pipeline<'a>(

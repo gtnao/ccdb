@@ -5,6 +5,7 @@
 mod analyzer;
 mod ast;
 mod bootstrap;
+mod btree;
 mod buffer_pool;
 mod catalog;
 mod checkpoint;

@@ -11,22 +11,47 @@ pub type Rid = (PageId, SlotId);
 
 // Slotted page layout (all little-endian):
 //
-//   header (20 bytes):
+//   header (24 bytes):
 //     [0..4)   page_id            : u32
-//     [4..8)   next_page_id       : u32   // NO_NEXT_PAGE means end of chain
-//     [8..10)  tuple_count        : u16
-//     [10..12) free_space_offset  : u16
+//     [4..8)   next_page_id       : u32   // heap: next chain page; btree leaf:
+//                                          // next leaf; btree internal: leftmost
+//                                          // child pointer (p0).
+//     [8..10)  tuple_count        : u16   // number of slot entries
+//     [10..12) free_space_offset  : u16   // smallest tuple-data offset in use
 //     [12..20) page_lsn           : u64
+//     [20..21) page_kind          : u8    // 0=heap, 1=btree leaf, 2=btree internal
+//     [21..24) reserved
 //
-//   slot array (grows forward from byte 20):
+//   slot array (grows forward from byte 24):
 //     each slot is 4 bytes: u16 offset || u16 length
 //
 //   tuple data (grows backward from PAGE_SIZE):
 //     newest tuple sits at free_space_offset
 
-const HEADER_SIZE: usize = 20;
+const HEADER_SIZE: usize = 24;
 const SLOT_SIZE: usize = 4;
 pub const NO_NEXT_PAGE: PageId = u32::MAX;
+
+/// Distinguishes heap pages from B+Tree nodes. Stored in the page header so
+/// that recovery and the buffer pool can tell which structural layout the
+/// page bytes encode without consulting the catalog.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PageKind {
+    Heap = 0,
+    BTreeLeaf = 1,
+    BTreeInternal = 2,
+}
+
+impl PageKind {
+    pub fn from_u8(b: u8) -> Self {
+        match b {
+            1 => PageKind::BTreeLeaf,
+            2 => PageKind::BTreeInternal,
+            _ => PageKind::Heap,
+        }
+    }
+}
 
 pub struct Page {
     data: [u8; PAGE_SIZE],
@@ -91,6 +116,21 @@ impl Page {
 
     pub fn set_page_lsn(&mut self, lsn: Lsn) {
         self.data[12..20].copy_from_slice(&lsn.to_le_bytes());
+    }
+
+    pub fn page_kind(&self) -> PageKind {
+        PageKind::from_u8(self.data[20])
+    }
+
+    pub fn set_page_kind(&mut self, k: PageKind) {
+        self.data[20] = k as u8;
+    }
+
+    /// Mutable raw access to the page bytes. Used by recovery to apply a
+    /// physical undo image without going through the slot interface, and by
+    /// the B+Tree to write its own layout directly.
+    pub fn as_bytes_mut(&mut self) -> &mut [u8; PAGE_SIZE] {
+        &mut self.data
     }
 
     pub fn free_space(&self) -> usize {

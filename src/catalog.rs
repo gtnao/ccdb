@@ -11,7 +11,7 @@ use anyhow::Result;
 
 use crate::bootstrap::{
     datatype_from_int, PG_ATTRIBUTE_PAGE_ID, PG_ATTRIBUTE_TABLE_ID, PG_CLASS_PAGE_ID,
-    PG_CLASS_TABLE_ID,
+    PG_CLASS_TABLE_ID, PG_INDEX_PAGE_ID, PG_INDEX_TABLE_ID,
 };
 use crate::buffer_pool::BufferPool;
 use crate::page::{PageId, NO_NEXT_PAGE};
@@ -31,6 +31,16 @@ pub struct TableDef {
     pub name: String,
     pub first_page_id: PageId,
     pub columns: Vec<ColumnDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexDef {
+    pub index_id: usize,
+    pub name: String,
+    pub table_id: usize,
+    /// Position of the indexed column inside the table's column list.
+    pub column_index: usize,
+    pub root_page_id: PageId,
 }
 
 impl TableDef {
@@ -128,7 +138,10 @@ impl Catalog {
                 Value::Int(n) => *n,
                 _ => continue,
             };
-            if table_id == PG_CLASS_TABLE_ID || table_id == PG_ATTRIBUTE_TABLE_ID {
+            if table_id == PG_CLASS_TABLE_ID
+                || table_id == PG_ATTRIBUTE_TABLE_ID
+                || table_id == PG_INDEX_TABLE_ID
+            {
                 continue;
             }
             let name = match &values[1] {
@@ -230,6 +243,55 @@ impl Catalog {
     pub fn tm(&self) -> &Arc<TransactionManager> {
         &self.tm
     }
+
+    /// Every committed-and-not-deleted index registered in `pg_index`.
+    pub fn all_indexes(&self) -> Result<Vec<IndexDef>> {
+        let schema = pg_index_schema();
+        let mut out = Vec::new();
+        for (_, _, _, values) in self.scan_chain(PG_INDEX_PAGE_ID, &schema)? {
+            let index_id = match &values[0] {
+                Value::Int(n) => *n as usize,
+                _ => continue,
+            };
+            let name = match &values[1] {
+                Value::Varchar(s) => s.clone(),
+                _ => continue,
+            };
+            let table_id = match &values[2] {
+                Value::Int(n) => *n as usize,
+                _ => continue,
+            };
+            let column_index = match &values[3] {
+                Value::Int(n) => *n as usize,
+                _ => continue,
+            };
+            let root_page_id = match &values[4] {
+                Value::Int(n) => *n as PageId,
+                _ => continue,
+            };
+            out.push(IndexDef {
+                index_id,
+                name,
+                table_id,
+                column_index,
+                root_page_id,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Indexes defined on a particular table (in declaration order).
+    pub fn indexes_for_table(&self, table_id: usize) -> Result<Vec<IndexDef>> {
+        Ok(self
+            .all_indexes()?
+            .into_iter()
+            .filter(|i| i.table_id == table_id)
+            .collect())
+    }
+
+    pub fn find_index(&self, name: &str) -> Result<Option<IndexDef>> {
+        Ok(self.all_indexes()?.into_iter().find(|i| i.name == name))
+    }
 }
 
 pub fn pg_class_schema() -> Schema {
@@ -245,6 +307,33 @@ pub fn pg_class_schema() -> Schema {
             },
             Column {
                 name: "first_page_id".to_string(),
+                data_type: DataType::Int,
+            },
+        ],
+    }
+}
+
+pub fn pg_index_schema() -> Schema {
+    Schema {
+        columns: vec![
+            Column {
+                name: "index_id".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "name".to_string(),
+                data_type: DataType::Varchar,
+            },
+            Column {
+                name: "table_id".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "column_index".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "root_page_id".to_string(),
                 data_type: DataType::Int,
             },
         ],

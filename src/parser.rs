@@ -326,23 +326,31 @@ impl Parser {
         }))
     }
 
-    /// `CREATE INDEX [name] ON tbl (cols)` — accepted as a no-op so sysbench's
-    /// index DDL doesn't fail. Returns a Begin/Commit-shaped Statement
-    /// because we don't yet have a dedicated AST node for it.
+    /// `CREATE INDEX <name> ON <table> (<col>)` — currently single-column only.
+    /// Optional `IF NOT EXISTS` is accepted (sysbench uses it).
     fn parse_create_index_noop(&mut self) -> Result<Statement> {
         self.expect(&Token::Index)?;
-        // Optional index name (anything that's an Ident).
-        if matches!(self.peek(), Some(Token::Ident(_))) {
+        if matches!(self.peek(), Some(Token::If)) {
+            self.bump();
+            self.expect(&Token::Not)?;
+            self.expect(&Token::Exists)?;
+        }
+        let name = self.parse_ident()?;
+        self.expect(&Token::On)?;
+        let table = self.parse_ident()?;
+        self.expect(&Token::LParen)?;
+        let column = self.parse_ident()?;
+        // Skip any extra columns or modifiers — multi-column indexes not
+        // supported yet; we just take the first column and ignore the rest.
+        while !matches!(self.peek(), Some(Token::RParen) | None) {
             self.bump();
         }
-        // Skip `ON <table> (cols)`. We just consume tokens until end of statement.
-        while let Some(t) = self.peek() {
-            if matches!(t, Token::Semicolon) {
-                break;
-            }
-            self.bump();
-        }
-        Ok(Statement::CreateIndexNoop)
+        self.expect(&Token::RParen)?;
+        Ok(Statement::CreateIndex(CreateIndexStatement {
+            name,
+            table,
+            column,
+        }))
     }
 
     fn parse_data_type(&mut self) -> Result<DataType> {
@@ -991,9 +999,12 @@ mod tests {
     }
 
     #[test]
-    fn create_index_noop() {
+    fn create_index_parses() {
         let s = parse("CREATE INDEX k_1 ON sbtest1(k)").unwrap();
-        assert!(matches!(s, Statement::CreateIndexNoop));
+        let Statement::CreateIndex(c) = s else { panic!() };
+        assert_eq!(c.name, "k_1");
+        assert_eq!(c.table, "sbtest1");
+        assert_eq!(c.column, "k");
     }
 
     #[test]

@@ -1,12 +1,13 @@
-//! Initialise the system catalog tables (pg_class / pg_attribute) on a
-//! fresh database. Both live as ordinary heap tables — pg_class itself
-//! is the first row in pg_class, identifying its own page.
+//! Initialise the system catalog tables (pg_class / pg_attribute / pg_index)
+//! on a fresh database. All three live as ordinary heap tables — pg_class
+//! itself is the first row in pg_class, identifying its own page.
 //!
 //! Layout:
 //!   - page 0 = pg_class            (table_id, name, first_page_id)
 //!   - page 1 = pg_attribute        (table_id, column_name, data_type, nullable, ordinal)
-//! pg_class rows are inserted with `xmin = SYSTEM_TXN_ID` (a reserved
-//! committed txn) so visibility checks accept them without further setup.
+//!   - page 2 = pg_index            (index_id, name, table_id, column_index, root_page_id)
+//! Rows are inserted with `xmin = SYSTEM_TXN_ID` (a reserved committed txn)
+//! so visibility checks accept them without further setup.
 
 use anyhow::Result;
 
@@ -18,8 +19,10 @@ use crate::tuple::{serialize_tuple_mvcc, Value};
 pub const SYSTEM_TXN_ID: u64 = 1;
 pub const PG_CLASS_TABLE_ID: i32 = 0;
 pub const PG_ATTRIBUTE_TABLE_ID: i32 = 1;
+pub const PG_INDEX_TABLE_ID: i32 = 2;
 pub const PG_CLASS_PAGE_ID: PageId = 0;
 pub const PG_ATTRIBUTE_PAGE_ID: PageId = 1;
+pub const PG_INDEX_PAGE_ID: PageId = 2;
 
 pub const DT_INT: i32 = 0;
 pub const DT_VARCHAR: i32 = 1;
@@ -35,6 +38,7 @@ pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
         for row in [
             (PG_CLASS_TABLE_ID, "pg_class", PG_CLASS_PAGE_ID as i32),
             (PG_ATTRIBUTE_TABLE_ID, "pg_attribute", PG_ATTRIBUTE_PAGE_ID as i32),
+            (PG_INDEX_TABLE_ID, "pg_index", PG_INDEX_PAGE_ID as i32),
         ] {
             let bytes = serialize_tuple_mvcc(
                 SYSTEM_TXN_ID,
@@ -63,6 +67,11 @@ pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
             (PG_ATTRIBUTE_TABLE_ID, "data_type", DT_INT, false, 2),
             (PG_ATTRIBUTE_TABLE_ID, "nullable", DT_BOOL, false, 3),
             (PG_ATTRIBUTE_TABLE_ID, "ordinal_position", DT_INT, false, 4),
+            (PG_INDEX_TABLE_ID, "index_id", DT_INT, false, 0),
+            (PG_INDEX_TABLE_ID, "name", DT_VARCHAR, false, 1),
+            (PG_INDEX_TABLE_ID, "table_id", DT_INT, false, 2),
+            (PG_INDEX_TABLE_ID, "column_index", DT_INT, false, 3),
+            (PG_INDEX_TABLE_ID, "root_page_id", DT_INT, false, 4),
         ];
         for (tid, cname, dt, nul, ord) in cols {
             let bytes = serialize_tuple_mvcc(
@@ -78,6 +87,13 @@ pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
             );
             p.insert(&bytes)?;
         }
+    }
+
+    // -- pg_index at page 2 (empty until CREATE INDEX runs) --
+    {
+        let g = bpm.new_page()?;
+        debug_assert_eq!(g.page_id(), PG_INDEX_PAGE_ID);
+        let _p = g.write();
     }
 
     bpm.flush_all()?;

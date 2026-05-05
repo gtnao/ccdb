@@ -465,7 +465,7 @@ fn run_query_with_options(
             execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("CREATE TABLE")?;
         }
-        AnalyzedStatement::CreateIndexNoop => {
+        AnalyzedStatement::CreateIndex(_) => {
             execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("CREATE INDEX")?;
         }

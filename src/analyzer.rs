@@ -14,9 +14,9 @@ use std::mem;
 use anyhow::{Result, bail};
 
 use crate::ast::{
-    self, BinaryOperator, CreateTableStatement, DeleteStatement, Expr, FromClause, FuncArgs,
-    InsertStatement, JoinType, Literal, OrderDir, SelectColumn, SelectStatement, Statement,
-    TableRef, UnaryOperator, UpdateStatement,
+    self, BinaryOperator, CreateIndexStatement, CreateTableStatement, DeleteStatement, Expr,
+    FromClause, FuncArgs, InsertStatement, JoinType, Literal, OrderDir, SelectColumn,
+    SelectStatement, Statement, TableRef, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -53,8 +53,7 @@ pub enum AnalyzedStatement {
     Delete(AnalyzedDeleteStatement),
     Update(AnalyzedUpdateStatement),
     CreateTable(AnalyzedCreateTableStatement),
-    /// Accepted-but-unimplemented `CREATE INDEX`; executor returns Affected(0).
-    CreateIndexNoop,
+    CreateIndex(AnalyzedCreateIndexStatement),
     Begin,
     Commit,
     Rollback,
@@ -198,6 +197,16 @@ pub struct AnalyzedInsertStatement {
 pub struct AnalyzedCreateTableStatement {
     pub table_name: String,
     pub columns: Vec<AnalyzedColumnDef>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedCreateIndexStatement {
+    pub name: String,
+    pub table_id: usize,
+    pub table_name: String,
+    pub column_index: usize,
+    pub column_name: String,
+    pub data_type: DataType,
 }
 
 #[derive(Debug, Clone)]
@@ -919,6 +928,33 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_create_index(
+        &self,
+        s: &CreateIndexStatement,
+    ) -> Result<AnalyzedCreateIndexStatement> {
+        let (table_id, table) = self
+            .catalog
+            .find_table(&s.table)?
+            .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
+        let (col_idx, col) = table
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == s.column)
+            .ok_or_else(|| anyhow::anyhow!("column '{}' not found", s.column))?;
+        if self.catalog.find_index(&s.name)?.is_some() {
+            bail!("index '{}' already exists", s.name);
+        }
+        Ok(AnalyzedCreateIndexStatement {
+            name: s.name.clone(),
+            table_id,
+            table_name: s.table.clone(),
+            column_index: col_idx,
+            column_name: col.name.clone(),
+            data_type: col.data_type,
+        })
+    }
+
     fn analyze_create_table(
         &self,
         s: &CreateTableStatement,
@@ -1158,7 +1194,7 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
         Statement::Delete(s) => AnalyzedStatement::Delete(a.analyze_delete(s)?),
         Statement::Update(s) => AnalyzedStatement::Update(a.analyze_update(s)?),
         Statement::CreateTable(s) => AnalyzedStatement::CreateTable(a.analyze_create_table(s)?),
-        Statement::CreateIndexNoop => AnalyzedStatement::CreateIndexNoop,
+        Statement::CreateIndex(s) => AnalyzedStatement::CreateIndex(a.analyze_create_index(s)?),
         Statement::Begin => AnalyzedStatement::Begin,
         Statement::Commit => AnalyzedStatement::Commit,
         Statement::Rollback => AnalyzedStatement::Rollback,
