@@ -18,7 +18,14 @@ use crate::lock_manager::{LockManager, LockMode};
 use crate::page::{PageId, Rid, SlotId};
 use crate::transaction::{Transaction, UndoLogEntry};
 use crate::tuple::{Schema, Value, deserialize_tuple, serialize_tuple};
-use crate::wal::{WalManager, WalRecordType};
+use crate::wal::{ClrRedo, Lsn, WalManager, WalRecordType};
+
+/// Append a WAL record under `tx`'s id/last_lsn chain and update `last_lsn`.
+fn log_record(wal: &WalManager, tx: &mut Transaction, rt: WalRecordType) -> Result<Lsn> {
+    let lsn = wal.append(tx.id(), tx.last_lsn(), rt)?;
+    tx.set_last_lsn(lsn);
+    Ok(lsn)
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tuple {
@@ -312,12 +319,12 @@ fn perform_insert(
         })
         .collect::<Result<_>>()?;
     let bytes = serialize_tuple(&values);
-    let rid = insert_bytes(bpm, wal, tx.id(), &bytes)?;
+    let (rid, lsn) = insert_bytes(bpm, wal, tx, &bytes)?;
     lm.lock(tx.id(), rid, LockMode::Exclusive)
         .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
     tx.add_lock(rid);
     if tx.is_active() {
-        tx.record(UndoLogEntry::Insert { rid });
+        tx.record(UndoLogEntry::Insert { rid, lsn });
     }
     Ok(1)
 }
@@ -382,23 +389,26 @@ fn perform_delete(
         lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
         tx.add_lock((pid, slot));
-        {
+        let lsn = {
             let g = bpm.fetch_page(pid)?;
             let mut p = g.write();
             p.delete(slot)?;
-            let lsn = wal.append(
-                tx.id(),
+            let lsn = log_record(
+                wal,
+                tx,
                 WalRecordType::Delete {
                     rid: (pid, slot),
                     data: bytes.clone(),
                 },
             )?;
             p.set_page_lsn(lsn);
-        }
+            lsn
+        };
         if tx.is_active() {
             tx.record(UndoLogEntry::Delete {
                 rid: (pid, slot),
                 data: bytes.clone(),
+                lsn,
             });
         }
     }
@@ -438,39 +448,52 @@ fn perform_update(
         lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
         tx.add_lock((pid, slot));
-        {
+        let del_lsn = {
             let g = bpm.fetch_page(pid)?;
             let mut p = g.write();
             p.delete(slot)?;
-            let lsn = wal.append(
-                tx.id(),
+            let lsn = log_record(
+                wal,
+                tx,
                 WalRecordType::Delete {
                     rid: (pid, slot),
                     data: old_bytes.clone(),
                 },
             )?;
             p.set_page_lsn(lsn);
-        }
+            lsn
+        };
         if tx.is_active() {
             tx.record(UndoLogEntry::Delete {
                 rid: (pid, slot),
                 data: old_bytes,
+                lsn: del_lsn,
             });
         }
-        let new_rid = insert_bytes(bpm, wal, tx.id(), &new_bytes)?;
+        let (new_rid, ins_lsn) = insert_bytes(bpm, wal, tx, &new_bytes)?;
         lm.lock(tx.id(), new_rid, LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
         tx.add_lock(new_rid);
         if tx.is_active() {
-            tx.record(UndoLogEntry::Insert { rid: new_rid });
+            tx.record(UndoLogEntry::Insert {
+                rid: new_rid,
+                lsn: ins_lsn,
+            });
         }
     }
     Ok(count)
 }
 
-// Shared insertion helper. Writes the tuple, records WAL Insert, and stamps
-// the page with the resulting LSN.
-fn insert_bytes(bpm: &BufferPool, wal: &WalManager, tx_id: u64, bytes: &[u8]) -> Result<Rid> {
+// Shared insertion helper. Writes the tuple, records WAL Insert chained
+// against the current tx, and stamps the page with the resulting LSN.
+// Returns (rid, lsn-of-Insert-record) so callers can record it in the
+// undo log for CLR chaining.
+fn insert_bytes(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tx: &mut Transaction,
+    bytes: &[u8],
+) -> Result<(Rid, Lsn)> {
     let n = bpm.page_count();
     if n > 0 {
         let last = n - 1;
@@ -478,15 +501,16 @@ fn insert_bytes(bpm: &BufferPool, wal: &WalManager, tx_id: u64, bytes: &[u8]) ->
         let mut p = g.write();
         if let Ok(slot) = p.insert(bytes) {
             let rid = (last, slot);
-            let lsn = wal.append(
-                tx_id,
+            let lsn = log_record(
+                wal,
+                tx,
                 WalRecordType::Insert {
                     rid,
                     data: bytes.to_vec(),
                 },
             )?;
             p.set_page_lsn(lsn);
-            return Ok(rid);
+            return Ok((rid, lsn));
         }
         drop(p);
         drop(g);
@@ -498,36 +522,70 @@ fn insert_bytes(bpm: &BufferPool, wal: &WalManager, tx_id: u64, bytes: &[u8]) ->
         .insert(bytes)
         .map_err(|e| anyhow::anyhow!("tuple does not fit on a fresh page: {e}"))?;
     let rid = (pid, slot);
-    let lsn = wal.append(
-        tx_id,
+    let lsn = log_record(
+        wal,
+        tx,
         WalRecordType::Insert {
             rid,
             data: bytes.to_vec(),
         },
     )?;
     p.set_page_lsn(lsn);
-    Ok(rid)
+    Ok((rid, lsn))
 }
 
-/// Apply undo entries in reverse order. Used by ROLLBACK and by the
-/// connection-close path. Only safe to call when the page contents are still
-/// intact (no compaction has happened since the entry was recorded).
-pub fn rollback(bpm: &BufferPool, tx: &mut Transaction) -> Result<()> {
-    let mut log = tx.take_log();
-    while let Some(entry) = log.pop() {
-        match entry {
-            UndoLogEntry::Insert { rid } => {
-                let (pid, slot) = rid;
+/// Roll back a transaction by walking its undo log in reverse. Each
+/// inverse-action is paired with a CLR record so a crash mid-rollback can
+/// be recovered without double-undoing. After all CLRs are written we
+/// emit Abort and fsync.
+pub fn rollback(bpm: &BufferPool, wal: &WalManager, tx: &mut Transaction) -> Result<()> {
+    let entries = tx.drain_log();
+    let n = entries.len();
+    for i in (0..n).rev() {
+        let undo_next = if i == 0 { 0 } else { entries[i - 1].lsn() };
+        match &entries[i] {
+            UndoLogEntry::Insert { rid, .. } => {
+                let (pid, slot) = *rid;
                 let g = bpm.fetch_page(pid)?;
-                g.write().delete(slot)?;
+                let mut p = g.write();
+                if p.get_tuple(slot).is_some() {
+                    p.delete(slot)?;
+                }
+                let clr_lsn = log_record(
+                    wal,
+                    tx,
+                    WalRecordType::Clr {
+                        undo_next_lsn: undo_next,
+                        redo: ClrRedo::UndoInsert { rid: *rid },
+                    },
+                )?;
+                p.set_page_lsn(clr_lsn);
             }
-            UndoLogEntry::Delete { rid, data } => {
-                let (pid, slot) = rid;
+            UndoLogEntry::Delete { rid, data, .. } => {
+                let (pid, slot) = *rid;
                 let g = bpm.fetch_page(pid)?;
-                g.write().restore(slot, &data)?;
+                let mut p = g.write();
+                if p.get_tuple(slot).is_none() {
+                    p.restore(slot, data)?;
+                }
+                let clr_lsn = log_record(
+                    wal,
+                    tx,
+                    WalRecordType::Clr {
+                        undo_next_lsn: undo_next,
+                        redo: ClrRedo::UndoDelete {
+                            rid: *rid,
+                            data: data.clone(),
+                        },
+                    },
+                )?;
+                p.set_page_lsn(clr_lsn);
             }
         }
     }
+    log_record(wal, tx, WalRecordType::Abort)?;
+    wal.flush()?;
+    tx.set_inactive();
     Ok(())
 }
 
@@ -558,7 +616,7 @@ pub fn execute(
                 | AnalyzedStatement::Update(_)
         );
     if needs_dml_brackets {
-        wal.append(tx.id(), WalRecordType::Begin)?;
+        log_record(wal, tx, WalRecordType::Begin)?;
     }
 
     let result: Result<Output> = (|| match stmt {
@@ -602,14 +660,14 @@ pub fn execute(
                 bail!("there is already a transaction in progress");
             }
             tx.begin();
-            wal.append(tx.id(), WalRecordType::Begin)?;
+            log_record(wal, tx, WalRecordType::Begin)?;
             Ok(Output::Begin)
         }
         AnalyzedStatement::Commit => {
             if !tx.is_active() {
                 bail!("there is no transaction in progress");
             }
-            wal.append(tx.id(), WalRecordType::Commit)?;
+            log_record(wal, tx, WalRecordType::Commit)?;
             wal.flush()?;
             let held = tx.take_held_locks();
             lm.unlock_all(tx.id(), &held);
@@ -620,9 +678,8 @@ pub fn execute(
             if !tx.is_active() {
                 bail!("there is no transaction in progress");
             }
-            rollback(bpm, tx)?;
-            wal.append(tx.id(), WalRecordType::Abort)?;
-            wal.flush()?;
+            // rollback() writes CLRs and the Abort record itself.
+            rollback(bpm, wal, tx)?;
             let held = tx.take_held_locks();
             lm.unlock_all(tx.id(), &held);
             Ok(Output::Rollback)
@@ -639,10 +696,9 @@ pub fn execute(
         } else {
             WalRecordType::Abort
         };
-        // Best effort: if WAL append fails here we still propagate the
-        // original result. The page may already be modified, which is the
-        // recovery code's problem to handle.
-        let _ = wal.append(tx.id(), bracket);
+        // Best-effort: if WAL append fails here we still propagate the
+        // original result.
+        let _ = log_record(wal, tx, bracket);
         let _ = wal.flush();
     }
 

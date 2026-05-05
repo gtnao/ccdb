@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::page::Rid;
+use crate::wal::Lsn;
 
 static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -31,8 +32,20 @@ pub enum TxState {
 
 #[derive(Debug, Clone)]
 pub enum UndoLogEntry {
-    Insert { rid: Rid },
-    Delete { rid: Rid, data: Vec<u8> },
+    /// Inserted a tuple at `rid`. The original Insert WAL record's LSN is
+    /// kept so rollback can chain CLRs (undo_next_lsn = previous record LSN).
+    Insert { rid: Rid, lsn: Lsn },
+    /// Tombstoned a tuple. Carries restorable bytes and the original Delete
+    /// record's LSN for the same chaining reason.
+    Delete { rid: Rid, data: Vec<u8>, lsn: Lsn },
+}
+
+impl UndoLogEntry {
+    pub fn lsn(&self) -> Lsn {
+        match self {
+            UndoLogEntry::Insert { lsn, .. } | UndoLogEntry::Delete { lsn, .. } => *lsn,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -41,6 +54,7 @@ pub struct Transaction {
     id: u64,
     log: Vec<UndoLogEntry>,
     held_locks: HashSet<Rid>,
+    last_lsn: Lsn,
 }
 
 impl Transaction {
@@ -50,11 +64,20 @@ impl Transaction {
             id: fresh_txn_id(),
             log: Vec::new(),
             held_locks: HashSet::new(),
+            last_lsn: 0,
         }
     }
 
     pub fn id(&self) -> u64 {
         self.id
+    }
+
+    pub fn last_lsn(&self) -> Lsn {
+        self.last_lsn
+    }
+
+    pub fn set_last_lsn(&mut self, lsn: Lsn) {
+        self.last_lsn = lsn;
     }
 
     pub fn is_active(&self) -> bool {
@@ -66,13 +89,13 @@ impl Transaction {
         self.state = TxState::Active;
         self.log.clear();
         self.held_locks.clear();
+        self.last_lsn = 0;
     }
 
     pub fn commit(&mut self) {
         self.log.clear();
-        // Caller is expected to drain held_locks and release them via the
-        // LockManager *before* calling commit().
         self.state = TxState::Inactive;
+        self.last_lsn = 0;
     }
 
     /// Start a fresh auto-commit boundary. No-op while explicit BEGIN is in
@@ -80,10 +103,9 @@ impl Transaction {
     pub fn refresh_autocommit(&mut self) {
         if !self.is_active() {
             self.id = fresh_txn_id();
-            // log/held_locks are kept empty between auto-commits by design;
-            // clear defensively.
             self.log.clear();
             self.held_locks.clear();
+            self.last_lsn = 0;
         }
     }
 
@@ -96,9 +118,16 @@ impl Transaction {
         self.held_locks.insert(rid);
     }
 
-    pub fn take_log(&mut self) -> Vec<UndoLogEntry> {
-        self.state = TxState::Inactive;
+    /// Drains the undo log without touching `last_lsn` (rollback still needs
+    /// it to chain CLRs). State remains as-is — the caller decides when to
+    /// flip back to Inactive.
+    pub fn drain_log(&mut self) -> Vec<UndoLogEntry> {
         std::mem::take(&mut self.log)
+    }
+
+    pub fn set_inactive(&mut self) {
+        self.state = TxState::Inactive;
+        self.last_lsn = 0;
     }
 
     pub fn take_held_locks(&mut self) -> HashSet<Rid> {
@@ -123,10 +152,14 @@ mod tests {
         tx.begin();
         assert!(tx.is_active());
         assert_ne!(tx.id(), id_before, "begin refreshes the id");
-        tx.record(UndoLogEntry::Insert { rid: (1, 2) });
+        tx.record(UndoLogEntry::Insert {
+            rid: (1, 2),
+            lsn: 100,
+        });
         tx.add_lock((0, 0));
-        assert_eq!(tx.take_log().len(), 1);
+        assert_eq!(tx.drain_log().len(), 1);
         assert_eq!(tx.take_held_locks().len(), 1);
+        tx.set_inactive();
         assert!(!tx.is_active());
     }
 

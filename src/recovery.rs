@@ -12,13 +12,13 @@
 //! the database in an undefined state. For "kill the server, restart it,
 //! everything's fine" semantics this is sufficient.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use anyhow::Result;
 
 use crate::buffer_pool::BufferPool;
 use crate::page::Rid;
-use crate::wal::{Lsn, WalRecord, WalRecordType};
+use crate::wal::{ClrRedo, Lsn, WalManager, WalRecord, WalRecordType};
 
 #[derive(Debug, Default)]
 pub struct RecoveryStats {
@@ -30,7 +30,11 @@ pub struct RecoveryStats {
     pub max_txn_id: u64,
 }
 
-pub fn recover(bpm: &BufferPool, records: &[WalRecord]) -> Result<RecoveryStats> {
+pub fn recover(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    records: &[WalRecord],
+) -> Result<RecoveryStats> {
     if records.is_empty() {
         return Ok(RecoveryStats::default());
     }
@@ -38,7 +42,7 @@ pub fn recover(bpm: &BufferPool, records: &[WalRecord]) -> Result<RecoveryStats>
     let analysis = analyze(records);
 
     let redo_applied = redo(bpm, records)?;
-    let undo_applied = undo(bpm, records, &analysis.uncommitted)?;
+    let undo_applied = undo(bpm, wal, records, &analysis)?;
 
     bpm.flush_all()?;
 
@@ -55,6 +59,9 @@ pub fn recover(bpm: &BufferPool, records: &[WalRecord]) -> Result<RecoveryStats>
 struct Analysis {
     committed: HashSet<u64>,
     uncommitted: HashSet<u64>,
+    /// Most recent LSN seen for each txn — entry point for the prev_lsn walk
+    /// during undo.
+    last_lsn_per_txn: HashMap<u64, Lsn>,
     max_lsn: Lsn,
     max_txn_id: u64,
 }
@@ -62,15 +69,15 @@ struct Analysis {
 fn analyze(records: &[WalRecord]) -> Analysis {
     let mut active: HashSet<u64> = HashSet::new();
     let mut committed: HashSet<u64> = HashSet::new();
+    let mut last_lsn_per_txn: HashMap<u64, Lsn> = HashMap::new();
     let mut max_lsn: Lsn = 0;
     let mut max_txn_id: u64 = 0;
-    // Track txns that wrote DML — Begin alone shouldn't count as "uncommitted
-    // work to undo" since there's nothing to undo.
     let mut wrote_dml: HashSet<u64> = HashSet::new();
 
     for r in records {
         max_lsn = max_lsn.max(r.lsn);
         max_txn_id = max_txn_id.max(r.txn_id);
+        last_lsn_per_txn.insert(r.txn_id, r.lsn);
         match &r.record_type {
             WalRecordType::Begin => {
                 active.insert(r.txn_id);
@@ -85,6 +92,10 @@ fn analyze(records: &[WalRecord]) -> Analysis {
             WalRecordType::Insert { .. } | WalRecordType::Delete { .. } => {
                 wrote_dml.insert(r.txn_id);
             }
+            WalRecordType::Clr { .. } => {
+                // CLR implies prior Insert/Delete by this txn.
+                wrote_dml.insert(r.txn_id);
+            }
         }
     }
 
@@ -92,6 +103,7 @@ fn analyze(records: &[WalRecord]) -> Analysis {
     Analysis {
         committed,
         uncommitted,
+        last_lsn_per_txn,
         max_lsn,
         max_txn_id,
     }
@@ -111,6 +123,20 @@ fn redo(bpm: &BufferPool, records: &[WalRecord]) -> Result<usize> {
                     count += 1;
                 }
             }
+            WalRecordType::Clr { redo: cr, .. } => match cr {
+                // CLR for an Insert: original was tombstoned during undo.
+                ClrRedo::UndoInsert { rid } => {
+                    if redo_delete(bpm, *rid, r.lsn)? {
+                        count += 1;
+                    }
+                }
+                // CLR for a Delete: original tombstone was restored during undo.
+                ClrRedo::UndoDelete { rid, data } => {
+                    if redo_insert(bpm, *rid, data, r.lsn)? {
+                        count += 1;
+                    }
+                }
+            },
             _ => {}
         }
     }
@@ -176,56 +202,99 @@ fn redo_delete(bpm: &BufferPool, rid: Rid, record_lsn: Lsn) -> Result<bool> {
 
 fn undo(
     bpm: &BufferPool,
+    wal: &WalManager,
     records: &[WalRecord],
-    uncommitted: &HashSet<u64>,
+    analysis: &Analysis,
 ) -> Result<usize> {
-    if uncommitted.is_empty() {
+    if analysis.uncommitted.is_empty() {
         return Ok(0);
     }
-    // Walk records in reverse: most-recent change first, like normal rollback.
+    let by_lsn: HashMap<Lsn, &WalRecord> = records.iter().map(|r| (r.lsn, r)).collect();
+
     let mut count = 0;
-    for r in records.iter().rev() {
-        if !uncommitted.contains(&r.txn_id) {
-            continue;
-        }
-        match &r.record_type {
-            WalRecordType::Insert { rid, .. } => {
-                undo_insert(bpm, *rid)?;
-                count += 1;
+    for &txn_id in &analysis.uncommitted {
+        // Walk the prev_lsn chain backwards from the txn's most recent record.
+        // CLRs short-circuit via undo_next_lsn (already-undone region is skipped).
+        // We maintain `last_clr_lsn` so newly-written CLRs chain together via prev_lsn.
+        let start = match analysis.last_lsn_per_txn.get(&txn_id) {
+            Some(&l) => l,
+            None => continue,
+        };
+        let mut cur = start;
+        let mut last_clr_lsn = start;
+
+        while cur != 0 {
+            let r = match by_lsn.get(&cur) {
+                Some(r) => *r,
+                None => break,
+            };
+            match &r.record_type {
+                WalRecordType::Insert { rid, .. } => {
+                    let (pid, slot) = *rid;
+                    ensure_page_allocated(bpm, pid)?;
+                    let g = bpm.fetch_page(pid)?;
+                    let mut p = g.write();
+                    if p.get_tuple(slot).is_some() {
+                        p.delete(slot)?;
+                    }
+                    let clr_lsn = wal.append(
+                        txn_id,
+                        last_clr_lsn,
+                        WalRecordType::Clr {
+                            undo_next_lsn: r.prev_lsn,
+                            redo: ClrRedo::UndoInsert { rid: *rid },
+                        },
+                    )?;
+                    p.set_page_lsn(clr_lsn);
+                    last_clr_lsn = clr_lsn;
+                    cur = r.prev_lsn;
+                    count += 1;
+                }
+                WalRecordType::Delete { rid, data } => {
+                    let (pid, slot) = *rid;
+                    ensure_page_allocated(bpm, pid)?;
+                    let g = bpm.fetch_page(pid)?;
+                    let mut p = g.write();
+                    if p.get_tuple(slot).is_none() {
+                        p.restore(slot, data)?;
+                    }
+                    let clr_lsn = wal.append(
+                        txn_id,
+                        last_clr_lsn,
+                        WalRecordType::Clr {
+                            undo_next_lsn: r.prev_lsn,
+                            redo: ClrRedo::UndoDelete {
+                                rid: *rid,
+                                data: data.clone(),
+                            },
+                        },
+                    )?;
+                    p.set_page_lsn(clr_lsn);
+                    last_clr_lsn = clr_lsn;
+                    cur = r.prev_lsn;
+                    count += 1;
+                }
+                WalRecordType::Clr { undo_next_lsn, .. } => {
+                    // Already-undone region; jump past it.
+                    cur = *undo_next_lsn;
+                }
+                WalRecordType::Begin => {
+                    // Reached the transaction's start — write Abort and stop.
+                    wal.append(txn_id, last_clr_lsn, WalRecordType::Abort)?;
+                    break;
+                }
+                WalRecordType::Commit | WalRecordType::Abort => {
+                    // Shouldn't happen for an "uncommitted" txn, but defensively
+                    // just follow the chain.
+                    cur = r.prev_lsn;
+                }
             }
-            WalRecordType::Delete { rid, data } => {
-                undo_delete(bpm, *rid, data)?;
-                count += 1;
-            }
-            _ => {}
         }
     }
+    wal.flush()?;
     Ok(count)
 }
 
-fn undo_insert(bpm: &BufferPool, rid: Rid) -> Result<()> {
-    let (pid, slot) = rid;
-    if bpm.page_count() <= pid {
-        return Ok(());
-    }
-    let g = bpm.fetch_page(pid)?;
-    let mut p = g.write();
-    if p.get_tuple(slot).is_some() {
-        p.delete(slot)?;
-    }
-    Ok(())
-}
-
-fn undo_delete(bpm: &BufferPool, rid: Rid, data: &[u8]) -> Result<()> {
-    let (pid, slot) = rid;
-    ensure_page_allocated(bpm, pid)?;
-    let g = bpm.fetch_page(pid)?;
-    let mut p = g.write();
-    if p.get_tuple(slot).is_none() {
-        p.restore(slot, data)?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 mod tests {
@@ -262,25 +331,26 @@ mod tests {
     #[test]
     fn redo_replays_committed_inserts() {
         let (data, wal_path) = paths("redo-commit");
-        // Construct a synthetic WAL: Begin, Insert at (0,0), Commit.
         {
             let (_pool, wal) = make_pool(&data, &wal_path);
-            wal.append(1, WalRecordType::Begin).unwrap();
-            wal.append(
-                1,
-                WalRecordType::Insert {
-                    rid: (0, 0),
-                    data: vec![0xAA, 0xBB], // bitmap (1 byte) + payload
-                },
-            )
-            .unwrap();
-            wal.append(1, WalRecordType::Commit).unwrap();
+            let l1 = wal.append(1, 0, WalRecordType::Begin).unwrap();
+            let l2 = wal
+                .append(
+                    1,
+                    l1,
+                    WalRecordType::Insert {
+                        rid: (0, 0),
+                        data: vec![0xAA, 0xBB],
+                    },
+                )
+                .unwrap();
+            wal.append(1, l2, WalRecordType::Commit).unwrap();
             wal.flush().unwrap();
         }
-        // No data file yet (we never flushed pages).
         let recs = crate::wal::read_records(&wal_path).unwrap();
-        let (pool, _wal) = make_pool(&data, &wal_path);
-        let stats = recover(&pool, &recs).unwrap();
+        let (pool, wal) = make_pool(&data, &wal_path);
+        wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
+        let stats = recover(&pool, &wal, &recs).unwrap();
         assert_eq!(stats.committed_txns, 1);
         assert_eq!(stats.redo_applied, 1);
         assert_eq!(stats.undo_applied, 0);
@@ -298,21 +368,22 @@ mod tests {
         let (data, wal_path) = paths("undo-uncommit");
         {
             let (_pool, wal) = make_pool(&data, &wal_path);
-            wal.append(2, WalRecordType::Begin).unwrap();
+            let l1 = wal.append(2, 0, WalRecordType::Begin).unwrap();
             wal.append(
                 2,
+                l1,
                 WalRecordType::Insert {
                     rid: (0, 0),
                     data: vec![0xCC],
                 },
             )
             .unwrap();
-            // No Commit / Abort — simulates crash mid-tx.
             wal.flush().unwrap();
         }
         let recs = crate::wal::read_records(&wal_path).unwrap();
-        let (pool, _wal) = make_pool(&data, &wal_path);
-        let stats = recover(&pool, &recs).unwrap();
+        let (pool, wal) = make_pool(&data, &wal_path);
+        wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
+        let stats = recover(&pool, &wal, &recs).unwrap();
         assert_eq!(stats.committed_txns, 0);
         assert_eq!(stats.uncommitted_txns, 1);
         assert_eq!(stats.redo_applied, 1);
@@ -320,8 +391,54 @@ mod tests {
 
         let g = pool.fetch_page(0).unwrap();
         let p = g.read();
-        assert!(p.get_tuple(0).is_none(), "uncommitted insert should be tombstoned");
+        assert!(
+            p.get_tuple(0).is_none(),
+            "uncommitted insert should be tombstoned"
+        );
 
+        std::fs::remove_file(&data).ok();
+        std::fs::remove_file(&wal_path).ok();
+    }
+
+    #[test]
+    fn recovery_idempotent_with_clrs_from_partial_undo() {
+        // Simulate: tx wrote Insert, recovery undid it (writing CLR), then
+        // crashed before Abort. Re-running recovery sees the CLR and shouldn't
+        // double-undo. End state: tombstoned, no spurious extra CLRs.
+        let (data, wal_path) = paths("clr-resume");
+        {
+            let (_pool, wal) = make_pool(&data, &wal_path);
+            let l1 = wal.append(3, 0, WalRecordType::Begin).unwrap();
+            let l2 = wal
+                .append(
+                    3,
+                    l1,
+                    WalRecordType::Insert {
+                        rid: (0, 0),
+                        data: vec![0xEE],
+                    },
+                )
+                .unwrap();
+            // CLR for the Insert above (simulates first recovery's undo)
+            wal.append(
+                3,
+                l2,
+                WalRecordType::Clr {
+                    undo_next_lsn: l1, // Insert.prev_lsn = Begin's lsn
+                    redo: ClrRedo::UndoInsert { rid: (0, 0) },
+                },
+            )
+            .unwrap();
+            wal.flush().unwrap();
+        }
+        let recs = crate::wal::read_records(&wal_path).unwrap();
+        let (pool, wal) = make_pool(&data, &wal_path);
+        wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
+        let stats = recover(&pool, &wal, &recs).unwrap();
+        // The Insert was already compensated; undo phase should write 0 new
+        // undo records (the CLR's undo_next_lsn jumps past the Insert).
+        assert_eq!(stats.uncommitted_txns, 1);
+        assert_eq!(stats.undo_applied, 0);
         std::fs::remove_file(&data).ok();
         std::fs::remove_file(&wal_path).ok();
     }

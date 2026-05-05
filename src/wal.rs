@@ -26,8 +26,28 @@ pub enum WalRecordType {
     Begin,
     Commit,
     Abort,
-    Insert { rid: Rid, data: Vec<u8> },
-    Delete { rid: Rid, data: Vec<u8> },
+    Insert {
+        rid: Rid,
+        data: Vec<u8>,
+    },
+    Delete {
+        rid: Rid,
+        data: Vec<u8>,
+    },
+    /// Compensation Log Record. Written during undo (normal rollback or
+    /// recovery's undo phase) so that a crash mid-undo is recoverable.
+    /// `undo_next_lsn` is the prev_lsn of the record this CLR compensates
+    /// — recovery uses it to skip over already-undone work.
+    Clr {
+        undo_next_lsn: Lsn,
+        redo: ClrRedo,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ClrRedo {
+    UndoInsert { rid: Rid },
+    UndoDelete { rid: Rid, data: Vec<u8> },
 }
 
 const TAG_BEGIN: u8 = 0;
@@ -35,23 +55,28 @@ const TAG_COMMIT: u8 = 1;
 const TAG_ABORT: u8 = 2;
 const TAG_INSERT: u8 = 3;
 const TAG_DELETE: u8 = 4;
+const TAG_CLR: u8 = 5;
+
+const CLR_UNDO_INSERT: u8 = 0;
+const CLR_UNDO_DELETE: u8 = 1;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WalRecord {
     pub lsn: Lsn,
     pub txn_id: u64,
+    /// LSN of the previous record written by the same txn, or 0 if first.
+    pub prev_lsn: Lsn,
     pub record_type: WalRecordType,
 }
 
 impl WalRecord {
-    /// On-disk record body (the per-record length prefix is added by the
-    /// WalManager when writing). Layout (little-endian):
-    /// `[lsn:8][txn_id:8][tag:1][payload]`
-    /// Insert/Delete payload: `[page_id:4][slot_id:2][data:..]`
+    /// Layout (little-endian):
+    /// `[lsn:8][txn_id:8][prev_lsn:8][tag:1][payload]`
     pub fn encode(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(64);
         buf.extend_from_slice(&self.lsn.to_le_bytes());
         buf.extend_from_slice(&self.txn_id.to_le_bytes());
+        buf.extend_from_slice(&self.prev_lsn.to_le_bytes());
         match &self.record_type {
             WalRecordType::Begin => buf.push(TAG_BEGIN),
             WalRecordType::Commit => buf.push(TAG_COMMIT),
@@ -70,18 +95,38 @@ impl WalRecord {
                 buf.extend_from_slice(&slot.to_le_bytes());
                 buf.extend_from_slice(data);
             }
+            WalRecordType::Clr { undo_next_lsn, redo } => {
+                buf.push(TAG_CLR);
+                buf.extend_from_slice(&undo_next_lsn.to_le_bytes());
+                match redo {
+                    ClrRedo::UndoInsert { rid } => {
+                        buf.push(CLR_UNDO_INSERT);
+                        let (pid, slot) = *rid;
+                        buf.extend_from_slice(&pid.to_le_bytes());
+                        buf.extend_from_slice(&slot.to_le_bytes());
+                    }
+                    ClrRedo::UndoDelete { rid, data } => {
+                        buf.push(CLR_UNDO_DELETE);
+                        let (pid, slot) = *rid;
+                        buf.extend_from_slice(&pid.to_le_bytes());
+                        buf.extend_from_slice(&slot.to_le_bytes());
+                        buf.extend_from_slice(data);
+                    }
+                }
+            }
         }
         buf
     }
 
     fn decode(body: &[u8]) -> Result<Self> {
-        if body.len() < 17 {
+        if body.len() < 25 {
             bail!("WAL record too short: {} bytes", body.len());
         }
         let lsn = u64::from_le_bytes(body[0..8].try_into().unwrap());
         let txn_id = u64::from_le_bytes(body[8..16].try_into().unwrap());
-        let tag = body[16];
-        let rest = &body[17..];
+        let prev_lsn = u64::from_le_bytes(body[16..24].try_into().unwrap());
+        let tag = body[24];
+        let rest = &body[25..];
         let record_type = match tag {
             TAG_BEGIN => WalRecordType::Begin,
             TAG_COMMIT => WalRecordType::Commit,
@@ -105,11 +150,44 @@ impl WalRecord {
                     }
                 }
             }
+            TAG_CLR => {
+                if rest.len() < 9 {
+                    bail!("CLR record missing fields");
+                }
+                let undo_next_lsn = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                let redo_tag = rest[8];
+                let redo_rest = &rest[9..];
+                let redo = match redo_tag {
+                    CLR_UNDO_INSERT => {
+                        if redo_rest.len() < 6 {
+                            bail!("CLR UndoInsert missing rid");
+                        }
+                        let pid = u32::from_le_bytes(redo_rest[0..4].try_into().unwrap());
+                        let slot = u16::from_le_bytes(redo_rest[4..6].try_into().unwrap());
+                        ClrRedo::UndoInsert { rid: (pid, slot) }
+                    }
+                    CLR_UNDO_DELETE => {
+                        if redo_rest.len() < 6 {
+                            bail!("CLR UndoDelete missing rid");
+                        }
+                        let pid = u32::from_le_bytes(redo_rest[0..4].try_into().unwrap());
+                        let slot = u16::from_le_bytes(redo_rest[4..6].try_into().unwrap());
+                        let data = redo_rest[6..].to_vec();
+                        ClrRedo::UndoDelete {
+                            rid: (pid, slot),
+                            data,
+                        }
+                    }
+                    other => bail!("unknown CLR redo tag: {other}"),
+                };
+                WalRecordType::Clr { undo_next_lsn, redo }
+            }
             other => bail!("unknown WAL tag: {other}"),
         };
         Ok(WalRecord {
             lsn,
             txn_id,
+            prev_lsn,
             record_type,
         })
     }
@@ -137,11 +215,12 @@ impl WalManager {
 
     /// Append a record. Returns its LSN. Does NOT fsync — caller decides
     /// when durability is required (commit, page eviction, etc).
-    pub fn append(&self, txn_id: u64, record_type: WalRecordType) -> Result<Lsn> {
+    pub fn append(&self, txn_id: u64, prev_lsn: Lsn, record_type: WalRecordType) -> Result<Lsn> {
         let lsn = self.next_lsn.fetch_add(1, Ordering::SeqCst);
         let record = WalRecord {
             lsn,
             txn_id,
+            prev_lsn,
             record_type,
         };
         let body = record.encode();
@@ -231,14 +310,15 @@ mod tests {
     }
 
     #[test]
-    fn append_and_read_back() {
+    fn append_and_read_back_with_prev_lsn_chain() {
         let p = temp_path("rt");
         {
             let w = WalManager::open(&p).unwrap();
-            let l1 = w.append(42, WalRecordType::Begin).unwrap();
+            let l1 = w.append(42, 0, WalRecordType::Begin).unwrap();
             let l2 = w
                 .append(
                     42,
+                    l1,
                     WalRecordType::Insert {
                         rid: (3, 7),
                         data: vec![1, 2, 3],
@@ -248,28 +328,26 @@ mod tests {
             let l3 = w
                 .append(
                     42,
-                    WalRecordType::Delete {
-                        rid: (3, 7),
-                        data: vec![9],
+                    l2,
+                    WalRecordType::Clr {
+                        undo_next_lsn: l1,
+                        redo: ClrRedo::UndoInsert { rid: (3, 7) },
                     },
                 )
                 .unwrap();
-            let l4 = w.append(42, WalRecordType::Commit).unwrap();
+            let l4 = w.append(42, l3, WalRecordType::Abort).unwrap();
             assert!(l1 < l2 && l2 < l3 && l3 < l4);
             w.flush().unwrap();
         }
         let recs = read_records(&p).unwrap();
         assert_eq!(recs.len(), 4);
-        assert_eq!(recs[0].record_type, WalRecordType::Begin);
-        assert!(matches!(
-            recs[1].record_type,
-            WalRecordType::Insert { rid: (3, 7), .. }
-        ));
+        assert_eq!(recs[0].prev_lsn, 0);
+        assert_eq!(recs[1].prev_lsn, recs[0].lsn);
+        assert_eq!(recs[2].prev_lsn, recs[1].lsn);
         assert!(matches!(
             recs[2].record_type,
-            WalRecordType::Delete { rid: (3, 7), .. }
+            WalRecordType::Clr { redo: ClrRedo::UndoInsert { rid: (3, 7) }, .. }
         ));
-        assert_eq!(recs[3].record_type, WalRecordType::Commit);
         std::fs::remove_file(&p).ok();
     }
 
@@ -277,11 +355,10 @@ mod tests {
     fn flush_to_is_no_op_if_already_durable() {
         let p = temp_path("flush-to");
         let w = WalManager::open(&p).unwrap();
-        let _ = w.append(1, WalRecordType::Begin).unwrap();
-        let lsn = w.append(1, WalRecordType::Commit).unwrap();
+        let begin_lsn = w.append(1, 0, WalRecordType::Begin).unwrap();
+        let lsn = w.append(1, begin_lsn, WalRecordType::Commit).unwrap();
         w.flush().unwrap();
         assert!(w.flushed_lsn() >= lsn);
-        // Calling flush_to with an LSN already on disk should not error.
         w.flush_to(lsn).unwrap();
         std::fs::remove_file(&p).ok();
     }

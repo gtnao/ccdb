@@ -51,7 +51,12 @@ impl Instance {
         let bpm = BufferPool::new(disk, POOL_CAPACITY, Arc::clone(&wal));
 
         if !wal_records.is_empty() {
-            let stats = recovery::recover(&bpm, &wal_records)?;
+            // Advance the WAL's LSN counter past anything on disk *before*
+            // recovery, so any CLRs we write during undo get fresh LSNs.
+            let max_lsn = wal_records.iter().map(|r| r.lsn).max().unwrap_or(0);
+            wal.set_next_lsn(max_lsn + 1);
+
+            let stats = recovery::recover(&bpm, &wal, &wal_records)?;
             eprintln!(
                 "recovery: committed={} uncommitted={} redo={} undo={}",
                 stats.committed_txns,
@@ -59,9 +64,6 @@ impl Instance {
                 stats.redo_applied,
                 stats.undo_applied,
             );
-            // Advance counters so newly-issued LSNs / txn_ids don't collide
-            // with values already written to the WAL.
-            wal.set_next_lsn(stats.max_lsn + 1);
             transaction::set_next_txn_id(stats.max_txn_id + 1);
         }
 
@@ -147,7 +149,7 @@ fn handle_client(
     })();
 
     if tx.is_active() {
-        if let Err(e) = executor::rollback(&bpm, &mut tx) {
+        if let Err(e) = executor::rollback(&bpm, &wal, &mut tx) {
             eprintln!("auto-rollback failed: {e}");
         }
     }
