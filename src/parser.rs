@@ -265,7 +265,28 @@ impl Parser {
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         let mut primary_key: Vec<String> = Vec::new();
+        let mut check_constraints: Vec<Expr> = Vec::new();
         loop {
+            // Optional `CONSTRAINT <name>` prefix on a table-level constraint
+            // — the name is parsed and discarded for now.
+            if matches!(self.peek(), Some(Token::Constraint)) {
+                self.bump();
+                self.parse_ident()?;
+            }
+            // Table-level CHECK (...).
+            if matches!(self.peek(), Some(Token::Check)) {
+                self.bump();
+                self.expect(&Token::LParen)?;
+                let expr = self.parse_expr()?;
+                self.expect(&Token::RParen)?;
+                check_constraints.push(expr);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                } else {
+                    break;
+                }
+            }
             // Table-level constraint: `PRIMARY KEY (col, ...)`.
             if matches!(self.peek(), Some(Token::Primary)) {
                 self.bump();
@@ -339,6 +360,16 @@ impl Parser {
                         self.bump();
                         default = Some(self.parse_expr()?);
                     }
+                    // Column-level CHECK (expr) — parsed and lifted to the
+                    // table-level list. Column-name resolution is deferred
+                    // to the analyzer.
+                    Some(Token::Check) => {
+                        self.bump();
+                        self.expect(&Token::LParen)?;
+                        let expr = self.parse_expr()?;
+                        self.expect(&Token::RParen)?;
+                        check_constraints.push(expr);
+                    }
                     // Column-level `PRIMARY KEY`. Records this column as
                     // the table's PK; the executor will create the unique
                     // index after the table itself is registered.
@@ -387,6 +418,7 @@ impl Parser {
             table,
             columns,
             primary_key,
+            check_constraints,
         }))
     }
 

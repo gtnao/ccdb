@@ -285,6 +285,8 @@ impl<S: Read + Write> Connection<S> {
         // Anything else gets the generic `XX000` (internal_error).
         let sqlstate = if message.contains("SQLSTATE 23505") {
             "23505" // unique_violation — set explicitly by the executor
+        } else if message.contains("SQLSTATE 23514") {
+            "23514" // check_violation
         } else if message.contains("lock acquisition timeout")
             || message.contains("deadlock")
         {

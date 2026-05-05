@@ -217,6 +217,9 @@ pub struct AnalyzedCreateTableStatement {
     /// declared one. Multi-column PKs are rejected at the analyzer for now;
     /// none ⇒ no automatic unique index.
     pub primary_key_column: Option<usize>,
+    /// CHECK predicates (table-level + lifted column-level), serialized
+    /// via Expr::Display. Stored in pg_constraint by the executor.
+    pub check_constraints: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1369,10 +1372,13 @@ impl<'a> Analyzer<'a> {
             }
             _ => bail!("multi-column PRIMARY KEY not supported yet"),
         };
+        let check_constraints: Vec<String> =
+            s.check_constraints.iter().map(|e| e.to_string()).collect();
         Ok(AnalyzedCreateTableStatement {
             table_name: s.table.clone(),
             columns,
             primary_key_column,
+            check_constraints,
         })
     }
 }
@@ -1750,6 +1756,27 @@ fn infer_unary_type(op: UnaryOperator) -> DataType {
         UnaryOperator::Not => DataType::Bool,
         UnaryOperator::Neg => DataType::Int,
     }
+}
+
+/// Bind a free-standing expression against a single table's columns.
+/// Used by the executor to evaluate stored CHECK constraint definitions
+/// against an INSERT/UPDATE row.
+pub fn analyze_expr_for_table(
+    catalog: &Catalog,
+    _table_id: usize,
+    table_name: &str,
+    expr: &Expr,
+) -> Result<AnalyzedExpr> {
+    let mut a = Analyzer::new(catalog);
+    a.scopes.push(Vec::new());
+    a.intro_table(
+        &TableRef {
+            name: table_name.to_string(),
+            alias: None,
+        },
+        0,
+    )?;
+    a.analyze_expr(expr)
 }
 
 pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement> {

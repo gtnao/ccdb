@@ -130,6 +130,10 @@ pub struct CreateTableStatement {
     /// table has no PK; multi-column PKs land here too but are not yet
     /// supported by the index machinery (analyzer rejects).
     pub primary_key: Vec<String>,
+    /// Table-level and column-level CHECK predicates collected together.
+    /// Each entry is the boolean expression as written; the executor
+    /// re-binds it against each INSERT/UPDATE row.
+    pub check_constraints: Vec<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -1405,10 +1405,9 @@ fn perform_create_table(
     for table in catalog.user_tables()? {
         max_id = max_id.max(table.table_id as i32);
     }
-    // System tables occupy 0 and 1; user tables start at 2.
-    // System tables 0..=3 (pg_class, pg_attribute, pg_index, pg_sequence).
-    // User tables start at 4.
-    let new_table_id = (max_id + 1).max(4);
+    // System tables occupy 0..=4 (pg_class, pg_attribute, pg_index,
+    // pg_sequence, pg_constraint). User tables start at 5.
+    let new_table_id = (max_id + 1).max(5);
 
     // Allocate the table's first heap page.
     let new_page_id = {
@@ -1454,6 +1453,35 @@ fn perform_create_table(
             ],
         );
         insert_bytes(bpm, wal, tx, PG_ATTRIBUTE_PAGE_ID, &row)?;
+    }
+
+    // CHECK constraints → pg_constraint rows, one per predicate.
+    if !stmt.check_constraints.is_empty() {
+        use crate::bootstrap::{PG_CONSTRAINT_PAGE_ID, PG_CONSTRAINT_TABLE_ID};
+        let _ = PG_CONSTRAINT_TABLE_ID;
+        let existing = catalog.all_constraints()?;
+        let mut next_id: i32 = existing
+            .iter()
+            .map(|c| c.constraint_id as i32)
+            .max()
+            .unwrap_or(-1)
+            + 1;
+        for (i, defn) in stmt.check_constraints.iter().enumerate() {
+            let cname = format!("{}_check_{}", stmt.table_name, i);
+            let row = serialize_tuple_mvcc(
+                tx.id(),
+                INVALID_TXN_ID,
+                &[
+                    Value::Int(next_id),
+                    Value::Varchar(cname),
+                    Value::Int(new_table_id),
+                    Value::Int(crate::catalog::ConstraintKind::Check as i32),
+                    Value::Varchar(defn.clone()),
+                ],
+            );
+            insert_bytes(bpm, wal, tx, PG_CONSTRAINT_PAGE_ID, &row)?;
+            next_id += 1;
+        }
     }
 
     // PRIMARY KEY → auto-create a unique index named `<table>_pkey`. The
@@ -2101,6 +2129,47 @@ fn rewrite_catalog_row(
     Ok(())
 }
 
+/// Evaluate every CHECK constraint registered for `table_id` against a
+/// fully-coerced row. Re-parses + re-binds each predicate's text on every
+/// call — fine for now (a per-row hashmap cache would help under load).
+/// Bails with SQLSTATE 23514 on the first failing predicate.
+fn enforce_check_constraints(
+    catalog: &Catalog,
+    table_id: usize,
+    table_name: &str,
+    values: &[Value],
+) -> Result<()> {
+    let constraints = catalog.constraints_for_table(table_id)?;
+    if constraints.is_empty() {
+        return Ok(());
+    }
+    let row = Tuple::new(values.to_vec());
+    for c in constraints {
+        if !matches!(c.kind, crate::catalog::ConstraintKind::Check) {
+            continue;
+        }
+        let expr = crate::parser::parse_expr_str(&c.definition).map_err(|e| {
+            anyhow::anyhow!(
+                "stored CHECK '{}' failed to parse: {e}",
+                c.definition
+            )
+        })?;
+        let analyzed =
+            crate::analyzer::analyze_expr_for_table(catalog, table_id, table_name, &expr)?;
+        match evaluate_expr(&analyzed, &row)? {
+            Value::Bool(true) => continue,
+            Value::Bool(false) => bail!(
+                "new row violates check constraint \"{}\" [SQLSTATE 23514]",
+                c.name
+            ),
+            // PG semantics: a NULL check passes (treated as not-violated).
+            Value::Null => continue,
+            other => bail!("CHECK '{}' returned non-boolean: {other:?}", c.name),
+        }
+    }
+    Ok(())
+}
+
 /// Insert one COPY row. Caller has already turned the wire-format text into a
 /// per-table-column `Value` vector (NULL-padded for unmapped columns). Mirrors
 /// perform_insert's per-row work: heap insert + lock + index maintenance.
@@ -2126,6 +2195,7 @@ pub fn perform_copy_row(
         .zip(table.columns.iter())
         .map(|(v, c)| coerce_for_storage(v, c.data_type))
         .collect::<Result<_>>()?;
+    enforce_check_constraints(catalog, table_id, &table.name, &coerced)?;
     let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &coerced);
     let (rid, _lsn, new_tail) =
         insert_bytes_hinted(bpm, wal, tx, table.first_page_id, &bytes, tail_hint)?;
@@ -2170,6 +2240,7 @@ fn perform_insert(
             .zip(table.columns.iter())
             .map(|(v, c)| coerce_for_storage(v, c.data_type))
             .collect::<Result<_>>()?;
+        enforce_check_constraints(catalog, stmt.table_id, &stmt.table_name, &values)?;
         let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &values);
         let (rid, _lsn) = insert_bytes(bpm, wal, tx, table.first_page_id, &bytes)?;
         lm.lock(tx.id(), rid, LockMode::Exclusive)
@@ -2644,6 +2715,7 @@ fn perform_update(
             let target = table.columns[a.column_index].data_type;
             new_values[a.column_index] = coerce_for_storage(v, target)?;
         }
+        enforce_check_constraints(catalog, stmt.table_id, &stmt.table_name, &new_values)?;
         let new_bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
         work.push((pid, slot, old_values, new_values, new_bytes));
     }

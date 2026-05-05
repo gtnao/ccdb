@@ -11,8 +11,8 @@ use anyhow::Result;
 
 use crate::bootstrap::{
     datatype_from_int, PG_ATTRIBUTE_PAGE_ID, PG_ATTRIBUTE_TABLE_ID, PG_CLASS_PAGE_ID,
-    PG_CLASS_TABLE_ID, PG_INDEX_PAGE_ID, PG_INDEX_TABLE_ID, PG_SEQUENCE_PAGE_ID,
-    PG_SEQUENCE_TABLE_ID,
+    PG_CLASS_TABLE_ID, PG_CONSTRAINT_PAGE_ID, PG_CONSTRAINT_TABLE_ID, PG_INDEX_PAGE_ID,
+    PG_INDEX_TABLE_ID, PG_SEQUENCE_PAGE_ID, PG_SEQUENCE_TABLE_ID,
 };
 use crate::buffer_pool::BufferPool;
 use crate::page::{PageId, NO_NEXT_PAGE};
@@ -49,6 +49,36 @@ pub struct IndexDef {
     /// Reject duplicate keys (PRIMARY KEY / UNIQUE). Plain CREATE INDEX
     /// leaves this false.
     pub is_unique: bool,
+}
+
+/// Kind of constraint stored in pg_constraint. Numeric values are the
+/// on-disk encoding (`pg_constraint.contype`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum ConstraintKind {
+    Check = 1,
+    // Foreign key, primary key, unique, etc. join here in later rounds.
+}
+
+impl ConstraintKind {
+    pub fn from_int(n: i32) -> Option<Self> {
+        match n {
+            1 => Some(Self::Check),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ConstraintDef {
+    pub constraint_id: usize,
+    pub name: String,
+    pub table_id: usize,
+    pub kind: ConstraintKind,
+    /// `Expr::Display` form of the constraint expression. The analyzer
+    /// re-parses it whenever the constraint needs to be applied (CHECK
+    /// against an INSERT/UPDATE row).
+    pub definition: String,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +191,7 @@ impl Catalog {
                 || table_id == PG_ATTRIBUTE_TABLE_ID
                 || table_id == PG_INDEX_TABLE_ID
                 || table_id == PG_SEQUENCE_TABLE_ID
+                || table_id == PG_CONSTRAINT_TABLE_ID
             {
                 continue;
             }
@@ -376,6 +407,81 @@ impl Catalog {
 
     pub fn find_sequence(&self, name: &str) -> Result<Option<SequenceDef>> {
         Ok(self.all_sequences()?.into_iter().find(|s| s.name == name))
+    }
+
+    /// Every constraint in pg_constraint, regardless of kind. Callers
+    /// usually filter by kind / table_id afterwards.
+    pub fn all_constraints(&self) -> Result<Vec<ConstraintDef>> {
+        let schema = pg_constraint_schema();
+        let mut out = Vec::new();
+        for (_, _, _, values) in self.scan_chain(PG_CONSTRAINT_PAGE_ID, &schema)? {
+            let constraint_id = match &values[0] {
+                Value::Int(n) => *n as usize,
+                _ => continue,
+            };
+            let name = match &values[1] {
+                Value::Varchar(s) => s.clone(),
+                _ => continue,
+            };
+            let table_id = match &values[2] {
+                Value::Int(n) => *n as usize,
+                _ => continue,
+            };
+            let kind = match &values[3] {
+                Value::Int(n) => match ConstraintKind::from_int(*n) {
+                    Some(k) => k,
+                    None => continue,
+                },
+                _ => continue,
+            };
+            let definition = match &values[4] {
+                Value::Varchar(s) => s.clone(),
+                _ => continue,
+            };
+            out.push(ConstraintDef {
+                constraint_id,
+                name,
+                table_id,
+                kind,
+                definition,
+            });
+        }
+        Ok(out)
+    }
+
+    pub fn constraints_for_table(&self, table_id: usize) -> Result<Vec<ConstraintDef>> {
+        Ok(self
+            .all_constraints()?
+            .into_iter()
+            .filter(|c| c.table_id == table_id)
+            .collect())
+    }
+}
+
+pub fn pg_constraint_schema() -> Schema {
+    Schema {
+        columns: vec![
+            Column {
+                name: "constraint_id".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "name".to_string(),
+                data_type: DataType::Varchar,
+            },
+            Column {
+                name: "table_id".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "contype".to_string(),
+                data_type: DataType::Int,
+            },
+            Column {
+                name: "definition".to_string(),
+                data_type: DataType::Varchar,
+            },
+        ],
     }
 }
 
