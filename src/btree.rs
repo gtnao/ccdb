@@ -60,6 +60,7 @@ pub fn encode_key(v: &Value) -> KeyBytes {
         Value::Varchar(s) => s.as_bytes().to_vec(),
         Value::Bool(b) => vec![*b as u8],
         Value::Double(f) => f.to_le_bytes().to_vec(),
+        Value::Timestamp(t) => t.to_le_bytes().to_vec(),
         Value::Null => Vec::new(),
     }
 }
@@ -88,6 +89,12 @@ pub fn decode_key(bytes: &[u8], ty: DataType) -> Result<Value> {
             }
             Ok(Value::Double(f64::from_le_bytes(bytes.try_into().unwrap())))
         }
+        DataType::Timestamp => {
+            if bytes.len() != 8 {
+                bail!("TIMESTAMP key wrong length: {}", bytes.len());
+            }
+            Ok(Value::Timestamp(i64::from_le_bytes(bytes.try_into().unwrap())))
+        }
     }
 }
 
@@ -106,6 +113,7 @@ pub fn compare_keys(a: &[u8], b: &[u8], ty: DataType) -> Result<Ordering> {
         (Value::Double(x), Value::Double(y)) => {
             Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal))
         }
+        (Value::Timestamp(x), Value::Timestamp(y)) => Ok(x.cmp(y)),
         _ => bail!("type mismatch in key comparison"),
     }
 }

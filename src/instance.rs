@@ -612,6 +612,7 @@ fn column_desc_for(item: &AnalyzedSelectItem) -> ColumnDesc {
         Some(DataType::Varchar) => ColumnDesc::varchar(&name),
         Some(DataType::Bool) => ColumnDesc::bool(&name),
         Some(DataType::Double) => ColumnDesc::double(&name),
+        Some(DataType::Timestamp) => ColumnDesc::timestamp(&name),
         // NULL literal without column context — Postgres convention is "text".
         None => ColumnDesc::varchar(&name),
     }
@@ -631,6 +632,7 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Varchar(s) => Some(s.clone()),
         Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
         Value::Double(f) => Some(format_double(*f)),
+        Value::Timestamp(t) => Some(format_timestamp(*t)),
         Value::Null => None,
     }
 }
@@ -648,6 +650,25 @@ fn format_double(f: f64) -> String {
     let s = format!("{f}");
     // Rust's default {} on f64 already gives a reasonable shortest form.
     s
+}
+
+/// Format a TIMESTAMP (μs since PG epoch 2000-01-01 UTC) as ISO 8601
+/// `YYYY-MM-DD HH:MM:SS[.ffffff]`. Trailing zeros on the fractional part
+/// are trimmed; a value with zero microseconds omits the fractional part.
+fn format_timestamp(micros: i64) -> String {
+    use chrono::{Duration, NaiveDate};
+    let epoch = NaiveDate::from_ymd_opt(2000, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let dt = epoch + Duration::microseconds(micros);
+    let frac = (micros.rem_euclid(1_000_000)) as u32;
+    if frac == 0 {
+        dt.format("%Y-%m-%d %H:%M:%S").to_string()
+    } else {
+        // Use chrono's %.f which trims trailing zeros automatically.
+        dt.format("%Y-%m-%d %H:%M:%S%.f").to_string()
+    }
 }
 
 #[cfg(test)]

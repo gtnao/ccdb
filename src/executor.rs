@@ -614,6 +614,7 @@ fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
         (Value::Double(x), Value::Int(y)) => Ok(x
             .partial_cmp(&(*y as f64))
             .unwrap_or(std::cmp::Ordering::Equal)),
+        (Value::Timestamp(x), Value::Timestamp(y)) => Ok(x.cmp(y)),
         _ => bail!("cannot compare {a:?} and {b:?}"),
     }
 }
@@ -893,6 +894,7 @@ fn literal_to_value(lit: &AnalyzedLiteral) -> Value {
         LiteralValue::Float(f) => Value::Double(*f),
         LiteralValue::String(s) => Value::Varchar(s.clone()),
         LiteralValue::Boolean(b) => Value::Bool(*b),
+        LiteralValue::Timestamp(t) => Value::Timestamp(*t),
         LiteralValue::Null => Value::Null,
     }
 }
@@ -970,6 +972,16 @@ fn evaluate_binary(op: BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
             Ge => Value::Bool(a >= b),
             _ => bail!("unsupported op {op:?} on VARCHAR"),
         }),
+        (Value::Timestamp(a), Value::Timestamp(b)) => Ok(match op {
+            Eq => Value::Bool(a == b),
+            Ne => Value::Bool(a != b),
+            Lt => Value::Bool(a < b),
+            Le => Value::Bool(a <= b),
+            Gt => Value::Bool(a > b),
+            Ge => Value::Bool(a >= b),
+            // INTERVAL arithmetic comes in Phase 1-3.
+            _ => bail!("unsupported op {op:?} on TIMESTAMP"),
+        }),
         _ => bail!("type mismatch in binary op {op:?}"),
     }
 }
@@ -995,7 +1007,8 @@ fn perform_create_table(
     tx: &mut Transaction,
 ) -> Result<()> {
     use crate::bootstrap::{
-        DT_BOOL, DT_DOUBLE, DT_INT, DT_VARCHAR, PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID,
+        DT_BOOL, DT_DOUBLE, DT_INT, DT_TIMESTAMP, DT_VARCHAR, PG_ATTRIBUTE_PAGE_ID,
+        PG_CLASS_PAGE_ID,
     };
 
     // Pick a fresh table_id (max existing + 1). Catalog scan is enough at
@@ -1033,6 +1046,7 @@ fn perform_create_table(
             crate::tuple::DataType::Varchar => DT_VARCHAR,
             crate::tuple::DataType::Bool => DT_BOOL,
             crate::tuple::DataType::Double => DT_DOUBLE,
+            crate::tuple::DataType::Timestamp => DT_TIMESTAMP,
         };
         let row = serialize_tuple_mvcc(
             tx.id(),

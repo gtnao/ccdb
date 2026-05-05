@@ -260,6 +260,8 @@ pub enum LiteralValue {
     String(String),
     Boolean(bool),
     Null,
+    /// PG-epoch microseconds (already parsed by lexer/parser).
+    Timestamp(i64),
 }
 
 impl AnalyzedExpr {
@@ -1050,6 +1052,7 @@ fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
             (LiteralValue::Float(x), LiteralValue::Float(y)) => x.to_bits() == y.to_bits(),
             (LiteralValue::String(x), LiteralValue::String(y)) => x == y,
             (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x == y,
+            (LiteralValue::Timestamp(x), LiteralValue::Timestamp(y)) => x == y,
             (LiteralValue::Null, LiteralValue::Null) => true,
             _ => false,
         },
@@ -1130,6 +1133,10 @@ fn literal_to_analyzed(lit: &Literal) -> AnalyzedLiteral {
             value: LiteralValue::String(s.clone()),
             data_type: Some(DataType::Varchar),
         },
+        Literal::Timestamp(t) => AnalyzedLiteral {
+            value: LiteralValue::Timestamp(*t),
+            data_type: Some(DataType::Timestamp),
+        },
         Literal::Boolean(b) => AnalyzedLiteral {
             value: LiteralValue::Boolean(*b),
             data_type: Some(DataType::Bool),
@@ -1146,6 +1153,7 @@ fn ast_to_runtime(dt: ast::DataType) -> DataType {
         ast::DataType::Int => DataType::Int,
         ast::DataType::Varchar => DataType::Varchar,
         ast::DataType::Double => DataType::Double,
+        ast::DataType::Timestamp => DataType::Timestamp,
     }
 }
 

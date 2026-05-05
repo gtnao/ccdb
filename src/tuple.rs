@@ -14,6 +14,9 @@ pub enum DataType {
     Bool,
     /// 64-bit IEEE 754 floating point (`DOUBLE` / `FLOAT` keyword).
     Double,
+    /// `TIMESTAMP WITHOUT TIME ZONE` — i64 microseconds since
+    /// 2000-01-01 UTC midnight (PostgreSQL epoch).
+    Timestamp,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +38,9 @@ pub enum Value {
     Varchar(String),
     Bool(bool),
     Double(f64),
+    /// Microseconds from PostgreSQL epoch (2000-01-01 UTC midnight). Stored
+    /// as i64 little-endian (8 bytes). Range: ~292000 BC to AD 294276.
+    Timestamp(i64),
 }
 
 fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
@@ -48,6 +54,7 @@ fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
         }
         Value::Bool(v) => buf.push(if *v { 1 } else { 0 }),
         Value::Double(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        Value::Timestamp(v) => buf.extend_from_slice(&v.to_le_bytes()),
     }
 }
 
@@ -86,6 +93,13 @@ fn deserialize_value(data: &[u8], data_type: DataType, is_null: bool) -> Result<
             }
             let v = f64::from_le_bytes(data[..8].try_into()?);
             Ok((Value::Double(v), 8))
+        }
+        DataType::Timestamp => {
+            if data.len() < 8 {
+                bail!("not enough bytes for TIMESTAMP");
+            }
+            let v = i64::from_le_bytes(data[..8].try_into()?);
+            Ok((Value::Timestamp(v), 8))
         }
     }
 }

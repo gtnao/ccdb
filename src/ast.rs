@@ -127,6 +127,7 @@ pub enum DataType {
     Int,
     Varchar,
     Double,
+    Timestamp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -176,6 +177,8 @@ pub enum Literal {
     String(String),
     Boolean(bool),
     Null,
+    /// `TIMESTAMP '2024-01-01 12:34:56'` — already parsed to PG epoch microseconds.
+    Timestamp(i64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -372,6 +372,13 @@ impl Parser {
                 self.skip_optional_size();
                 Ok(DataType::Double)
             }
+            Some(Token::Timestamp) => {
+                self.bump();
+                // Optional `(N)` for fractional-second precision; we always
+                // store μs precision so the value is parsed and ignored.
+                self.skip_optional_size();
+                Ok(DataType::Timestamp)
+            }
             other => bail!("expected data type, got {other:?}"),
         }
     }
@@ -673,6 +680,20 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Expr> {
         match self.peek() {
+            Some(Token::Timestamp) => {
+                // `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.fff]'` — typed literal.
+                self.bump();
+                let s = match self.peek() {
+                    Some(Token::String(s)) => {
+                        let s = s.clone();
+                        self.bump();
+                        s
+                    }
+                    other => bail!("expected string after TIMESTAMP, got {other:?}"),
+                };
+                let micros = parse_timestamp_literal(&s)?;
+                Ok(Expr::Literal(Literal::Timestamp(micros)))
+            }
             Some(Token::Integer(n)) => {
                 let n = *n;
                 self.bump();
@@ -754,6 +775,43 @@ fn bin(l: Expr, op: BinaryOperator, r: Expr) -> Expr {
         op,
         right: Box::new(r),
     }
+}
+
+/// Parse a TIMESTAMP literal string into microseconds from the PostgreSQL
+/// epoch (2000-01-01 UTC midnight). Accepted forms:
+///   - `YYYY-MM-DD HH:MM:SS`
+///   - `YYYY-MM-DD HH:MM:SS.ffffff` (1-6 fractional digits, μs precision)
+///   - `YYYY-MM-DD` (treated as midnight)
+/// Naive parsing only — no time-zone offsets here (those land with TIMESTAMPTZ).
+pub fn parse_timestamp_literal(s: &str) -> Result<i64> {
+    use chrono::NaiveDateTime;
+    let trimmed = s.trim();
+    // Try several format strings in order; first hit wins.
+    let candidates: &[&str] = &[
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d",
+    ];
+    let dt = candidates
+        .iter()
+        .find_map(|fmt| NaiveDateTime::parse_from_str(trimmed, fmt).ok())
+        .or_else(|| {
+            chrono::NaiveDate::parse_from_str(trimmed, "%Y-%m-%d")
+                .ok()
+                .map(|d| d.and_hms_opt(0, 0, 0).unwrap())
+        })
+        .ok_or_else(|| anyhow::anyhow!("invalid timestamp literal: {trimmed:?}"))?;
+    // PostgreSQL epoch: 2000-01-01 00:00:00 UTC.
+    let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let delta = dt.signed_duration_since(pg_epoch);
+    delta
+        .num_microseconds()
+        .ok_or_else(|| anyhow::anyhow!("timestamp out of range"))
 }
 
 pub fn parse(sql: &str) -> Result<Statement> {

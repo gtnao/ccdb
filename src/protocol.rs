@@ -22,6 +22,7 @@ const OID_BOOL: i32 = 16;
 const OID_INT4: i32 = 23;
 const OID_TEXT: i32 = 25;
 const OID_FLOAT8: i32 = 701;
+const OID_TIMESTAMP: i32 = 1114;
 
 #[derive(Debug, Clone)]
 pub struct ColumnDesc {
@@ -56,6 +57,13 @@ impl ColumnDesc {
         Self {
             name: name.to_string(),
             type_oid: OID_FLOAT8,
+            type_size: 8,
+        }
+    }
+    pub fn timestamp(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            type_oid: OID_TIMESTAMP,
             type_size: 8,
         }
     }
