@@ -49,6 +49,9 @@ pub enum AnalyzedStatement {
     Delete(AnalyzedDeleteStatement),
     Update(AnalyzedUpdateStatement),
     CreateTable(AnalyzedCreateTableStatement),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone)]
@@ -545,6 +548,9 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
         Statement::Delete(s) => AnalyzedStatement::Delete(a.analyze_delete(s)?),
         Statement::Update(s) => AnalyzedStatement::Update(a.analyze_update(s)?),
         Statement::CreateTable(s) => AnalyzedStatement::CreateTable(a.analyze_create_table(s)?),
+        Statement::Begin => AnalyzedStatement::Begin,
+        Statement::Commit => AnalyzedStatement::Commit,
+        Statement::Rollback => AnalyzedStatement::Rollback,
     })
 }
 

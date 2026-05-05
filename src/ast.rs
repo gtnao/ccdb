@@ -7,6 +7,9 @@ pub enum Statement {
     Delete(DeleteStatement),
     Update(UpdateStatement),
     CreateTable(CreateTableStatement),
+    Begin,
+    Commit,
+    Rollback,
 }
 
 #[derive(Debug, Clone, PartialEq)]

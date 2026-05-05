@@ -13,6 +13,7 @@ mod lexer;
 mod page;
 mod parser;
 mod protocol;
+mod transaction;
 mod tuple;
 
 use anyhow::Result;

@@ -38,8 +38,20 @@ impl Parser {
             Some(Token::Delete) => self.parse_delete()?,
             Some(Token::Update) => self.parse_update()?,
             Some(Token::Create) => self.parse_create_table()?,
+            Some(Token::Begin) => {
+                self.bump();
+                Statement::Begin
+            }
+            Some(Token::Commit) => {
+                self.bump();
+                Statement::Commit
+            }
+            Some(Token::Rollback) => {
+                self.bump();
+                Statement::Rollback
+            }
             other => bail!(
-                "expected SELECT / INSERT / DELETE / UPDATE / CREATE, got {other:?}"
+                "expected statement keyword, got {other:?}"
             ),
         };
         if let Some(Token::Semicolon) = self.peek() {

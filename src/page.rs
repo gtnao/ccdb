@@ -4,6 +4,8 @@ pub const PAGE_SIZE: usize = 4096;
 
 pub type PageId = u32;
 pub type SlotId = u16;
+/// Record identifier: page + slot inside that page.
+pub type Rid = (PageId, SlotId);
 
 // Slotted page layout (all little-endian):
 //
@@ -136,6 +138,28 @@ impl Page {
         self.write_slot(slot_id, off, 0);
         Ok(())
     }
+
+    /// Reverse of `delete`: revives a tombstoned slot by writing the saved
+    /// bytes back at the original offset and restoring the slot length.
+    /// Relies on the invariant that `delete` does not reclaim space, so the
+    /// region `[offset, offset + data.len())` is still untouched.
+    pub fn restore(&mut self, slot_id: SlotId, data: &[u8]) -> Result<()> {
+        if slot_id >= self.tuple_count() {
+            bail!("slot {slot_id} out of range");
+        }
+        let (offset, len) = self.read_slot(slot_id);
+        if len != 0 {
+            bail!("slot {slot_id} is not deleted (length={len})");
+        }
+        let n = data.len();
+        let end = offset as usize + n;
+        if end > PAGE_SIZE {
+            bail!("restore would overflow page");
+        }
+        self.data[offset as usize..end].copy_from_slice(data);
+        self.write_slot(slot_id, offset, n as u16);
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +185,18 @@ mod tests {
         assert_eq!(q.page_id(), 3);
         assert_eq!(q.tuple_count(), 1);
         assert_eq!(q.get_tuple(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn restore_revives_tombstone() {
+        let mut p = Page::new(0);
+        let s = p.insert(b"hello").unwrap();
+        p.delete(s).unwrap();
+        assert!(p.get_tuple(s).is_none());
+        p.restore(s, b"hello").unwrap();
+        assert_eq!(p.get_tuple(s).unwrap(), b"hello");
+        // Restoring a non-deleted slot is an error.
+        assert!(p.restore(s, b"hello").is_err());
     }
 
     #[test]

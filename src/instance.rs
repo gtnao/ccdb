@@ -14,9 +14,10 @@ use crate::analyzer::{
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::Catalog;
 use crate::disk::DiskManager;
-use crate::executor::{Output, execute};
+use crate::executor::{self, Output, execute};
 use crate::parser::parse;
 use crate::protocol::{ColumnDesc, Connection, FrontendMessage};
+use crate::transaction::Transaction;
 use crate::tuple::{DataType, Value};
 
 const DATA_FILE: &str = "table.db";
@@ -67,28 +68,47 @@ impl Instance {
         conn.send_backend_key_data(1, 0xC0FFEE)?;
         conn.send_ready_for_query()?;
 
-        loop {
-            match conn.read_message()? {
-                None => return Ok(()),
-                Some(FrontendMessage::Terminate) => return Ok(()),
-                Some(FrontendMessage::Unknown(t)) => {
-                    eprintln!("ignoring unknown message type: 0x{t:02x}");
-                    conn.send_ready_for_query()?;
-                }
-                Some(FrontendMessage::Query(sql)) => {
-                    if sql.trim().is_empty() {
-                        conn.send_empty_query()?;
-                    } else if let Err(e) = self.run_query(&sql, &mut conn) {
-                        eprintln!("query error: {e}");
-                        conn.send_error(&e.to_string())?;
+        let mut tx = Transaction::new();
+
+        let result = (|| -> Result<()> {
+            loop {
+                match conn.read_message()? {
+                    None => return Ok(()),
+                    Some(FrontendMessage::Terminate) => return Ok(()),
+                    Some(FrontendMessage::Unknown(t)) => {
+                        eprintln!("ignoring unknown message type: 0x{t:02x}");
+                        conn.send_ready_for_query()?;
                     }
-                    conn.send_ready_for_query()?;
+                    Some(FrontendMessage::Query(sql)) => {
+                        if sql.trim().is_empty() {
+                            conn.send_empty_query()?;
+                        } else if let Err(e) = self.run_query(&sql, &mut conn, &mut tx) {
+                            eprintln!("query error: {e}");
+                            conn.send_error(&e.to_string())?;
+                        }
+                        conn.send_ready_for_query()?;
+                    }
                 }
             }
+        })();
+
+        // Auto-rollback any in-flight transaction so half-applied work doesn't
+        // become "committed" via the post-disconnect flush.
+        if tx.is_active() {
+            if let Err(e) = executor::rollback(&mut self.bpm, &mut tx) {
+                eprintln!("auto-rollback failed: {e}");
+            }
         }
+
+        result
     }
 
-    fn run_query(&mut self, sql: &str, conn: &mut Connection<TcpStream>) -> Result<()> {
+    fn run_query(
+        &mut self,
+        sql: &str,
+        conn: &mut Connection<TcpStream>,
+        tx: &mut Transaction,
+    ) -> Result<()> {
         let stmt = parse(sql)?;
         let analyzed = analyze(&self.catalog, &stmt)?;
 
@@ -96,10 +116,10 @@ impl Instance {
             AnalyzedStatement::Select(s) => {
                 let columns: Vec<ColumnDesc> =
                     s.select_items.iter().map(column_desc_for).collect();
-                let out = execute(&mut self.bpm, &self.catalog, &analyzed)?;
+                let out = execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
                 let rows = match out {
                     Output::Rows(r) => r,
-                    Output::Affected(_) => bail!("SELECT yielded Affected output"),
+                    other => bail!("SELECT yielded non-Rows output: {other:?}"),
                 };
                 conn.send_row_description(&columns)?;
                 for row in &rows {
@@ -109,16 +129,28 @@ impl Instance {
                 conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
             }
             AnalyzedStatement::Insert(_) => {
-                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed)?)?;
+                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed, tx)?)?;
                 conn.send_command_complete(&format!("INSERT 0 {n}"))?;
             }
             AnalyzedStatement::Delete(_) => {
-                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed)?)?;
+                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed, tx)?)?;
                 conn.send_command_complete(&format!("DELETE {n}"))?;
             }
             AnalyzedStatement::Update(_) => {
-                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed)?)?;
+                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed, tx)?)?;
                 conn.send_command_complete(&format!("UPDATE {n}"))?;
+            }
+            AnalyzedStatement::Begin => {
+                execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
+                conn.send_command_complete("BEGIN")?;
+            }
+            AnalyzedStatement::Commit => {
+                execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
+                conn.send_command_complete("COMMIT")?;
+            }
+            AnalyzedStatement::Rollback => {
+                execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
+                conn.send_command_complete("ROLLBACK")?;
             }
             AnalyzedStatement::CreateTable(_) => {
                 bail!("CREATE TABLE is not yet wired up (catalog is read-only)")
@@ -131,7 +163,7 @@ impl Instance {
 fn expect_affected(out: Output) -> Result<usize> {
     match out {
         Output::Affected(n) => Ok(n),
-        Output::Rows(_) => bail!("expected affected-row count, got rows"),
+        other => bail!("expected affected-row count, got {other:?}"),
     }
 }
 
