@@ -850,19 +850,56 @@ impl<'a> Analyzer<'a> {
             .find_table(&s.table)?
             .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
 
+        // Resolve the column list (or default to declaration order). For each
+        // table column, `col_to_value_idx[i]` is the position in the row's
+        // VALUES tuple, or None if that column should default to NULL.
+        let col_to_value_idx: Vec<Option<usize>> = match &s.columns {
+            None => (0..table.columns.len()).map(Some).collect(),
+            Some(names) => {
+                let mut indexed: Vec<Option<usize>> = vec![None; table.columns.len()];
+                for (vi, want) in names.iter().enumerate() {
+                    let (col_idx, _) = table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.name == *want)
+                        .ok_or_else(|| anyhow::anyhow!("column '{want}' not found"))?;
+                    if indexed[col_idx].is_some() {
+                        bail!("column '{want}' specified more than once");
+                    }
+                    indexed[col_idx] = Some(vi);
+                }
+                indexed
+            }
+        };
+        let expected_value_count = match &s.columns {
+            None => table.columns.len(),
+            Some(c) => c.len(),
+        };
+
         let mut analyzed_rows = Vec::with_capacity(s.rows.len());
         for row in &s.rows {
-            if row.len() != table.columns.len() {
+            if row.len() != expected_value_count {
                 bail!(
-                    "INSERT has {} values but table has {} columns",
+                    "INSERT has {} values but {} were expected",
                     row.len(),
-                    table.columns.len()
+                    expected_value_count,
                 );
             }
-            let mut values = Vec::with_capacity(row.len());
-            for (i, v) in row.iter().enumerate() {
-                let expr = self.analyze_expr(v)?;
-                let col = &table.columns[i];
+            let mut values = Vec::with_capacity(table.columns.len());
+            for (col_idx, col) in table.columns.iter().enumerate() {
+                let expr = match col_to_value_idx[col_idx] {
+                    Some(vi) => self.analyze_expr(&row[vi])?,
+                    None => {
+                        if !col.nullable {
+                            bail!(
+                                "column '{}' is not nullable and was not given a value",
+                                col.name
+                            );
+                        }
+                        AnalyzedExpr::Literal(literal_to_analyzed(&Literal::Null))
+                    }
+                };
                 match expr.data_type() {
                     None => {
                         if !col.nullable {

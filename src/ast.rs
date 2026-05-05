@@ -109,6 +109,10 @@ pub enum SelectColumn {
 #[derive(Debug, Clone, PartialEq)]
 pub struct InsertStatement {
     pub table: String,
+    /// `INSERT INTO t (a, b) VALUES (...)` records the column list here.
+    /// `None` means VALUES targets every column in declaration order.
+    /// Unlisted columns get NULL (or the analyzer rejects if NOT NULL).
+    pub columns: Option<Vec<String>>,
     /// One Vec<Expr> per row. Multi-row form: VALUES (...), (...), ... .
     pub rows: Vec<Vec<Expr>>,
 }

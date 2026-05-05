@@ -47,7 +47,8 @@ impl Parser {
                 self.bump();
                 Statement::Begin
             }
-            Some(Token::Commit) => {
+            // `END` is a PG-specific spelling of COMMIT (used by pgbench).
+            Some(Token::Commit) | Some(Token::End) => {
                 self.bump();
                 Statement::Commit
             }
@@ -194,16 +195,25 @@ impl Parser {
         self.expect(&Token::Insert)?;
         self.expect(&Token::Into)?;
         let table = self.parse_ident()?;
-        // Optional column list: `INSERT INTO t (a, b) VALUES (...)`. We
-        // currently require all columns in declaration order; the column
-        // list is parsed and ignored.
-        if matches!(self.peek(), Some(Token::LParen)) {
+        // Optional column list: `INSERT INTO t (a, b) VALUES (...)`.
+        let columns = if matches!(self.peek(), Some(Token::LParen)) {
             self.bump();
-            while !matches!(self.peek(), Some(Token::RParen) | None) {
-                self.bump();
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.parse_ident()?);
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.bump();
+                    }
+                    Some(Token::RParen) => break,
+                    other => bail!("expected ',' or ')' in column list, got {other:?}"),
+                }
             }
             self.expect(&Token::RParen)?;
-        }
+            Some(cols)
+        } else {
+            None
+        };
         self.expect(&Token::Values)?;
         let mut rows = Vec::new();
         loop {
@@ -225,7 +235,11 @@ impl Parser {
                 break;
             }
         }
-        Ok(Statement::Insert(InsertStatement { table, rows }))
+        Ok(Statement::Insert(InsertStatement {
+            table,
+            columns,
+            rows,
+        }))
     }
 
     fn parse_create_table(&mut self) -> Result<Statement> {
@@ -333,6 +347,23 @@ impl Parser {
             }
         }
         self.expect(&Token::RParen)?;
+        // pgbench / many tools emit `WITH (fillfactor=100, ...)` after the
+        // column list. We don't honour storage parameters; just consume and
+        // discard the parenthesised list.
+        if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("with")) {
+            self.bump();
+            self.expect(&Token::LParen)?;
+            let mut depth = 1;
+            while depth > 0 {
+                match self.peek() {
+                    Some(Token::LParen) => depth += 1,
+                    Some(Token::RParen) => depth -= 1,
+                    None => bail!("unterminated WITH (...) clause"),
+                    _ => {}
+                }
+                self.bump();
+            }
+        }
         Ok(Statement::CreateTable(CreateTableStatement {
             table,
             columns,
