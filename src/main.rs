@@ -1,9 +1,11 @@
-// Storage modules are wired in but unused at this stage; the analyzer in
-// day05 will start tying them to the SQL frontend.
+// Storage modules are wired in but not yet used by the analyzer; day06 will
+// connect them via the executor.
 #![allow(dead_code)]
 
+mod analyzer;
 mod ast;
 mod buffer_pool;
+mod catalog;
 mod disk;
 mod lexer;
 mod page;
@@ -13,30 +15,41 @@ mod tuple;
 
 use anyhow::Result;
 
+use analyzer::analyze;
+use catalog::Catalog;
+use parser::parse;
+
 fn main() -> Result<()> {
-    let queries = [
+    let cat = Catalog::new();
+
+    println!("--- valid queries ---");
+    for sql in [
         "SELECT * FROM users",
         "SELECT id, name FROM users WHERE id > 10",
-        "SELECT id FROM users WHERE id = 1 AND name = 'Alice'",
-        "SELECT a + b * c FROM t",
-        "SELECT * FROM t WHERE NOT (x = 1 OR y = 2)",
-        "SELECT * FROM t WHERE active = TRUE",
-        "INSERT INTO users VALUES (1, 'Alice', NULL)",
-        "CREATE TABLE users (id INT, name VARCHAR)",
-    ];
-
-    for q in queries {
-        println!("SQL: {q}");
-        match parser::parse(q) {
-            Ok(stmt) => println!("  OK: {stmt:?}"),
-            Err(e) => println!("  ERR: {e}"),
+        "SELECT id + 1 FROM users",
+        "INSERT INTO users VALUES (1, 'Alice')",
+        "INSERT INTO users VALUES (2, NULL)",
+        "CREATE TABLE accounts (uid INT, kind VARCHAR)",
+    ] {
+        match parse(sql).and_then(|s| analyze(&cat, &s)) {
+            Ok(_) => println!("OK   {sql}"),
+            Err(e) => println!("ERR  {sql}\n     -> {e}"),
         }
     }
 
-    println!("\n--- error case ---");
-    println!("SQL: SELECT FROM");
-    if let Err(e) = parser::parse("SELECT FROM") {
-        println!("  ERR: {e}");
+    println!("\n--- expected errors ---");
+    for sql in [
+        "SELECT * FROM nope",
+        "SELECT zz FROM users",
+        "INSERT INTO users VALUES (1)",
+        "INSERT INTO users VALUES ('a', 1)",
+        "INSERT INTO users VALUES (NULL, 'Alice')",
+        "CREATE TABLE users (id INT)",
+    ] {
+        match parse(sql).and_then(|s| analyze(&cat, &s)) {
+            Ok(_) => println!("UNEXPECTED OK  {sql}"),
+            Err(e) => println!("ERR  {sql}\n     -> {e}"),
+        }
     }
     Ok(())
 }

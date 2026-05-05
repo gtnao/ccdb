@@ -64,7 +64,7 @@ impl Parser {
             }
         }
         self.expect(&Token::From)?;
-        let from = self.parse_ident()?;
+        let from = self.parse_table_ref()?;
         let where_clause = if matches!(self.peek(), Some(Token::Where)) {
             self.bump();
             Some(self.parse_expr()?)
@@ -132,6 +132,13 @@ impl Parser {
             }
             other => bail!("expected data type, got {other:?}"),
         }
+    }
+
+    fn parse_table_ref(&mut self) -> Result<TableRef> {
+        let name = self.parse_ident()?;
+        // Alias parsing (`AS u` / bare `u`) is deferred — qualified column refs
+        // (`u.col`) aren't supported yet, so the alias would be unused.
+        Ok(TableRef { name, alias: None })
     }
 
     fn parse_ident(&mut self) -> Result<String> {
@@ -305,7 +312,10 @@ mod tests {
             s,
             Statement::Select(SelectStatement {
                 columns: vec![SelectColumn::Asterisk],
-                from: "users".into(),
+                from: TableRef {
+                    name: "users".into(),
+                    alias: None
+                },
                 where_clause: None,
             })
         );
@@ -317,7 +327,7 @@ mod tests {
         let Statement::Select(sel) = s else {
             panic!()
         };
-        assert_eq!(sel.from, "users");
+        assert_eq!(sel.from.name, "users");
         assert_eq!(sel.columns.len(), 2);
         assert!(matches!(sel.where_clause, Some(_)));
     }

@@ -4,6 +4,7 @@ use anyhow::{Result, bail};
 pub enum DataType {
     Int,
     Varchar,
+    Bool,
 }
 
 #[derive(Debug, Clone)]
@@ -23,6 +24,7 @@ pub enum Value {
     Null,
     Int(i32),
     Varchar(String),
+    Bool(bool),
 }
 
 fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
@@ -34,6 +36,7 @@ fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
             buf.extend_from_slice(bytes);
         }
+        Value::Bool(v) => buf.push(if *v { 1 } else { 0 }),
     }
 }
 
@@ -59,6 +62,12 @@ fn deserialize_value(data: &[u8], data_type: DataType, is_null: bool) -> Result<
             }
             let v = String::from_utf8(data[4..4 + len].to_vec())?;
             Ok((Value::Varchar(v), 4 + len))
+        }
+        DataType::Bool => {
+            if data.is_empty() {
+                bail!("not enough bytes for BOOL");
+            }
+            Ok((Value::Bool(data[0] != 0), 1))
         }
     }
 }
@@ -147,5 +156,28 @@ mod tests {
     fn arity_mismatch_is_rejected() {
         let schema = schema_2col();
         assert!(serialize_tuple(&[Value::Int(1)], &schema).is_err());
+    }
+
+    #[test]
+    fn bool_round_trip() {
+        let schema = Schema {
+            columns: vec![
+                Column {
+                    name: "a".into(),
+                    data_type: DataType::Bool,
+                },
+                Column {
+                    name: "b".into(),
+                    data_type: DataType::Bool,
+                },
+            ],
+        };
+        for vs in [
+            vec![Value::Bool(true), Value::Bool(false)],
+            vec![Value::Null, Value::Bool(true)],
+        ] {
+            let bytes = serialize_tuple(&vs, &schema).unwrap();
+            assert_eq!(deserialize_tuple(&bytes, &schema).unwrap(), vs);
+        }
     }
 }

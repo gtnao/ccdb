@@ -10,8 +10,14 @@ pub enum Statement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     pub columns: Vec<SelectColumn>,
-    pub from: String,
+    pub from: TableRef,
     pub where_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableRef {
+    pub name: String,
+    pub alias: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
