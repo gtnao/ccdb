@@ -14,6 +14,7 @@ use crate::analyzer::{
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::buffer_pool::BufferPool;
 use crate::catalog::Catalog;
+use crate::lock_manager::{LockManager, LockMode};
 use crate::page::{PageId, Rid, SlotId};
 use crate::transaction::{Transaction, UndoLogEntry};
 use crate::tuple::{Schema, Value, deserialize_tuple, serialize_tuple};
@@ -52,6 +53,15 @@ pub struct SeqScan<'a> {
     schema: Schema,
     cur_page: u32,
     cur_slot: u16,
+    locking: Option<LockSink<'a>>,
+}
+
+/// Borrowed handle SeqScan uses to acquire S-locks per row and remember
+/// what it locked so the caller (execute) can release on commit.
+struct LockSink<'a> {
+    lm: &'a LockManager,
+    tx_id: u64,
+    held: &'a mut std::collections::HashSet<Rid>,
 }
 
 impl<'a> SeqScan<'a> {
@@ -65,7 +75,21 @@ impl<'a> SeqScan<'a> {
             schema,
             cur_page: 0,
             cur_slot: 0,
+            locking: None,
         })
+    }
+
+    pub fn with_locking(
+        bpm: &'a BufferPool,
+        catalog: &Catalog,
+        table_id: usize,
+        lm: &'a LockManager,
+        tx_id: u64,
+        held: &'a mut std::collections::HashSet<Rid>,
+    ) -> Result<Self> {
+        let mut s = Self::new(bpm, catalog, table_id)?;
+        s.locking = Some(LockSink { lm, tx_id, held });
+        Ok(s)
     }
 }
 
@@ -79,7 +103,7 @@ impl Executor for SeqScan<'_> {
     fn next(&mut self) -> Result<Option<Tuple>> {
         let n = self.bpm.page_count();
         while self.cur_page < n {
-            let found: Option<Vec<Value>> = {
+            let found: Option<(Rid, Vec<Value>)> = {
                 let guard = self.bpm.fetch_page(self.cur_page)?;
                 let page = guard.read();
                 let tc = page.tuple_count();
@@ -87,15 +111,22 @@ impl Executor for SeqScan<'_> {
                 while self.cur_slot < tc {
                     if let Some(raw) = page.get_tuple(self.cur_slot) {
                         let values = deserialize_tuple(raw, &self.schema)?;
+                        let rid = (self.cur_page, self.cur_slot);
                         self.cur_slot += 1;
-                        out = Some(values);
+                        out = Some((rid, values));
                         break;
                     }
                     self.cur_slot += 1;
                 }
                 out
             };
-            if let Some(values) = found {
+            if let Some((rid, values)) = found {
+                if let Some(sink) = self.locking.as_mut() {
+                    sink.lm
+                        .lock(sink.tx_id, rid, LockMode::Shared)
+                        .map_err(|e| anyhow::anyhow!("S-lock on {rid:?}: {e}"))?;
+                    sink.held.insert(rid);
+                }
                 return Ok(Some(Tuple::new(values)));
             }
             self.cur_page += 1;
@@ -266,6 +297,7 @@ fn evaluate_unary(op: UnaryOperator, v: &Value) -> Result<Value> {
 
 fn perform_insert(
     bpm: &BufferPool,
+    lm: &LockManager,
     stmt: &AnalyzedInsertStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
@@ -278,6 +310,9 @@ fn perform_insert(
         })
         .collect::<Result<_>>()?;
     let rid = insert_bytes(bpm, &serialize_tuple(&values))?;
+    lm.lock(tx.id(), rid, LockMode::Exclusive)
+        .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
+    tx.add_lock(rid);
     if tx.is_active() {
         tx.record(UndoLogEntry::Insert { rid });
     }
@@ -324,6 +359,7 @@ fn matches(predicate: Option<&AnalyzedExpr>, tuple: &Tuple) -> Result<bool> {
 
 fn perform_delete(
     bpm: &BufferPool,
+    lm: &LockManager,
     catalog: &Catalog,
     stmt: &AnalyzedDeleteStatement,
     tx: &mut Transaction,
@@ -340,6 +376,9 @@ fn perform_delete(
     }
     for (rid, bytes) in &victims {
         let (pid, slot) = *rid;
+        lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
+            .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
+        tx.add_lock((pid, slot));
         {
             let g = bpm.fetch_page(pid)?;
             g.write().delete(slot)?;
@@ -356,6 +395,7 @@ fn perform_delete(
 
 fn perform_update(
     bpm: &BufferPool,
+    lm: &LockManager,
     catalog: &Catalog,
     stmt: &AnalyzedUpdateStatement,
     tx: &mut Transaction,
@@ -382,7 +422,10 @@ fn perform_update(
 
     let count = work.len();
     for (pid, slot, old_bytes, new_bytes) in work {
-        // Tombstone the old slot first.
+        // X-lock the old slot, tombstone it.
+        lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
+            .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
+        tx.add_lock((pid, slot));
         {
             let g = bpm.fetch_page(pid)?;
             g.write().delete(slot)?;
@@ -393,7 +436,11 @@ fn perform_update(
                 data: old_bytes,
             });
         }
+        // Insert the new version, X-lock that too.
         let new_rid = insert_bytes(bpm, &new_bytes)?;
+        lm.lock(tx.id(), new_rid, LockMode::Exclusive)
+            .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
+        tx.add_lock(new_rid);
         if tx.is_active() {
             tx.record(UndoLogEntry::Insert { rid: new_rid });
         }
@@ -447,23 +494,52 @@ pub fn rollback(bpm: &BufferPool, tx: &mut Transaction) -> Result<()> {
 
 pub fn execute(
     bpm: &BufferPool,
+    lm: &LockManager,
     catalog: &Catalog,
     stmt: &AnalyzedStatement,
     tx: &mut Transaction,
 ) -> Result<Output> {
-    match stmt {
+    // Auto-commit boundary: a fresh tx_id per implicit-tx statement so the
+    // LockManager can distinguish concurrent auto-commit statements.
+    let was_inactive_at_start = !tx.is_active();
+    if was_inactive_at_start {
+        tx.refresh_autocommit();
+    }
+
+    let result: Result<Output> = (|| match stmt {
         AnalyzedStatement::Select(s) => {
-            let mut exec = build_select_pipeline(bpm, catalog, s)?;
-            exec.open()?;
-            let mut rows = Vec::new();
-            while let Some(t) = exec.next()? {
-                rows.push(t);
+            // SeqScan accumulates S-locks into a local set so it doesn't need
+            // to borrow tx mutably alongside the pipeline.
+            let mut local_locks: std::collections::HashSet<Rid> =
+                std::collections::HashSet::new();
+            let rows = {
+                let mut exec = build_select_pipeline_locked(
+                    bpm,
+                    catalog,
+                    s,
+                    lm,
+                    tx.id(),
+                    &mut local_locks,
+                )?;
+                exec.open()?;
+                let mut rows = Vec::new();
+                while let Some(t) = exec.next()? {
+                    rows.push(t);
+                }
+                rows
+            };
+            for rid in local_locks {
+                tx.add_lock(rid);
             }
             Ok(Output::Rows(rows))
         }
-        AnalyzedStatement::Insert(s) => Ok(Output::Affected(perform_insert(bpm, s, tx)?)),
-        AnalyzedStatement::Delete(s) => Ok(Output::Affected(perform_delete(bpm, catalog, s, tx)?)),
-        AnalyzedStatement::Update(s) => Ok(Output::Affected(perform_update(bpm, catalog, s, tx)?)),
+        AnalyzedStatement::Insert(s) => Ok(Output::Affected(perform_insert(bpm, lm, s, tx)?)),
+        AnalyzedStatement::Delete(s) => {
+            Ok(Output::Affected(perform_delete(bpm, lm, catalog, s, tx)?))
+        }
+        AnalyzedStatement::Update(s) => {
+            Ok(Output::Affected(perform_update(bpm, lm, catalog, s, tx)?))
+        }
         AnalyzedStatement::Begin => {
             if tx.is_active() {
                 bail!("there is already a transaction in progress");
@@ -475,6 +551,9 @@ pub fn execute(
             if !tx.is_active() {
                 bail!("there is no transaction in progress");
             }
+            // Release all locks before clearing tx state.
+            let held = tx.take_held_locks();
+            lm.unlock_all(tx.id(), &held);
             tx.commit();
             Ok(Output::Commit)
         }
@@ -483,24 +562,38 @@ pub fn execute(
                 bail!("there is no transaction in progress");
             }
             rollback(bpm, tx)?;
+            let held = tx.take_held_locks();
+            lm.unlock_all(tx.id(), &held);
             Ok(Output::Rollback)
         }
         AnalyzedStatement::CreateTable(_) => {
             bail!("CREATE TABLE execution is not yet wired up (catalog is read-only)")
         }
+    })();
+
+    // Auto-commit: release any locks the statement acquired.
+    if was_inactive_at_start && !tx.is_active() {
+        let held = tx.take_held_locks();
+        lm.unlock_all(tx.id(), &held);
     }
+
+    result
 }
 
-fn build_select_pipeline<'a>(
+fn build_select_pipeline_locked<'a>(
     bpm: &'a BufferPool,
     catalog: &'a Catalog,
     stmt: &AnalyzedSelectStatement,
+    lm: &'a LockManager,
+    tx_id: u64,
+    held: &'a mut std::collections::HashSet<Rid>,
 ) -> Result<Box<dyn Executor + 'a>> {
     let rte = &stmt.range_table[stmt.from_rte_index];
     let table_id = match &rte.source {
         TableSource::BaseTable { table_id, .. } => *table_id,
     };
-    let scan: Box<dyn Executor + 'a> = Box::new(SeqScan::new(bpm, catalog, table_id)?);
+    let scan: Box<dyn Executor + 'a> =
+        Box::new(SeqScan::with_locking(bpm, catalog, table_id, lm, tx_id, held)?);
     let filtered: Box<dyn Executor + 'a> = match &stmt.where_clause {
         Some(p) => Box::new(Filter::new(scan, p.clone())),
         None => scan,
@@ -537,7 +630,8 @@ mod tests {
 
     fn run(sql: &str, cat: &Catalog, bpm: &BufferPool) -> Output {
         let mut tx = Transaction::new();
-        run_tx(sql, cat, bpm, &mut tx)
+        let lm = LockManager::new();
+        run_full(sql, cat, bpm, &lm, &mut tx)
     }
 
     fn run_tx(
@@ -546,9 +640,20 @@ mod tests {
         bpm: &BufferPool,
         tx: &mut Transaction,
     ) -> Output {
+        let lm = LockManager::new();
+        run_full(sql, cat, bpm, &lm, tx)
+    }
+
+    fn run_full(
+        sql: &str,
+        cat: &Catalog,
+        bpm: &BufferPool,
+        lm: &LockManager,
+        tx: &mut Transaction,
+    ) -> Output {
         let stmt = parse(sql).unwrap();
         let analyzed = analyze(cat, &stmt).unwrap();
-        execute(bpm, cat, &analyzed, tx).unwrap()
+        execute(bpm, lm, cat, &analyzed, tx).unwrap()
     }
 
     #[test]
@@ -861,9 +966,103 @@ mod tests {
 
         let stmt = parse("BEGIN").unwrap();
         let analyzed = analyze(&cat, &stmt).unwrap();
-        execute(&bpm, &cat, &analyzed, &mut tx).unwrap();
-        let err = execute(&bpm, &cat, &analyzed, &mut tx);
+        let lm = LockManager::new();
+        execute(&bpm, &lm, &cat, &analyzed, &mut tx).unwrap();
+        let err = execute(&bpm, &lm, &cat, &analyzed, &mut tx);
         assert!(err.is_err());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn concurrent_update_serializes_via_x_lock() {
+        // Two threads BEGIN, both UPDATE the same row, then COMMIT.
+        // Without the lock manager they'd race; with X-locks the second
+        // blocks until the first commits, then proceeds.
+        use crate::lock_manager::LockManager;
+        use std::sync::Arc;
+        use std::sync::Barrier;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let path = temp_path("concurrent-update");
+        let disk = DiskManager::open(&path).unwrap();
+        let bpm = BufferPool::new(disk, 4);
+        let lm = Arc::new(LockManager::new());
+        let cat = Arc::new(Catalog::new());
+
+        // Seed one row.
+        {
+            let mut tx = Transaction::new();
+            run_full(
+                "INSERT INTO users VALUES (1, 'init')",
+                &cat,
+                &bpm,
+                &lm,
+                &mut tx,
+            );
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let (a_started, b_can_proceed) = mpsc::channel::<()>();
+
+        let bpm_a = bpm.clone();
+        let lm_a = Arc::clone(&lm);
+        let cat_a = Arc::clone(&cat);
+        let bar_a = Arc::clone(&barrier);
+        let h_a = thread::spawn(move || {
+            bar_a.wait();
+            let mut tx = Transaction::new();
+            run_full("BEGIN", &cat_a, &bpm_a, &lm_a, &mut tx);
+            run_full(
+                "UPDATE users SET name = 'A' WHERE id = 1",
+                &cat_a,
+                &bpm_a,
+                &lm_a,
+                &mut tx,
+            );
+            // Signal B to start; hold the lock briefly.
+            a_started.send(()).unwrap();
+            thread::sleep(Duration::from_millis(100));
+            run_full("COMMIT", &cat_a, &bpm_a, &lm_a, &mut tx);
+        });
+
+        let bpm_b = bpm.clone();
+        let lm_b = Arc::clone(&lm);
+        let cat_b = Arc::clone(&cat);
+        let bar_b = Arc::clone(&barrier);
+        let h_b = thread::spawn(move || {
+            bar_b.wait();
+            // Wait until A is mid-tx so we know A is holding the X-lock.
+            b_can_proceed.recv().unwrap();
+            let mut tx = Transaction::new();
+            run_full("BEGIN", &cat_b, &bpm_b, &lm_b, &mut tx);
+            // This blocks until A commits.
+            run_full(
+                "UPDATE users SET name = 'B' WHERE id = 1",
+                &cat_b,
+                &bpm_b,
+                &lm_b,
+                &mut tx,
+            );
+            run_full("COMMIT", &cat_b, &bpm_b, &lm_b, &mut tx);
+        });
+
+        h_a.join().unwrap();
+        h_b.join().unwrap();
+
+        // After both commit, B's update wins (it ran second, post-A's release).
+        let mut tx = Transaction::new();
+        let Output::Rows(rows) = run_full(
+            "SELECT name FROM users WHERE id = 1",
+            &cat,
+            &bpm,
+            &lm,
+            &mut tx,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows[0].values[0], Value::Varchar("B".into()));
         std::fs::remove_file(&path).ok();
     }
 }

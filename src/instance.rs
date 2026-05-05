@@ -72,7 +72,7 @@ fn handle_client(
     mut conn: Connection<TcpStream>,
     catalog: Arc<Catalog>,
     bpm: BufferPool,
-    _lock_manager: Arc<LockManager>,
+    lock_manager: Arc<LockManager>,
 ) -> Result<()> {
     let startup = conn.read_startup()?;
     eprintln!(
@@ -101,7 +101,9 @@ fn handle_client(
                 Some(FrontendMessage::Query(sql)) => {
                     if sql.trim().is_empty() {
                         conn.send_empty_query()?;
-                    } else if let Err(e) = run_query(&sql, &mut conn, &bpm, &catalog, &mut tx) {
+                    } else if let Err(e) =
+                        run_query(&sql, &mut conn, &bpm, &lock_manager, &catalog, &mut tx)
+                    {
                         eprintln!("query error: {e}");
                         conn.send_error(&e.to_string())?;
                     }
@@ -116,6 +118,11 @@ fn handle_client(
             eprintln!("auto-rollback failed: {e}");
         }
     }
+    // Release any locks left over (auto-rollback or aborted statement).
+    let held = tx.take_held_locks();
+    if !held.is_empty() {
+        lock_manager.unlock_all(tx.id(), &held);
+    }
 
     // Per-connection flush so writes are durable across sessions.
     bpm.flush_all()?;
@@ -127,6 +134,7 @@ fn run_query(
     sql: &str,
     conn: &mut Connection<TcpStream>,
     bpm: &BufferPool,
+    lm: &LockManager,
     catalog: &Catalog,
     tx: &mut Transaction,
 ) -> Result<()> {
@@ -136,7 +144,7 @@ fn run_query(
     match &analyzed {
         AnalyzedStatement::Select(s) => {
             let columns: Vec<ColumnDesc> = s.select_items.iter().map(column_desc_for).collect();
-            let out = execute(bpm, catalog, &analyzed, tx)?;
+            let out = execute(bpm, lm, catalog, &analyzed, tx)?;
             let rows = match out {
                 Output::Rows(r) => r,
                 other => bail!("SELECT yielded non-Rows output: {other:?}"),
@@ -149,27 +157,27 @@ fn run_query(
             conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
         }
         AnalyzedStatement::Insert(_) => {
-            let n = expect_affected(execute(bpm, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("INSERT 0 {n}"))?;
         }
         AnalyzedStatement::Delete(_) => {
-            let n = expect_affected(execute(bpm, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("DELETE {n}"))?;
         }
         AnalyzedStatement::Update(_) => {
-            let n = expect_affected(execute(bpm, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("UPDATE {n}"))?;
         }
         AnalyzedStatement::Begin => {
-            execute(bpm, catalog, &analyzed, tx)?;
+            execute(bpm, lm, catalog, &analyzed, tx)?;
             conn.send_command_complete("BEGIN")?;
         }
         AnalyzedStatement::Commit => {
-            execute(bpm, catalog, &analyzed, tx)?;
+            execute(bpm, lm, catalog, &analyzed, tx)?;
             conn.send_command_complete("COMMIT")?;
         }
         AnalyzedStatement::Rollback => {
-            execute(bpm, catalog, &analyzed, tx)?;
+            execute(bpm, lm, catalog, &analyzed, tx)?;
             conn.send_command_complete("ROLLBACK")?;
         }
         AnalyzedStatement::CreateTable(_) => {
