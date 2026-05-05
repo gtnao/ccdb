@@ -7,9 +7,10 @@
 //! state instead of scanning from the beginning of the WAL.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::clog::Clog;
 use crate::tuple::TxnId;
 use crate::wal::Lsn;
 
@@ -39,19 +40,27 @@ pub struct TransactionManager {
     next_txn_id: AtomicU64,
     /// Active Transaction Table: txn_id → last_lsn.
     att: Mutex<HashMap<u64, Lsn>>,
-    /// Status of finished transactions. `InProgress` is the implicit default
-    /// for any txn_id not in this map. Day15 swaps this for a persistent
-    /// CLOG.
-    status: Mutex<HashMap<TxnId, TxnStatus>>,
+    /// Persistent commit/abort status. Read on every visibility check, so
+    /// the inner page cache absorbs the load. Reaches disk only at flush
+    /// (driven by CHECKPOINT).
+    clog: Arc<Clog>,
 }
 
 impl TransactionManager {
-    pub fn new() -> Self {
+    pub fn new(clog: Arc<Clog>) -> Self {
         Self {
             next_txn_id: AtomicU64::new(1),
             att: Mutex::new(HashMap::new()),
-            status: Mutex::new(HashMap::new()),
+            clog,
         }
+    }
+
+    pub fn clog(&self) -> &Arc<Clog> {
+        &self.clog
+    }
+
+    pub fn next_txn_id(&self) -> u64 {
+        self.next_txn_id.load(Ordering::SeqCst)
     }
 
     pub fn begin(&self) -> u64 {
@@ -68,23 +77,24 @@ impl TransactionManager {
 
     pub fn commit(&self, txn_id: u64) {
         self.att.lock().unwrap().remove(&txn_id);
-        // First decision wins — once a txn is recorded as Committed or
-        // Aborted, later calls (e.g. a stale refresh_autocommit() after a
-        // ROLLBACK) must not flip it.
-        self.status
-            .lock()
-            .unwrap()
-            .entry(txn_id)
-            .or_insert(TxnStatus::Committed);
+        // First decision wins: don't overwrite an existing terminal status
+        // (e.g. a stale refresh_autocommit() after ROLLBACK).
+        if matches!(
+            self.clog.get(txn_id).unwrap_or(TxnStatus::InProgress),
+            TxnStatus::InProgress
+        ) {
+            let _ = self.clog.set(txn_id, TxnStatus::Committed);
+        }
     }
 
     pub fn abort(&self, txn_id: u64) {
         self.att.lock().unwrap().remove(&txn_id);
-        self.status
-            .lock()
-            .unwrap()
-            .entry(txn_id)
-            .or_insert(TxnStatus::Aborted);
+        if matches!(
+            self.clog.get(txn_id).unwrap_or(TxnStatus::InProgress),
+            TxnStatus::InProgress
+        ) {
+            let _ = self.clog.set(txn_id, TxnStatus::Aborted);
+        }
     }
 
     pub fn att_snapshot(&self) -> HashMap<u64, Lsn> {
@@ -108,15 +118,14 @@ impl TransactionManager {
         }
     }
 
-    /// Look up a transaction's persisted commit/abort status. Defaults to
-    /// `Aborted` for unknown txn_ids — recovery treats unfinished txns as
-    /// aborted, and live in-progress txns are filtered earlier via the
-    /// snapshot's `active` set.
+    /// Look up a transaction's commit/abort status. Reads from CLOG;
+    /// defaults to `Aborted` for unknown txn_ids that aren't in the ATT
+    /// (matches the "unfinished = aborted" recovery convention).
     pub fn status(&self, txn_id: TxnId) -> TxnStatus {
-        match self.status.lock().unwrap().get(&txn_id).copied() {
-            Some(s) => s,
-            None => {
-                // If still in ATT it's in progress; otherwise default Aborted.
+        match self.clog.get(txn_id).unwrap_or(TxnStatus::InProgress) {
+            TxnStatus::Committed => TxnStatus::Committed,
+            TxnStatus::Aborted => TxnStatus::Aborted,
+            TxnStatus::InProgress => {
                 if self.att.lock().unwrap().contains_key(&txn_id) {
                     TxnStatus::InProgress
                 } else {
@@ -128,15 +137,10 @@ impl TransactionManager {
 
     /// Recovery uses this to seed status for txns observed in the WAL.
     pub fn record_status(&self, txn_id: TxnId, status: TxnStatus) {
-        self.status.lock().unwrap().insert(txn_id, status);
+        let _ = self.clog.set(txn_id, status);
     }
 }
 
-impl Default for TransactionManager {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -146,7 +150,7 @@ mod tests {
 
     #[test]
     fn ids_unique_under_concurrency() {
-        let tm = Arc::new(TransactionManager::new());
+        let tm = Arc::new(TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory())));
         let mut handles = Vec::new();
         for _ in 0..8 {
             let tm = Arc::clone(&tm);
@@ -165,7 +169,7 @@ mod tests {
 
     #[test]
     fn att_snapshot_reflects_lifecycle() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         let a = tm.begin();
         let b = tm.begin();
         tm.update_last_lsn(a, 10);

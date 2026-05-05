@@ -1,9 +1,10 @@
-//! Trivial persistence of the most recent checkpoint LSN.
+//! Persists checkpoint metadata: the most recent checkpoint LSN and the
+//! global txn_id frontier at that moment. Recovery uses both to skip the
+//! WAL prefix it doesn't need to replay AND to continue allocating
+//! txn_ids without colliding with anything already on disk.
 //!
-//! `checkpoint.meta` is a tiny file containing one little-endian u64. It's
-//! the entry point recovery uses to skip the WAL prefix it doesn't need to
-//! replay. Updated atomically (truncate + write + fsync) at the end of a
-//! successful checkpoint.
+//! `checkpoint.meta` layout (16 bytes, little-endian):
+//!   `[checkpoint_lsn: u64][next_txn_id: u64]`
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
@@ -15,29 +16,41 @@ use crate::wal::Lsn;
 
 const META_FILE: &str = "checkpoint.meta";
 
-pub fn read_lsn<P: AsRef<Path>>(dir: P) -> Result<Option<Lsn>> {
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CheckpointMeta {
+    pub lsn: Lsn,
+    pub next_txn_id: u64,
+}
+
+pub fn read<P: AsRef<Path>>(dir: P) -> Result<Option<CheckpointMeta>> {
     let path = dir.as_ref().join(META_FILE);
     let mut file = match File::open(&path) {
         Ok(f) => f,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let mut buf = [0u8; 8];
+    let mut buf = [0u8; 16];
     match file.read_exact(&mut buf) {
-        Ok(()) => Ok(Some(u64::from_le_bytes(buf))),
-        // Treat a partial/empty file as "no checkpoint yet" rather than fatal.
+        Ok(()) => {
+            let lsn = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+            let next_txn_id = u64::from_le_bytes(buf[8..16].try_into().unwrap());
+            Ok(Some(CheckpointMeta { lsn, next_txn_id }))
+        }
         Err(_) => Ok(None),
     }
 }
 
-pub fn write_lsn<P: AsRef<Path>>(dir: P, lsn: Lsn) -> Result<()> {
+pub fn write<P: AsRef<Path>>(dir: P, meta: CheckpointMeta) -> Result<()> {
     let path = dir.as_ref().join(META_FILE);
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
         .open(&path)?;
-    file.write_all(&lsn.to_le_bytes())?;
+    let mut buf = [0u8; 16];
+    buf[0..8].copy_from_slice(&meta.lsn.to_le_bytes());
+    buf[8..16].copy_from_slice(&meta.next_txn_id.to_le_bytes());
+    file.write_all(&buf)?;
     file.sync_all()?;
     Ok(())
 }
@@ -73,11 +86,13 @@ mod tests {
     #[test]
     fn round_trip() {
         let d = temp_dir("rt");
-        assert_eq!(read_lsn(&d).unwrap(), None);
-        write_lsn(&d, 42).unwrap();
-        assert_eq!(read_lsn(&d).unwrap(), Some(42));
+        assert!(read(&d).unwrap().is_none());
+        write(&d, CheckpointMeta { lsn: 42, next_txn_id: 100 }).unwrap();
+        let m = read(&d).unwrap().unwrap();
+        assert_eq!(m.lsn, 42);
+        assert_eq!(m.next_txn_id, 100);
         delete(&d).unwrap();
-        assert_eq!(read_lsn(&d).unwrap(), None);
+        assert!(read(&d).unwrap().is_none());
         std::fs::remove_dir_all(&d).ok();
     }
 }

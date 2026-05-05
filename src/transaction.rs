@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn lifecycle() {
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
         let id_before = tx.id();
         tx.begin();
         assert!(tx.is_active());
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn refresh_changes_id_only_when_inactive() {
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
         let id1 = tx.id();
         tx.refresh_autocommit();
         let id2 = tx.id();

@@ -18,6 +18,7 @@ use anyhow::Result;
 
 use crate::buffer_pool::BufferPool;
 use crate::page::Rid;
+use crate::transaction_manager::{TransactionManager, TxnStatus};
 use crate::wal::{ClrRedo, Lsn, WalManager, WalRecord, WalRecordType};
 
 #[derive(Debug, Default)]
@@ -35,6 +36,7 @@ pub fn recover(
     wal: &WalManager,
     records: &[WalRecord],
     checkpoint_lsn: Option<Lsn>,
+    tm: &TransactionManager,
 ) -> Result<RecoveryStats> {
     if records.is_empty() {
         return Ok(RecoveryStats::default());
@@ -62,6 +64,16 @@ pub fn recover(
 
     let redo_applied = redo_from(bpm, records, redo_start)?;
     let undo_applied = undo(bpm, wal, records, &analysis)?;
+
+    // Seed CLOG with statuses observed in WAL so post-recovery visibility
+    // checks see the correct outcomes for committed/aborted txns.
+    for &id in &analysis.committed {
+        tm.record_status(id, TxnStatus::Committed);
+    }
+    for &id in &analysis.uncommitted {
+        tm.record_status(id, TxnStatus::Aborted);
+    }
+    tm.clog().flush()?;
 
     bpm.flush_all()?;
 
@@ -292,7 +304,7 @@ mod tests {
         let recs = crate::wal::read_records(&wal_path).unwrap();
         let (pool, wal) = make_pool(&data, &wal_path);
         wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
-        let stats = recover(&pool, &wal, &recs, None).unwrap();
+        let stats = recover(&pool, &wal, &recs, None, &crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))).unwrap();
         assert_eq!(stats.committed_txns, 1);
         assert_eq!(stats.redo_applied, 1);
         assert_eq!(stats.undo_applied, 0);
@@ -325,7 +337,7 @@ mod tests {
         let recs = crate::wal::read_records(&wal_path).unwrap();
         let (pool, wal) = make_pool(&data, &wal_path);
         wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
-        let stats = recover(&pool, &wal, &recs, None).unwrap();
+        let stats = recover(&pool, &wal, &recs, None, &crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))).unwrap();
         assert_eq!(stats.committed_txns, 0);
         assert_eq!(stats.uncommitted_txns, 1);
         assert_eq!(stats.redo_applied, 1);

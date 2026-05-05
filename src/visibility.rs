@@ -85,14 +85,14 @@ mod tests {
 
     #[test]
     fn own_insert_is_visible_to_self() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         let s = snap(5, 10, &[]);
         assert!(is_visible(5, 0, &s, &tm));
     }
 
     #[test]
     fn concurrent_insert_invisible_until_commit() {
-        let tm = Arc::new(TransactionManager::new());
+        let tm = Arc::new(TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory())));
         let writer = tm.begin();
         let reader = tm.begin();
         // Reader's snapshot includes writer in active set.
@@ -107,14 +107,14 @@ mod tests {
 
     #[test]
     fn future_insert_invisible() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         let s = snap(5, 10, &[]);
         assert!(!is_visible(11, 0, &s, &tm));
     }
 
     #[test]
     fn committed_old_insert_visible() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         // xmin=2 committed before our snapshot started.
         tm.record_status(2, TxnStatus::Committed);
         let s = snap(5, 10, &[]);
@@ -123,7 +123,7 @@ mod tests {
 
     #[test]
     fn aborted_xmin_invisible() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         tm.record_status(2, TxnStatus::Aborted);
         let s = snap(5, 10, &[]);
         assert!(!is_visible(2, 0, &s, &tm));
@@ -131,7 +131,7 @@ mod tests {
 
     #[test]
     fn deletion_by_committed_other_hides_tuple() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         tm.record_status(2, TxnStatus::Committed); // creator
         tm.record_status(3, TxnStatus::Committed); // deleter
         let s = snap(5, 10, &[]);
@@ -140,7 +140,7 @@ mod tests {
 
     #[test]
     fn deletion_by_aborted_other_keeps_visible() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         tm.record_status(2, TxnStatus::Committed);
         tm.record_status(3, TxnStatus::Aborted);
         let s = snap(5, 10, &[]);
@@ -149,7 +149,7 @@ mod tests {
 
     #[test]
     fn own_delete_hides_tuple_from_self() {
-        let tm = TransactionManager::new();
+        let tm = TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()));
         tm.record_status(2, TxnStatus::Committed);
         let s = snap(5, 10, &[]);
         assert!(!is_visible(2, 5, &s, &tm));

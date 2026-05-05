@@ -2,3 +2,4 @@
 /table.db
 /wal.log
 /checkpoint.meta
+/clog.db

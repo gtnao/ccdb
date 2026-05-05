@@ -717,7 +717,7 @@ mod tests {
     }
 
     fn run(sql: &str, cat: &Catalog, bpm: &BufferPool, wal: &WalManager) -> Output {
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
         let lm = LockManager::new();
         run_full(sql, cat, bpm, &lm, wal, &mut tx)
     }
@@ -947,7 +947,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
 
         run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
         run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
@@ -974,7 +974,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
 
         run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
         run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &wal, &mut tx);
@@ -996,7 +996,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
 
         run_tx("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &wal, &mut tx);
         run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
@@ -1029,7 +1029,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
 
         run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
         run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
@@ -1048,13 +1048,13 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory()))));
 
         let stmt = parse("BEGIN").unwrap();
         let analyzed = analyze(&cat, &stmt).unwrap();
         let lm = LockManager::new();
-        execute(&bpm, &lm, &wal, &crate::transaction_manager::TransactionManager::new(), &cat, &analyzed, &mut tx).unwrap();
-        let err = execute(&bpm, &lm, &wal, &crate::transaction_manager::TransactionManager::new(), &cat, &analyzed, &mut tx);
+        execute(&bpm, &lm, &wal, &crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory())), &cat, &analyzed, &mut tx).unwrap();
+        let err = execute(&bpm, &lm, &wal, &crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory())), &cat, &analyzed, &mut tx);
         assert!(err.is_err());
         std::fs::remove_file(&path).ok();
     }
@@ -1079,7 +1079,7 @@ mod tests {
         let cat = Arc::new(Catalog::new());
         // Single shared TM so visibility checks across threads agree on
         // commit/abort status.
-        let tm = Arc::new(crate::transaction_manager::TransactionManager::new());
+        let tm = Arc::new(crate::transaction_manager::TransactionManager::new(std::sync::Arc::new(crate::clog::Clog::in_memory())));
 
         // Seed one row.
         {

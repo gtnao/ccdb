@@ -7,6 +7,7 @@ mod ast;
 mod buffer_pool;
 mod catalog;
 mod checkpoint;
+mod clog;
 mod disk;
 mod executor;
 mod instance;

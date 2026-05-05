@@ -23,7 +23,8 @@ use crate::transaction::Transaction;
 use crate::transaction_manager::TransactionManager;
 use crate::tuple::{DataType, Value};
 use crate::wal::{self, WalManager, WalRecordType};
-use crate::checkpoint;
+use crate::checkpoint::{self, CheckpointMeta};
+use crate::clog::{self, Clog};
 
 const DATA_FILE: &str = "table.db";
 const WAL_FILE: &str = "wal.log";
@@ -45,30 +46,42 @@ impl Instance {
             let _ = std::fs::remove_file(DATA_FILE);
             let _ = std::fs::remove_file(WAL_FILE);
             checkpoint::delete(DATA_DIR)?;
+            clog::delete(DATA_DIR)?;
         }
 
         let wal_records = wal::read_records(WAL_FILE)?;
-        let checkpoint_lsn = checkpoint::read_lsn(DATA_DIR)?;
+        let meta = checkpoint::read(DATA_DIR)?;
 
         let disk = DiskManager::open(DATA_FILE)?;
         let wal = Arc::new(WalManager::open(WAL_FILE)?);
         let bpm = BufferPool::new(disk, POOL_CAPACITY, Arc::clone(&wal));
-        let tm = Arc::new(TransactionManager::new());
+        let clog = Arc::new(Clog::open(DATA_DIR)?);
+        let tm = Arc::new(TransactionManager::new(Arc::clone(&clog)));
+
+        // Seed counter from checkpoint so we don't reuse txn_ids.
+        if let Some(m) = meta {
+            if m.next_txn_id > 0 {
+                tm.set_next_txn_id(m.next_txn_id);
+            }
+        }
 
         if !wal_records.is_empty() {
             let max_lsn = wal_records.iter().map(|r| r.lsn).max().unwrap_or(0);
             wal.set_next_lsn(max_lsn + 1);
 
-            let stats = recovery::recover(&bpm, &wal, &wal_records, checkpoint_lsn)?;
+            let stats =
+                recovery::recover(&bpm, &wal, &wal_records, meta.map(|m| m.lsn), &tm)?;
             eprintln!(
                 "recovery: checkpoint={:?} committed={} uncommitted={} redo={} undo={}",
-                checkpoint_lsn,
+                meta.map(|m| m.lsn),
                 stats.committed_txns,
                 stats.uncommitted_txns,
                 stats.redo_applied,
                 stats.undo_applied,
             );
-            tm.set_next_txn_id(stats.max_txn_id + 1);
+            // After recovery, advance counter past anything observed.
+            let max_id = stats.max_txn_id.max(meta.map(|m| m.next_txn_id).unwrap_or(0));
+            tm.set_next_txn_id(max_id + 1);
         }
 
         Ok(Self {
@@ -80,16 +93,27 @@ impl Instance {
         })
     }
 
-    /// Take a fuzzy checkpoint: snapshot ATT + DPT, write a Checkpoint
-    /// record, fsync the WAL, then update checkpoint.meta.
+    /// Take a fuzzy checkpoint: persist CLOG, write a Checkpoint WAL
+    /// record (ATT + DPT snapshot), fsync the WAL, then update
+    /// checkpoint.meta atomically.
     pub fn checkpoint(&self) -> Result<()> {
+        // CLOG first so any committed status referenced by post-checkpoint
+        // visibility is durable.
+        self.tm.clog().flush()?;
+
         let att = self.tm.att_snapshot();
         let dpt = self.bpm.dpt_snapshot();
         let lsn = self
             .wal
             .append(0, 0, WalRecordType::Checkpoint { att, dpt })?;
         self.wal.flush()?;
-        checkpoint::write_lsn(DATA_DIR, lsn)?;
+        checkpoint::write(
+            DATA_DIR,
+            CheckpointMeta {
+                lsn,
+                next_txn_id: self.tm.next_txn_id(),
+            },
+        )?;
         Ok(())
     }
 
@@ -138,13 +162,20 @@ struct InstanceHandle {
 
 impl InstanceHandle {
     fn checkpoint(&self) -> Result<()> {
+        self.tm.clog().flush()?;
         let att = self.tm.att_snapshot();
         let dpt = self.bpm.dpt_snapshot();
         let lsn = self
             .wal
             .append(0, 0, WalRecordType::Checkpoint { att, dpt })?;
         self.wal.flush()?;
-        checkpoint::write_lsn(DATA_DIR, lsn)?;
+        checkpoint::write(
+            DATA_DIR,
+            CheckpointMeta {
+                lsn,
+                next_txn_id: self.tm.next_txn_id(),
+            },
+        )?;
         Ok(())
     }
 }
