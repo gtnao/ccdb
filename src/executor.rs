@@ -1784,18 +1784,55 @@ fn perform_vacuum(
                 }
             }
             let became_empty;
-            if !dead.is_empty() {
-                let mut p = g.write();
-                for (slot, _) in &dead {
-                    p.delete(*slot)?;
+            {
+                if !dead.is_empty() {
+                    let mut p = g.write();
+                    for (slot, _) in &dead {
+                        p.delete(*slot)?;
+                    }
+                    p.vacuum_compact();
+                    if p.page_lsn() < stamp_lsn {
+                        p.set_page_lsn(stamp_lsn);
+                    }
                 }
-                p.vacuum_compact();
-                if p.page_lsn() < stamp_lsn {
-                    p.set_page_lsn(stamp_lsn);
-                }
+                let p = g.read();
                 became_empty = p.is_empty();
-            } else {
-                became_empty = g.read().is_empty();
+                drop(p);
+            }
+            // After dead-tuple cleanup, see whether every remaining tuple is
+            // visible to every snapshot the VACUUM saw — i.e. xmin committed
+            // before oldest_active_xmin and xmax is unset. If so, set the
+            // page's all_visible bit. Future writes (insert/set_xmax/restore)
+            // clear it automatically.
+            if !became_empty {
+                let mut all_visible = true;
+                {
+                    let p = g.read();
+                    let n = p.tuple_count();
+                    for slot in 0..n {
+                        let raw = match p.get_tuple(slot) {
+                            Some(r) => r,
+                            None => continue,
+                        };
+                        let (xmin, xmax, _) = deserialize_tuple_mvcc(raw, &schema)?;
+                        if xmax != INVALID_TXN_ID
+                            || xmin >= oldest_xmin
+                            || !matches!(tm.status(xmin), TxnStatus::Committed)
+                        {
+                            all_visible = false;
+                            break;
+                        }
+                    }
+                }
+                if all_visible {
+                    let mut p = g.write();
+                    if !p.all_visible() {
+                        p.set_all_visible(true);
+                        if p.page_lsn() < stamp_lsn {
+                            p.set_page_lsn(stamp_lsn);
+                        }
+                    }
+                }
             }
             drop(g);
 

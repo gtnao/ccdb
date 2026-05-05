@@ -130,6 +130,18 @@ impl Page {
         self.data[20] = k as u8;
     }
 
+    /// VM bit. `true` means "every live tuple on this page is visible to
+    /// any snapshot that could be running" — VACUUM sets it; any write
+    /// (INSERT, set_tuple_xmax, restore) clears it. Phase 9 will use it
+    /// to skip the heap visit during index-only scans.
+    pub fn all_visible(&self) -> bool {
+        self.data[22] != 0
+    }
+
+    pub fn set_all_visible(&mut self, v: bool) {
+        self.data[22] = v as u8;
+    }
+
     /// Mutable raw access to the page bytes. Used by recovery to apply a
     /// physical undo image without going through the slot interface, and by
     /// the B+Tree to write its own layout directly.
@@ -176,6 +188,9 @@ impl Page {
         self.write_slot(slot_id, new_off, tuple_len as u16);
         self.set_tuple_count(slot_id + 1);
         self.set_free_space_offset(new_off);
+        // A new (xmin = current txn) tuple just landed — the page is no
+        // longer "every tuple visible to every snapshot."
+        self.set_all_visible(false);
         Ok(slot_id)
     }
 
@@ -221,6 +236,8 @@ impl Page {
         }
         let xmax_off = offset as usize + 8;
         self.data[xmax_off..xmax_off + 8].copy_from_slice(&xmax.to_le_bytes());
+        // A delete invalidates the all-visible promise.
+        self.set_all_visible(false);
         Ok(())
     }
 
@@ -291,6 +308,8 @@ impl Page {
         }
         self.data[offset as usize..end].copy_from_slice(data);
         self.write_slot(slot_id, offset, n as u16);
+        // restore is the redo path for an Insert; treat it as a write.
+        self.set_all_visible(false);
         Ok(())
     }
 }
@@ -330,6 +349,25 @@ mod tests {
         assert_eq!(p.get_tuple(s).unwrap(), b"hello");
         // Restoring a non-deleted slot is an error.
         assert!(p.restore(s, b"hello").is_err());
+    }
+
+    #[test]
+    fn all_visible_clears_on_writes_and_can_be_set() {
+        let mut p = Page::new(0);
+        assert!(!p.all_visible(), "fresh page is not yet all_visible");
+        p.set_all_visible(true);
+        assert!(p.all_visible());
+        // INSERT clears it.
+        let s = p.insert(b"hello").unwrap();
+        assert!(!p.all_visible());
+        // VACUUM-like manual set works again.
+        p.set_all_visible(true);
+        assert!(p.all_visible());
+        // delete (logical tombstone) doesn't go through set_tuple_xmax,
+        // so it does NOT clear all_visible by itself — that matches the
+        // spec: actual MVCC delete uses set_tuple_xmax.
+        p.delete(s).unwrap();
+        assert!(p.all_visible());
     }
 
     #[test]
