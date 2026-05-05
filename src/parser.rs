@@ -84,7 +84,7 @@ impl Parser {
             }
         }
         self.expect(&Token::From)?;
-        let from = self.parse_table_ref()?;
+        let from = self.parse_from_clause()?;
         let where_clause = if matches!(self.peek(), Some(Token::Where)) {
             self.bump();
             Some(self.parse_expr()?)
@@ -211,11 +211,56 @@ impl Parser {
         }))
     }
 
+    /// Parse the FROM tree, building Joins left-associatively.
+    fn parse_from_clause(&mut self) -> Result<FromClause> {
+        let first = self.parse_table_ref()?;
+        let mut node = FromClause::Table(first);
+        loop {
+            let join_type = match self.peek() {
+                Some(Token::Inner) => {
+                    self.bump();
+                    self.expect(&Token::Join)?;
+                    JoinType::Inner
+                }
+                // Bare JOIN means INNER JOIN.
+                Some(Token::Join) => {
+                    self.bump();
+                    JoinType::Inner
+                }
+                Some(Token::Left) => {
+                    self.bump();
+                    self.expect(&Token::Join)?;
+                    JoinType::Left
+                }
+                _ => break,
+            };
+            let right = self.parse_table_ref()?;
+            self.expect(&Token::On)?;
+            let on = self.parse_expr()?;
+            node = FromClause::Join {
+                left: Box::new(node),
+                right,
+                join_type,
+                on,
+            };
+        }
+        Ok(node)
+    }
+
     fn parse_table_ref(&mut self) -> Result<TableRef> {
         let name = self.parse_ident()?;
-        // Alias parsing (`AS u` / bare `u`) is deferred — qualified column refs
-        // (`u.col`) aren't supported yet, so the alias would be unused.
-        Ok(TableRef { name, alias: None })
+        // Optional alias: `AS u` or bare `u`. Bare alias must not collide
+        // with any keyword that can legally follow a table ref (WHERE, JOIN,
+        // INNER, LEFT, ON, semicolon, end-of-input).
+        let alias = if matches!(self.peek(), Some(Token::As)) {
+            self.bump();
+            Some(self.parse_ident()?)
+        } else if matches!(self.peek(), Some(Token::Ident(_))) {
+            Some(self.parse_ident()?)
+        } else {
+            None
+        };
+        Ok(TableRef { name, alias })
     }
 
     fn parse_ident(&mut self) -> Result<String> {
@@ -345,7 +390,20 @@ impl Parser {
             Some(Token::Ident(s)) => {
                 let s = s.clone();
                 self.bump();
-                Ok(Expr::Column(s))
+                // Optional `.ident` for qualified column references.
+                if matches!(self.peek(), Some(Token::Dot)) {
+                    self.bump();
+                    let col = self.parse_ident()?;
+                    Ok(Expr::Column {
+                        qualifier: Some(s),
+                        name: col,
+                    })
+                } else {
+                    Ok(Expr::Column {
+                        qualifier: None,
+                        name: s,
+                    })
+                }
             }
             Some(Token::LParen) => {
                 self.bump();
@@ -379,7 +437,10 @@ mod tests {
         Expr::Literal(Literal::Integer(n))
     }
     fn col(s: &str) -> Expr {
-        Expr::Column(s.into())
+        Expr::Column {
+            qualifier: None,
+            name: s.into(),
+        }
     }
 
     #[test]
@@ -389,10 +450,10 @@ mod tests {
             s,
             Statement::Select(SelectStatement {
                 columns: vec![SelectColumn::Asterisk],
-                from: TableRef {
+                from: FromClause::Table(TableRef {
                     name: "users".into(),
                     alias: None
-                },
+                }),
                 where_clause: None,
             })
         );
@@ -404,9 +465,55 @@ mod tests {
         let Statement::Select(sel) = s else {
             panic!()
         };
-        assert_eq!(sel.from.name, "users");
+        let FromClause::Table(t) = &sel.from else { panic!() };
+        assert_eq!(t.name, "users");
         assert_eq!(sel.columns.len(), 2);
         assert!(matches!(sel.where_clause, Some(_)));
+    }
+
+    #[test]
+    fn parse_inner_join_with_aliases() {
+        let s = parse(
+            "SELECT u.id, o.product FROM users u INNER JOIN orders o ON u.id = o.user_id",
+        )
+        .unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        let FromClause::Join { left, right, join_type, .. } = sel.from else {
+            panic!("expected join")
+        };
+        assert_eq!(join_type, JoinType::Inner);
+        assert_eq!(right.name, "orders");
+        assert_eq!(right.alias.as_deref(), Some("o"));
+        let FromClause::Table(t) = *left else { panic!() };
+        assert_eq!(t.name, "users");
+        assert_eq!(t.alias.as_deref(), Some("u"));
+    }
+
+    #[test]
+    fn parse_left_join_three_way() {
+        let s = parse(
+            "SELECT a.x FROM a JOIN b ON a.id = b.id LEFT JOIN c ON b.id = c.id",
+        )
+        .unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        // Outermost is LEFT JOIN with c.
+        let FromClause::Join { left, right, join_type, .. } = sel.from else { panic!() };
+        assert_eq!(join_type, JoinType::Left);
+        assert_eq!(right.name, "c");
+        // Inner is INNER JOIN(a, b).
+        let FromClause::Join { join_type: inner_jt, .. } = *left else { panic!() };
+        assert_eq!(inner_jt, JoinType::Inner);
+    }
+
+    #[test]
+    fn qualified_column_in_expression() {
+        let s = parse("SELECT u.name FROM users u").unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        let SelectColumn::Expr(Expr::Column { qualifier, name }) = &sel.columns[0] else {
+            panic!()
+        };
+        assert_eq!(qualifier.as_deref(), Some("u"));
+        assert_eq!(name, "name");
     }
 
     #[test]
@@ -515,7 +622,9 @@ mod tests {
 
     #[test]
     fn trailing_garbage_errors() {
-        assert!(parse("SELECT * FROM t blah").is_err());
+        // `FROM t blah` now parses as `FROM t AS blah` (bare-alias). Use a
+        // token that can't be an alias to exercise the trailing-garbage path.
+        assert!(parse("SELECT * FROM t 123").is_err());
     }
 
     #[test]

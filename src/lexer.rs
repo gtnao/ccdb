@@ -26,6 +26,11 @@ pub enum Token {
     Null,
     True,
     False,
+    Join,
+    Inner,
+    Left,
+    On,
+    As,
 
     // Identifiers and literals
     Ident(String),
@@ -38,6 +43,7 @@ pub enum Token {
     Semicolon, // ;
     LParen,    // (
     RParen,    // )
+    Dot,       // .
     Eq,        // =
     Ne,        // <>
     Lt,        // <
@@ -99,6 +105,10 @@ impl Lexer {
             ',' => {
                 self.bump();
                 Token::Comma
+            }
+            '.' => {
+                self.bump();
+                Token::Dot
             }
             ';' => {
                 self.bump();
@@ -209,6 +219,11 @@ impl Lexer {
             "NULL" => Token::Null,
             "TRUE" => Token::True,
             "FALSE" => Token::False,
+            "JOIN" => Token::Join,
+            "INNER" => Token::Inner,
+            "LEFT" => Token::Left,
+            "ON" => Token::On,
+            "AS" => Token::As,
             _ => Token::Ident(s),
         }
     }

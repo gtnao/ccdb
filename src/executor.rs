@@ -8,10 +8,10 @@
 use anyhow::{Result, bail};
 
 use crate::analyzer::{
-    AnalyzedDeleteStatement, AnalyzedExpr, AnalyzedInsertStatement, AnalyzedLiteral,
+    AnalyzedDeleteStatement, AnalyzedExpr, AnalyzedFrom, AnalyzedInsertStatement, AnalyzedLiteral,
     AnalyzedSelectStatement, AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue, TableSource,
 };
-use crate::ast::{BinaryOperator, UnaryOperator};
+use crate::ast::{BinaryOperator, JoinType, UnaryOperator};
 use crate::buffer_pool::BufferPool;
 use crate::catalog::Catalog;
 use crate::lock_manager::{LockManager, LockMode};
@@ -194,6 +194,125 @@ impl Executor for Project<'_> {
                     .map(|e| evaluate_expr(e, &t))
                     .collect::<Result<_>>()?;
                 Ok(Some(Tuple::new(row)))
+            }
+        }
+    }
+}
+
+// -- NestedLoopJoin ----------------------------------------------------------
+
+/// Volcano-style nested-loop join. For each outer row, scan the inner from
+/// the start; emit `outer ++ inner` when the ON predicate is true. LEFT
+/// JOIN additionally emits `outer ++ NULL*` when no inner row matched.
+///
+/// `inner_width` is how many columns the inner side contributes — needed
+/// to NULL-pad on a non-match for LEFT JOIN.
+pub struct NestedLoopJoin<'a> {
+    outer: Box<dyn Executor + 'a>,
+    inner: Box<dyn Executor + 'a>,
+    on: AnalyzedExpr,
+    join_type: JoinType,
+    inner_width: usize,
+    cur_outer: Option<Tuple>,
+    /// Whether the current outer row found at least one inner match. Used
+    /// by LEFT JOIN to decide if a NULL-padded row needs to be emitted.
+    matched_current_outer: bool,
+    /// True between `next()` discovering inner is exhausted and the next
+    /// `next()` actually advancing the outer. Lets us emit a single
+    /// NULL-padded row for an unmatched outer before moving on.
+    pending_left_null_pad: bool,
+}
+
+impl<'a> NestedLoopJoin<'a> {
+    pub fn new(
+        outer: Box<dyn Executor + 'a>,
+        inner: Box<dyn Executor + 'a>,
+        on: AnalyzedExpr,
+        join_type: JoinType,
+        inner_width: usize,
+    ) -> Self {
+        Self {
+            outer,
+            inner,
+            on,
+            join_type,
+            inner_width,
+            cur_outer: None,
+            matched_current_outer: false,
+            pending_left_null_pad: false,
+        }
+    }
+
+    fn concat(outer: &Tuple, inner: &Tuple) -> Tuple {
+        let mut v = Vec::with_capacity(outer.values.len() + inner.values.len());
+        v.extend_from_slice(&outer.values);
+        v.extend_from_slice(&inner.values);
+        Tuple::new(v)
+    }
+
+    fn null_padded(outer: &Tuple, inner_width: usize) -> Tuple {
+        let mut v = outer.values.clone();
+        v.resize(v.len() + inner_width, Value::Null);
+        Tuple::new(v)
+    }
+}
+
+impl Executor for NestedLoopJoin<'_> {
+    fn open(&mut self) -> Result<()> {
+        self.outer.open()?;
+        self.inner.open()?;
+        self.cur_outer = self.outer.next()?;
+        self.matched_current_outer = false;
+        self.pending_left_null_pad = false;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        loop {
+            // LEFT JOIN: outer with no matches gets a single NULL-padded row.
+            if self.pending_left_null_pad {
+                self.pending_left_null_pad = false;
+                let outer = self
+                    .cur_outer
+                    .take()
+                    .expect("pending_left_null_pad implies a current outer");
+                self.cur_outer = self.outer.next()?;
+                self.matched_current_outer = false;
+                return Ok(Some(Self::null_padded(&outer, self.inner_width)));
+            }
+
+            let Some(outer_t) = &self.cur_outer else {
+                return Ok(None);
+            };
+
+            match self.inner.next()? {
+                Some(inner_t) => {
+                    let joined = Self::concat(outer_t, &inner_t);
+                    match evaluate_expr(&self.on, &joined)? {
+                        Value::Bool(true) => {
+                            self.matched_current_outer = true;
+                            return Ok(Some(joined));
+                        }
+                        Value::Bool(false) | Value::Null => continue,
+                        other => bail!("JOIN ON must be boolean, got {other:?}"),
+                    }
+                }
+                None => {
+                    // Inner exhausted for this outer row.
+                    let need_pad = matches!(self.join_type, JoinType::Left)
+                        && !self.matched_current_outer;
+                    if need_pad {
+                        self.pending_left_null_pad = true;
+                        // Loop will emit the padded row on the next iteration.
+                        continue;
+                    }
+                    // Advance outer; reset inner.
+                    self.cur_outer = self.outer.next()?;
+                    self.matched_current_outer = false;
+                    if self.cur_outer.is_some() {
+                        self.inner.open()?;
+                    }
+                }
             }
         }
     }
@@ -744,15 +863,10 @@ fn build_select_pipeline<'a>(
     snapshot: Snapshot,
     tm: &'a TransactionManager,
 ) -> Result<Box<dyn Executor + 'a>> {
-    let rte = &stmt.range_table[stmt.from_rte_index];
-    let table_id = match &rte.source {
-        TableSource::BaseTable { table_id, .. } => *table_id,
-    };
-    let scan: Box<dyn Executor + 'a> =
-        Box::new(SeqScan::new(bpm, catalog, table_id, snapshot, tm)?);
+    let from_exec = build_from_pipeline(bpm, catalog, &stmt.from, &stmt.range_table, &snapshot, tm)?;
     let filtered: Box<dyn Executor + 'a> = match &stmt.where_clause {
-        Some(p) => Box::new(Filter::new(scan, p.clone())),
-        None => scan,
+        Some(p) => Box::new(Filter::new(from_exec, p.clone())),
+        None => from_exec,
     };
     let exprs: Vec<AnalyzedExpr> = stmt
         .select_items
@@ -760,6 +874,54 @@ fn build_select_pipeline<'a>(
         .map(|i| i.expr.clone())
         .collect();
     Ok(Box::new(Project::new(filtered, exprs)))
+}
+
+fn build_from_pipeline<'a>(
+    bpm: &'a BufferPool,
+    catalog: &'a Catalog,
+    from: &AnalyzedFrom,
+    range_table: &[crate::analyzer::RangeTableEntry],
+    snapshot: &Snapshot,
+    tm: &'a TransactionManager,
+) -> Result<Box<dyn Executor + 'a>> {
+    match from {
+        AnalyzedFrom::Table { rte_index } => {
+            let rte = &range_table[*rte_index];
+            let TableSource::BaseTable { table_id, .. } = &rte.source;
+            Ok(Box::new(SeqScan::new(
+                bpm,
+                catalog,
+                *table_id,
+                snapshot.clone(),
+                tm,
+            )?))
+        }
+        AnalyzedFrom::Join {
+            left,
+            right_rte_index,
+            join_type,
+            on,
+        } => {
+            let outer = build_from_pipeline(bpm, catalog, left, range_table, snapshot, tm)?;
+            let rte = &range_table[*right_rte_index];
+            let TableSource::BaseTable { table_id, .. } = &rte.source;
+            let inner: Box<dyn Executor + 'a> = Box::new(SeqScan::new(
+                bpm,
+                catalog,
+                *table_id,
+                snapshot.clone(),
+                tm,
+            )?);
+            let inner_width = rte.output_columns.len();
+            Ok(Box::new(NestedLoopJoin::new(
+                outer,
+                inner,
+                on.clone(),
+                *join_type,
+                inner_width,
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1251,5 +1413,120 @@ mod tests {
             .collect();
         assert!(names.contains("A"));
         assert!(names.contains("B"));
+    }
+
+    /// Same as setup_users() but also creates an `orders(id INT, user_id INT,
+    /// product VARCHAR)` table — the canonical day17 fixture.
+    fn setup_users_orders() -> (
+        Catalog,
+        BufferPool,
+        std::sync::Arc<crate::wal::WalManager>,
+        std::sync::Arc<crate::transaction_manager::TransactionManager>,
+    ) {
+        let (cat, bpm, wal, tm) = setup_users();
+        run(
+            "CREATE TABLE orders (id INT, user_id INT, product VARCHAR)",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        );
+        (cat, bpm, wal, tm)
+    }
+
+    #[test]
+    fn inner_join_basic() {
+        let (cat, bpm, wal, tm) = setup_users_orders();
+        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (2, 'Bob')", &cat, &bpm, &wal, &tm);
+        run(
+            "INSERT INTO orders VALUES (1, 1, 'Book')",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        );
+        run(
+            "INSERT INTO orders VALUES (2, 1, 'Pen')",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        );
+        run(
+            "INSERT INTO orders VALUES (3, 2, 'Notebook')",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        );
+        let Output::Rows(rows) = run(
+            "SELECT u.id, u.name, o.product FROM users u INNER JOIN orders o ON u.id = o.user_id",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 3);
+        // Three matched products, one per row.
+        let products: std::collections::HashSet<String> = rows
+            .iter()
+            .filter_map(|r| match &r.values[2] {
+                Value::Varchar(s) => Some(s.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(products.contains("Book"));
+        assert!(products.contains("Pen"));
+        assert!(products.contains("Notebook"));
+    }
+
+    #[test]
+    fn left_join_unmatched_emits_null() {
+        let (cat, bpm, wal, tm) = setup_users_orders();
+        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (2, 'Bob')", &cat, &bpm, &wal, &tm);
+        // No orders for Bob.
+        run(
+            "INSERT INTO orders VALUES (1, 1, 'Book')",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        );
+        let Output::Rows(rows) = run(
+            "SELECT u.id, u.name, o.product FROM users u LEFT JOIN orders o ON u.id = o.user_id",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 2);
+        // Find Bob's row — product should be NULL.
+        let bob = rows
+            .iter()
+            .find(|r| matches!(&r.values[1], Value::Varchar(s) if s == "Bob"))
+            .expect("Bob row");
+        assert_eq!(bob.values[2], Value::Null);
+    }
+
+    #[test]
+    fn join_qualified_column_ambiguous_unqualified_errors() {
+        // Both users.id and orders.id exist; bare `id` should be ambiguous.
+        let (cat, bpm, wal, tm) = setup_users_orders();
+        let lm = LockManager::new();
+        let mut tx = Transaction::new(std::sync::Arc::clone(&tm));
+        let stmt = parse(
+            "SELECT id FROM users u INNER JOIN orders o ON u.id = o.user_id",
+        )
+        .unwrap();
+        let err = analyze(&cat, &stmt).unwrap_err().to_string();
+        assert!(err.contains("ambiguous"), "got: {err}");
+        // Avoid unused-var warnings.
+        let _ = (bpm, wal, lm, &mut tx);
     }
 }

@@ -14,8 +14,9 @@ use std::mem;
 use anyhow::{Result, bail};
 
 use crate::ast::{
-    self, BinaryOperator, CreateTableStatement, DeleteStatement, Expr, InsertStatement, Literal,
-    SelectColumn, SelectStatement, Statement, UnaryOperator, UpdateStatement,
+    self, BinaryOperator, CreateTableStatement, DeleteStatement, Expr, FromClause,
+    InsertStatement, JoinType, Literal, SelectColumn, SelectStatement, Statement, TableRef,
+    UnaryOperator, UpdateStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -40,6 +41,9 @@ pub struct RangeTableEntry {
     pub rte_index: usize,
     pub source: TableSource,
     pub output_columns: Vec<OutputColumn>,
+    /// Offset of this RTE's columns inside the joined-output tuple. The
+    /// executor's flat tuple is the concat of all RTEs in FROM order.
+    pub flat_offset: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -80,9 +84,24 @@ pub struct AnalyzedAssignment {
 #[derive(Debug, Clone)]
 pub struct AnalyzedSelectStatement {
     pub range_table: Vec<RangeTableEntry>,
-    pub from_rte_index: usize,
+    pub from: AnalyzedFrom,
     pub select_items: Vec<AnalyzedSelectItem>,
     pub where_clause: Option<AnalyzedExpr>,
+}
+
+/// Tree of joined sources. Mirrors the AST `FromClause` but carries
+/// resolved `rte_index` references and analyzed ON predicates.
+#[derive(Debug, Clone)]
+pub enum AnalyzedFrom {
+    Table {
+        rte_index: usize,
+    },
+    Join {
+        left: Box<AnalyzedFrom>,
+        right_rte_index: usize,
+        join_type: JoinType,
+        on: AnalyzedExpr,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -164,8 +183,8 @@ impl AnalyzedExpr {
 
 #[derive(Debug, Clone)]
 struct ScopeEntry {
-    #[allow(dead_code)] // alias resolution comes when qualified refs land
-    name: String,
+    /// The name visible in qualified refs — alias if present, otherwise table name.
+    visible_name: String,
     rte_index: usize,
 }
 
@@ -184,17 +203,56 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn add_rte(&mut self, source: TableSource, output_columns: Vec<OutputColumn>) -> usize {
+    fn add_rte(
+        &mut self,
+        source: TableSource,
+        output_columns: Vec<OutputColumn>,
+        flat_offset: usize,
+    ) -> usize {
         let idx = self.range_table.len();
         self.range_table.push(RangeTableEntry {
             rte_index: idx,
             source,
             output_columns,
+            flat_offset,
         });
         idx
     }
 
-    fn resolve_column(&self, name: &str) -> Result<AnalyzedColumnRef> {
+    fn resolve_column(
+        &self,
+        qualifier: Option<&str>,
+        name: &str,
+    ) -> Result<AnalyzedColumnRef> {
+        // Qualified: only consider the matching scope entry.
+        if let Some(q) = qualifier {
+            for scope in self.scopes.iter().rev() {
+                for entry in scope {
+                    if entry.visible_name != q {
+                        continue;
+                    }
+                    let rte = &self.range_table[entry.rte_index];
+                    let (idx, col) = rte
+                        .output_columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.name == name)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!("column '{q}.{name}' not found")
+                        })?;
+                    return Ok(AnalyzedColumnRef {
+                        rte_index: entry.rte_index,
+                        column_index: rte.flat_offset + idx,
+                        column_name: name.to_string(),
+                        data_type: col.data_type,
+                    });
+                }
+            }
+            bail!("table or alias '{q}' not in scope");
+        }
+
+        // Unqualified: search all scopes; reject ambiguity.
+        let mut hit: Option<AnalyzedColumnRef> = None;
         for scope in self.scopes.iter().rev() {
             for entry in scope {
                 let rte = &self.range_table[entry.rte_index];
@@ -204,22 +262,28 @@ impl<'a> Analyzer<'a> {
                     .enumerate()
                     .find(|(_, c)| c.name == name)
                 {
-                    return Ok(AnalyzedColumnRef {
+                    let cand = AnalyzedColumnRef {
                         rte_index: entry.rte_index,
-                        column_index: idx,
+                        column_index: rte.flat_offset + idx,
                         column_name: name.to_string(),
                         data_type: col.data_type,
-                    });
+                    };
+                    if hit.is_some() {
+                        bail!("column '{name}' is ambiguous");
+                    }
+                    hit = Some(cand);
                 }
             }
         }
-        bail!("column '{name}' not found")
+        hit.ok_or_else(|| anyhow::anyhow!("column '{name}' not found"))
     }
 
     fn analyze_expr(&self, e: &Expr) -> Result<AnalyzedExpr> {
         match e {
             Expr::Literal(l) => Ok(AnalyzedExpr::Literal(literal_to_analyzed(l))),
-            Expr::Column(name) => Ok(AnalyzedExpr::ColumnRef(self.resolve_column(name)?)),
+            Expr::Column { qualifier, name } => Ok(AnalyzedExpr::ColumnRef(
+                self.resolve_column(qualifier.as_deref(), name)?,
+            )),
             Expr::BinaryOp { left, op, right } => {
                 let l = self.analyze_expr(left)?;
                 let r = self.analyze_expr(right)?;
@@ -241,11 +305,13 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn analyze_select(&mut self, s: &SelectStatement) -> Result<AnalyzedSelectStatement> {
+    /// Add an RTE for `t`, register it in the current scope, and return its
+    /// rte_index. `current_offset` is the next free flat-tuple position.
+    fn intro_table(&mut self, t: &TableRef, current_offset: usize) -> Result<usize> {
         let (table_id, table) = self
             .catalog
-            .find_table(&s.from.name)?
-            .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.from.name))?;
+            .find_table(&t.name)?
+            .ok_or_else(|| anyhow::anyhow!("table '{}' not found", t.name))?;
         let output_columns: Vec<OutputColumn> = table
             .columns
             .iter()
@@ -258,32 +324,88 @@ impl<'a> Analyzer<'a> {
         let rte_index = self.add_rte(
             TableSource::BaseTable {
                 table_id,
-                table_name: s.from.name.clone(),
+                table_name: t.name.clone(),
             },
             output_columns,
+            current_offset,
         );
-
-        let scope_name = s.from.alias.clone().unwrap_or_else(|| s.from.name.clone());
-        self.scopes.push(vec![ScopeEntry {
-            name: scope_name,
+        let visible_name = t.alias.clone().unwrap_or_else(|| t.name.clone());
+        // Reject duplicate names within the same SELECT scope.
+        let scope = self.scopes.last_mut().expect("scope pushed");
+        if scope.iter().any(|e| e.visible_name == visible_name) {
+            bail!("table name or alias '{visible_name}' duplicated in FROM");
+        }
+        scope.push(ScopeEntry {
+            visible_name,
             rte_index,
-        }]);
+        });
+        Ok(rte_index)
+    }
+
+    /// Recursively analyze a FROM tree. Returns (analyzed-from, total flat width).
+    fn analyze_from(
+        &mut self,
+        from: &FromClause,
+        offset: usize,
+    ) -> Result<(AnalyzedFrom, usize)> {
+        match from {
+            FromClause::Table(t) => {
+                let rte_index = self.intro_table(t, offset)?;
+                let width = self.range_table[rte_index].output_columns.len();
+                Ok((AnalyzedFrom::Table { rte_index }, offset + width))
+            }
+            FromClause::Join {
+                left,
+                right,
+                join_type,
+                on,
+            } => {
+                let (left_a, after_left) = self.analyze_from(left, offset)?;
+                let right_rte = self.intro_table(right, after_left)?;
+                let total = after_left + self.range_table[right_rte].output_columns.len();
+                // ON predicate is analyzed in the scope that includes both sides.
+                let on_a = self.analyze_expr(on)?;
+                if !matches!(on_a.data_type(), Some(DataType::Bool) | None) {
+                    bail!("JOIN ON must be boolean, got {:?}", on_a.data_type());
+                }
+                Ok((
+                    AnalyzedFrom::Join {
+                        left: Box::new(left_a),
+                        right_rte_index: right_rte,
+                        join_type: *join_type,
+                        on: on_a,
+                    },
+                    total,
+                ))
+            }
+        }
+    }
+
+    fn analyze_select(&mut self, s: &SelectStatement) -> Result<AnalyzedSelectStatement> {
+        // Push scope BEFORE walking FROM so intro_table can register entries.
+        self.scopes.push(Vec::new());
+        let (from_a, _total_width) = self.analyze_from(&s.from, 0)?;
 
         let mut select_items = Vec::new();
         for c in &s.columns {
             match c {
                 SelectColumn::Asterisk => {
-                    let rte = &self.range_table[rte_index];
-                    for (i, oc) in rte.output_columns.iter().enumerate() {
-                        select_items.push(AnalyzedSelectItem {
-                            expr: AnalyzedExpr::ColumnRef(AnalyzedColumnRef {
-                                rte_index,
-                                column_index: i,
-                                column_name: oc.name.clone(),
-                                data_type: oc.data_type,
-                            }),
-                            alias: None,
-                        });
+                    // Expand to every column from every RTE in declaration order.
+                    let scope = self.scopes.last().expect("scope pushed").clone();
+                    for entry in scope {
+                        let rte = &self.range_table[entry.rte_index];
+                        let off = rte.flat_offset;
+                        for (i, oc) in rte.output_columns.iter().enumerate() {
+                            select_items.push(AnalyzedSelectItem {
+                                expr: AnalyzedExpr::ColumnRef(AnalyzedColumnRef {
+                                    rte_index: entry.rte_index,
+                                    column_index: off + i,
+                                    column_name: oc.name.clone(),
+                                    data_type: oc.data_type,
+                                }),
+                                alias: None,
+                            });
+                        }
                     }
                 }
                 SelectColumn::Expr(e) => {
@@ -304,7 +426,7 @@ impl<'a> Analyzer<'a> {
 
         Ok(AnalyzedSelectStatement {
             range_table: mem::take(&mut self.range_table),
-            from_rte_index: rte_index,
+            from: from_a,
             select_items,
             where_clause,
         })
@@ -373,9 +495,10 @@ impl<'a> Analyzer<'a> {
                 table_name: s.table.clone(),
             },
             output_columns,
+            0,
         );
         self.scopes.push(vec![ScopeEntry {
-            name: s.table.clone(),
+            visible_name: s.table.clone(),
             rte_index,
         }]);
 
@@ -420,9 +543,10 @@ impl<'a> Analyzer<'a> {
                 table_name: s.table.clone(),
             },
             output_columns,
+            0,
         );
         self.scopes.push(vec![ScopeEntry {
-            name: s.table.clone(),
+            visible_name: s.table.clone(),
             rte_index,
         }]);
 

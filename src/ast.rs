@@ -35,7 +35,7 @@ pub struct Assignment {
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectStatement {
     pub columns: Vec<SelectColumn>,
-    pub from: TableRef,
+    pub from: FromClause,
     pub where_clause: Option<Expr>,
 }
 
@@ -43,6 +43,25 @@ pub struct SelectStatement {
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
+}
+
+/// Tree-shaped FROM clause. Joins are left-associative:
+/// `A JOIN B JOIN C` parses as `Join(Join(Table(A), B), C)`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FromClause {
+    Table(TableRef),
+    Join {
+        left: Box<FromClause>,
+        right: TableRef,
+        join_type: JoinType,
+        on: Expr,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinType {
+    Inner,
+    Left,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,7 +98,12 @@ pub enum DataType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Literal(Literal),
-    Column(String),
+    /// Column reference: bare `id` has qualifier=None; `u.id` has
+    /// qualifier=Some("u") (the alias or table name as written).
+    Column {
+        qualifier: Option<String>,
+        name: String,
+    },
     BinaryOp {
         left: Box<Expr>,
         op: BinaryOperator,
