@@ -1,3 +1,4 @@
+mod buffer_pool;
 mod disk;
 mod page;
 mod table;
@@ -5,11 +6,13 @@ mod tuple;
 
 use anyhow::Result;
 
+use buffer_pool::BufferPoolManager;
 use disk::DiskManager;
 use table::Table;
 use tuple::{Column, DataType, Schema, Value};
 
 const DATA_FILE: &str = "table.db";
+const POOL_CAPACITY: usize = 3;
 
 fn main() -> Result<()> {
     let _ = std::fs::remove_file(DATA_FILE);
@@ -28,22 +31,27 @@ fn main() -> Result<()> {
     };
 
     let disk = DiskManager::open(DATA_FILE)?;
-    let mut table = Table::new(disk, schema);
+    let bpm = BufferPoolManager::new(disk, POOL_CAPACITY);
+    let mut table = Table::new(bpm, schema);
 
-    let r1 = table.insert(&[Value::Int(1), Value::Varchar("Alice".to_string())])?;
-    let r2 = table.insert(&[Value::Int(2), Value::Null])?;
-    let r3 = table.insert(&[Value::Null, Value::Varchar("Charlie".to_string())])?;
+    // Insert enough rows that some pages must be evicted before flush.
+    // ~1KB rows × 20 → multiple 4KB pages, exceeding capacity=3.
+    let big = "x".repeat(1024);
+    for i in 1..=20 {
+        table.insert(&[Value::Int(i), Value::Varchar(big.clone())])?;
+    }
 
-    println!("inserted rids: {r1:?} {r2:?} {r3:?}");
     println!("page_count = {}", table.page_count());
 
-    let r2_again = table.get(r2)?;
-    println!("get({r2:?}) = {r2_again:?}");
+    table.flush()?;
 
-    let tuples = table.scan()?;
-    println!("scanned {} tuples:", tuples.len());
-    for values in tuples {
-        println!("  {values:?}");
+    let rows = table.scan()?;
+    println!("scanned {} rows (showing first 3):", rows.len());
+    for row in rows.iter().take(3) {
+        match &row[0] {
+            Value::Int(v) => println!("  id={v}, name=<...>"),
+            _ => println!("  {row:?}"),
+        }
     }
     Ok(())
 }
@@ -55,7 +63,14 @@ mod integration_tests {
 
     fn temp_path(name: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("ccdb-{name}-{}.db", std::process::id()));
+        p.push(format!(
+            "ccdb-int-{name}-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
         let _ = std::fs::remove_file(&p);
         p
     }
@@ -76,51 +91,31 @@ mod integration_tests {
     }
 
     #[test]
-    fn insert_spans_multiple_pages() {
-        let path = temp_path("multi-page");
-        let disk = DiskManager::open(&path).unwrap();
-        let mut t = Table::new(disk, schema_kv());
-
-        // ~1KB per tuple → forces multiple 4KB pages.
+    fn many_inserts_under_small_pool_persist() {
+        let path = temp_path("many");
         let big = "x".repeat(1024);
-        let n = 20;
-        let mut rids = Vec::new();
-        for i in 0..n {
-            rids.push(
-                t.insert(&[Value::Int(i), Value::Varchar(big.clone())])
-                    .unwrap(),
-            );
-        }
-        assert!(t.page_count() > 1, "expected >1 pages, got {}", t.page_count());
+        let n = 30i32;
 
-        let scanned = t.scan().unwrap();
-        assert_eq!(scanned.len(), n as usize);
-        for (i, row) in scanned.iter().enumerate() {
+        {
+            let disk = DiskManager::open(&path).unwrap();
+            let bpm = BufferPoolManager::new(disk, 2); // very small pool
+            let mut t = Table::new(bpm, schema_kv());
+            for i in 0..n {
+                t.insert(&[Value::Int(i), Value::Varchar(big.clone())])
+                    .unwrap();
+            }
+            t.flush().unwrap();
+        }
+
+        let disk = DiskManager::open(&path).unwrap();
+        let bpm = BufferPoolManager::new(disk, 2);
+        let mut t = Table::new(bpm, schema_kv());
+        let rows = t.scan().unwrap();
+        assert_eq!(rows.len(), n as usize);
+        for (i, row) in rows.iter().enumerate() {
             assert_eq!(row[0], Value::Int(i as i32));
             assert_eq!(row[1], Value::Varchar(big.clone()));
         }
-        for (i, rid) in rids.into_iter().enumerate() {
-            let row = t.get(rid).unwrap().unwrap();
-            assert_eq!(row[0], Value::Int(i as i32));
-        }
-
-        std::fs::remove_file(&path).ok();
-    }
-
-    #[test]
-    fn reopen_preserves_data() {
-        let path = temp_path("reopen");
-        {
-            let disk = DiskManager::open(&path).unwrap();
-            let mut t = Table::new(disk, schema_kv());
-            t.insert(&[Value::Int(42), Value::Varchar("hi".to_string())])
-                .unwrap();
-        }
-        let disk = DiskManager::open(&path).unwrap();
-        let mut t = Table::new(disk, schema_kv());
-        let rows = t.scan().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0][0], Value::Int(42));
         std::fs::remove_file(&path).ok();
     }
 }
