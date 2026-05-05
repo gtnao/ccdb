@@ -15,8 +15,8 @@ use anyhow::{Result, bail};
 
 use crate::ast::{
     self, BinaryOperator, CreateTableStatement, DeleteStatement, Expr, FromClause, FuncArgs,
-    InsertStatement, JoinType, Literal, SelectColumn, SelectStatement, Statement, TableRef,
-    UnaryOperator, UpdateStatement,
+    InsertStatement, JoinType, Literal, OrderDir, SelectColumn, SelectStatement, Statement,
+    TableRef, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -96,6 +96,16 @@ pub struct AnalyzedSelectStatement {
     pub select_items: Vec<AnalyzedSelectItem>,
     /// Same evaluation context as `select_items` (only meaningful with aggregation).
     pub having: Option<AnalyzedExpr>,
+    /// Sort keys evaluated against the same context as `select_items`.
+    pub order_by: Vec<AnalyzedOrderBy>,
+    /// Cap on rows after Sort. None ⇒ no cap.
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedOrderBy {
+    pub expr: AnalyzedExpr,
+    pub dir: OrderDir,
 }
 
 #[derive(Debug, Clone)]
@@ -486,7 +496,7 @@ impl<'a> Analyzer<'a> {
         }) || s.having.as_ref().map(contains_aggregate).unwrap_or(false);
         let needs_aggregation = !group_keys.is_empty() || has_aggregate_call;
 
-        let (select_items, having, aggregation) = if needs_aggregation {
+        let (select_items, having, aggregation, order_by) = if needs_aggregation {
             let mut aggs: Vec<AnalyzedAggregate> = Vec::new();
             let mut select_items = Vec::new();
             for c in &s.columns {
@@ -513,6 +523,12 @@ impl<'a> Analyzer<'a> {
                 }
                 None => None,
             };
+            // ORDER BY uses the same post-aggregate context.
+            let mut order_by = Vec::new();
+            for ob in &s.order_by {
+                let expr = self.analyze_post_agg(&ob.expr, &group_keys, &mut aggs)?;
+                order_by.push(AnalyzedOrderBy { expr, dir: ob.dir });
+            }
             (
                 select_items,
                 having,
@@ -520,6 +536,7 @@ impl<'a> Analyzer<'a> {
                     group_keys,
                     aggregates: aggs,
                 }),
+                order_by,
             )
         } else {
             // No aggregation: SELECT operates on input tuples directly.
@@ -555,7 +572,15 @@ impl<'a> Analyzer<'a> {
                     }
                 }
             }
-            (select_items, None, None)
+            // ORDER BY against per-row tuples.
+            let mut order_by = Vec::new();
+            for ob in &s.order_by {
+                order_by.push(AnalyzedOrderBy {
+                    expr: self.analyze_expr(&ob.expr)?,
+                    dir: ob.dir,
+                });
+            }
+            (select_items, None, None, order_by)
         };
 
         self.scopes.pop();
@@ -567,6 +592,8 @@ impl<'a> Analyzer<'a> {
             aggregation,
             select_items,
             having,
+            order_by,
+            limit: s.limit,
         })
     }
 

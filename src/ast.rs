@@ -39,6 +39,21 @@ pub struct SelectStatement {
     pub where_clause: Option<Expr>,
     pub group_by: Vec<Expr>,
     pub having: Option<Expr>,
+    pub order_by: Vec<OrderBy>,
+    /// Cap on rows emitted to the client. Omitted ⇒ no cap.
+    pub limit: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OrderBy {
+    pub expr: Expr,
+    pub dir: OrderDir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderDir {
+    Asc,
+    Desc,
 }
 
 #[derive(Debug, Clone, PartialEq)]

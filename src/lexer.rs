@@ -34,6 +34,10 @@ pub enum Token {
     Group,
     By,
     Having,
+    Order,
+    Asc,
+    Desc,
+    Limit,
 
     // Identifiers and literals
     Ident(String),
@@ -230,6 +234,10 @@ impl Lexer {
             "GROUP" => Token::Group,
             "BY" => Token::By,
             "HAVING" => Token::Having,
+            "ORDER" => Token::Order,
+            "ASC" => Token::Asc,
+            "DESC" => Token::Desc,
+            "LIMIT" => Token::Limit,
             _ => Token::Ident(s),
         }
     }

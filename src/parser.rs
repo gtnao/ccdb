@@ -109,13 +109,56 @@ impl Parser {
         } else {
             None
         };
+        let order_by = if matches!(self.peek(), Some(Token::Order)) {
+            self.bump();
+            self.expect(&Token::By)?;
+            let mut items = vec![self.parse_order_item()?];
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                items.push(self.parse_order_item()?);
+            }
+            items
+        } else {
+            Vec::new()
+        };
+        let limit = if matches!(self.peek(), Some(Token::Limit)) {
+            self.bump();
+            match self.peek() {
+                Some(Token::Integer(n)) if *n >= 0 => {
+                    let n = *n as u64;
+                    self.bump();
+                    Some(n)
+                }
+                other => bail!("LIMIT requires non-negative integer, got {other:?}"),
+            }
+        } else {
+            None
+        };
         Ok(Statement::Select(SelectStatement {
             columns,
             from,
             where_clause,
             group_by,
             having,
+            order_by,
+            limit,
         }))
+    }
+
+    fn parse_order_item(&mut self) -> Result<OrderBy> {
+        let expr = self.parse_expr()?;
+        let dir = match self.peek() {
+            Some(Token::Asc) => {
+                self.bump();
+                OrderDir::Asc
+            }
+            Some(Token::Desc) => {
+                self.bump();
+                OrderDir::Desc
+            }
+            _ => OrderDir::Asc,
+        };
+        Ok(OrderBy { expr, dir })
     }
 
     fn parse_insert(&mut self) -> Result<Statement> {
@@ -496,8 +539,20 @@ mod tests {
                 where_clause: None,
                 group_by: Vec::new(),
                 having: None,
+                order_by: Vec::new(),
+                limit: None,
             })
         );
+    }
+
+    #[test]
+    fn parse_order_by_and_limit() {
+        let s = parse("SELECT id FROM t ORDER BY name DESC, id LIMIT 5").unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.order_by.len(), 2);
+        assert_eq!(sel.order_by[0].dir, OrderDir::Desc);
+        assert_eq!(sel.order_by[1].dir, OrderDir::Asc);
+        assert_eq!(sel.limit, Some(5));
     }
 
     #[test]

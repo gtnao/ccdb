@@ -8,11 +8,11 @@
 use anyhow::{Result, bail};
 
 use crate::analyzer::{
-    AggArg, AggKind, AnalyzedAggregate, AnalyzedDeleteStatement,
-    AnalyzedExpr, AnalyzedFrom, AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedSelectStatement,
+    AggArg, AggKind, AnalyzedAggregate, AnalyzedDeleteStatement, AnalyzedExpr, AnalyzedFrom,
+    AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedOrderBy, AnalyzedSelectStatement,
     AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue, TableSource,
 };
-use crate::ast::{BinaryOperator, JoinType, UnaryOperator};
+use crate::ast::{BinaryOperator, JoinType, OrderDir, UnaryOperator};
 use crate::buffer_pool::BufferPool;
 use crate::catalog::Catalog;
 use crate::lock_manager::{LockManager, LockMode};
@@ -535,6 +535,140 @@ impl Executor for HashAggregate<'_> {
         let t = self.rows[self.cursor].clone();
         self.cursor += 1;
         Ok(Some(t))
+    }
+}
+
+// -- Sort --------------------------------------------------------------------
+
+/// Volcano-style Sort. Blocking: drains the child on `open()`, sorts the
+/// buffered tuples by the given keys, then emits one per `next()`. NULLs
+/// follow the PostgreSQL default — ASC puts them last, DESC puts them
+/// first. Stable on equal keys, falling through to insertion order.
+pub struct Sort<'a> {
+    child: Box<dyn Executor + 'a>,
+    keys: Vec<AnalyzedOrderBy>,
+    rows: Vec<Tuple>,
+    cursor: usize,
+    initialized: bool,
+}
+
+impl<'a> Sort<'a> {
+    pub fn new(child: Box<dyn Executor + 'a>, keys: Vec<AnalyzedOrderBy>) -> Self {
+        Self {
+            child,
+            keys,
+            rows: Vec::new(),
+            cursor: 0,
+            initialized: false,
+        }
+    }
+
+    fn build(&mut self) -> Result<()> {
+        self.child.open()?;
+        // Pre-evaluate all sort keys for each tuple — this both avoids
+        // re-evaluating on every comparison and lets us bail out cleanly
+        // before the sort starts if a key fails to evaluate.
+        let mut entries: Vec<(Vec<Value>, Tuple)> = Vec::new();
+        while let Some(t) = self.child.next()? {
+            let mut keyvals = Vec::with_capacity(self.keys.len());
+            for k in &self.keys {
+                keyvals.push(evaluate_expr(&k.expr, &t)?);
+            }
+            entries.push((keyvals, t));
+        }
+        let dirs: Vec<OrderDir> = self.keys.iter().map(|k| k.dir).collect();
+        // sort_by is stable in std.
+        entries.sort_by(|a, b| compare_keys(&a.0, &b.0, &dirs));
+        self.rows = entries.into_iter().map(|(_, t)| t).collect();
+        Ok(())
+    }
+}
+
+impl Executor for Sort<'_> {
+    fn open(&mut self) -> Result<()> {
+        if !self.initialized {
+            self.build()?;
+            self.initialized = true;
+        }
+        self.cursor = 0;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        if self.cursor >= self.rows.len() {
+            return Ok(None);
+        }
+        let t = self.rows[self.cursor].clone();
+        self.cursor += 1;
+        Ok(Some(t))
+    }
+}
+
+fn compare_keys(a: &[Value], b: &[Value], dirs: &[OrderDir]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (i, dir) in dirs.iter().enumerate() {
+        let av = &a[i];
+        let bv = &b[i];
+        // NULL placement: ASC → last, DESC → first (PostgreSQL default).
+        let ord = match (av, bv) {
+            (Value::Null, Value::Null) => Ordering::Equal,
+            (Value::Null, _) => match dir {
+                OrderDir::Asc => Ordering::Greater,
+                OrderDir::Desc => Ordering::Less,
+            },
+            (_, Value::Null) => match dir {
+                OrderDir::Asc => Ordering::Less,
+                OrderDir::Desc => Ordering::Greater,
+            },
+            _ => match compare_values(av, bv) {
+                Ok(o) => match dir {
+                    OrderDir::Asc => o,
+                    OrderDir::Desc => o.reverse(),
+                },
+                // Type-mismatched key — treat as equal so we don't panic;
+                // the analyzer should've caught this earlier.
+                Err(_) => Ordering::Equal,
+            },
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+// -- Limit -------------------------------------------------------------------
+
+pub struct Limit<'a> {
+    child: Box<dyn Executor + 'a>,
+    remaining: u64,
+}
+
+impl<'a> Limit<'a> {
+    pub fn new(child: Box<dyn Executor + 'a>, n: u64) -> Self {
+        Self {
+            child,
+            remaining: n,
+        }
+    }
+}
+
+impl Executor for Limit<'_> {
+    fn open(&mut self) -> Result<()> {
+        self.child.open()
+    }
+
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        if self.remaining == 0 {
+            return Ok(None);
+        }
+        match self.child.next()? {
+            Some(t) => {
+                self.remaining -= 1;
+                Ok(Some(t))
+            }
+            None => Ok(None),
+        }
     }
 }
 
@@ -1103,12 +1237,24 @@ fn build_select_pipeline<'a>(
         Some(p) => Box::new(Filter::new(post_agg, p.clone())),
         None => post_agg,
     };
+    // Sort runs on pre-projection tuples so ORDER BY can reference columns
+    // not in the SELECT list. Skipped when there are no sort keys.
+    let sorted: Box<dyn Executor + 'a> = if stmt.order_by.is_empty() {
+        post_having
+    } else {
+        Box::new(Sort::new(post_having, stmt.order_by.clone()))
+    };
+    // LIMIT after Sort so the cap applies to the ordered output.
+    let limited: Box<dyn Executor + 'a> = match stmt.limit {
+        Some(n) => Box::new(Limit::new(sorted, n)),
+        None => sorted,
+    };
     let exprs: Vec<AnalyzedExpr> = stmt
         .select_items
         .iter()
         .map(|i| i.expr.clone())
         .collect();
-    Ok(Box::new(Project::new(post_having, exprs)))
+    Ok(Box::new(Project::new(limited, exprs)))
 }
 
 fn build_from_pipeline<'a>(
@@ -1878,6 +2024,104 @@ mod tests {
         let err = analyze(&cat, &stmt).unwrap_err().to_string();
         assert!(err.contains("GROUP BY"), "got: {err}");
         let _ = tm;
+    }
+
+    #[test]
+    fn order_by_asc_default() {
+        let (cat, bpm, wal, tm) = setup_users();
+        for (i, name) in [(3, "c"), (1, "a"), (2, "b")] {
+            run(
+                &format!("INSERT INTO users VALUES ({i}, '{name}')"),
+                &cat,
+                &bpm,
+                &wal,
+                &tm,
+            );
+        }
+        let Output::Rows(rows) = run("SELECT id FROM users ORDER BY id", &cat, &bpm, &wal, &tm)
+        else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], Value::Int(1));
+        assert_eq!(rows[1].values[0], Value::Int(2));
+        assert_eq!(rows[2].values[0], Value::Int(3));
+    }
+
+    #[test]
+    fn order_by_desc_with_limit() {
+        let (cat, bpm, wal, tm) = setup_users();
+        for i in [1, 4, 2, 5, 3] {
+            run(
+                &format!("INSERT INTO users VALUES ({i}, 'x')"),
+                &cat,
+                &bpm,
+                &wal,
+                &tm,
+            );
+        }
+        let Output::Rows(rows) = run(
+            "SELECT id FROM users ORDER BY id DESC LIMIT 2",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], Value::Int(5));
+        assert_eq!(rows[1].values[0], Value::Int(4));
+    }
+
+    #[test]
+    fn order_by_null_placement_asc_last() {
+        let (cat, bpm, wal, tm) = setup_users();
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (2, NULL)", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (3, 'b')", &cat, &bpm, &wal, &tm);
+        let Output::Rows(rows) = run(
+            "SELECT id FROM users ORDER BY name",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        // NULL row sorts last under ASC.
+        assert_eq!(rows[0].values[0], Value::Int(1));
+        assert_eq!(rows[1].values[0], Value::Int(3));
+        assert_eq!(rows[2].values[0], Value::Int(2));
+    }
+
+    #[test]
+    fn order_by_with_aggregate() {
+        let (cat, bpm, wal, tm) = setup_sales();
+        let Output::Rows(rows) = run(
+            "SELECT product, SUM(quantity) FROM sales GROUP BY product ORDER BY SUM(quantity) DESC",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 2);
+        let Value::Varchar(p0) = &rows[0].values[0] else { panic!() };
+        assert_eq!(p0, "banana"); // SUM=27 > 18
+    }
+
+    #[test]
+    fn limit_zero_emits_no_rows() {
+        let (cat, bpm, wal, tm) = setup_users();
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &tm);
+        let Output::Rows(rows) =
+            run("SELECT id FROM users LIMIT 0", &cat, &bpm, &wal, &tm)
+        else {
+            panic!()
+        };
+        assert!(rows.is_empty());
     }
 
     #[test]
