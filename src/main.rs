@@ -1,148 +1,15 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+mod disk;
+mod page;
+mod table;
+mod tuple;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
+
+use disk::DiskManager;
+use table::Table;
+use tuple::{Column, DataType, Schema, Value};
 
 const DATA_FILE: &str = "table.db";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DataType {
-    Int,
-    Varchar,
-}
-
-#[derive(Debug, Clone)]
-struct Column {
-    #[allow(dead_code)]
-    name: String,
-    data_type: DataType,
-}
-
-#[derive(Debug, Clone)]
-struct Schema {
-    columns: Vec<Column>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Value {
-    Null,
-    Int(i32),
-    Varchar(String),
-}
-
-fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
-    match value {
-        Value::Null => {}
-        Value::Int(v) => buf.extend_from_slice(&v.to_le_bytes()),
-        Value::Varchar(v) => {
-            let bytes = v.as_bytes();
-            buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-            buf.extend_from_slice(bytes);
-        }
-    }
-}
-
-fn deserialize_value(data: &[u8], data_type: DataType, is_null: bool) -> Result<(Value, usize)> {
-    if is_null {
-        return Ok((Value::Null, 0));
-    }
-    match data_type {
-        DataType::Int => {
-            if data.len() < 4 {
-                bail!("not enough bytes for INT");
-            }
-            let v = i32::from_le_bytes(data[..4].try_into()?);
-            Ok((Value::Int(v), 4))
-        }
-        DataType::Varchar => {
-            if data.len() < 4 {
-                bail!("not enough bytes for VARCHAR length prefix");
-            }
-            let len = u32::from_le_bytes(data[..4].try_into()?) as usize;
-            if data.len() < 4 + len {
-                bail!("VARCHAR payload truncated");
-            }
-            let v = String::from_utf8(data[4..4 + len].to_vec())?;
-            Ok((Value::Varchar(v), 4 + len))
-        }
-    }
-}
-
-fn null_bitmap_size(num_columns: usize) -> usize {
-    num_columns.div_ceil(8)
-}
-
-// Tuple layout: [null bitmap (ceil(N/8) bytes)] [non-null values, in column order]
-// Bitmap convention: bit i set => column i IS NULL.
-fn serialize_tuple(values: &[Value], schema: &Schema) -> Result<Vec<u8>> {
-    if values.len() != schema.columns.len() {
-        bail!(
-            "tuple arity mismatch: got {} values, schema has {} columns",
-            values.len(),
-            schema.columns.len()
-        );
-    }
-
-    let bitmap_len = null_bitmap_size(schema.columns.len());
-    let mut buf = vec![0u8; bitmap_len];
-    for (i, value) in values.iter().enumerate() {
-        if matches!(value, Value::Null) {
-            buf[i / 8] |= 1 << (i % 8);
-        }
-    }
-    for value in values {
-        serialize_value(value, &mut buf);
-    }
-    Ok(buf)
-}
-
-fn deserialize_tuple(data: &[u8], schema: &Schema) -> Result<(Vec<Value>, usize)> {
-    let bitmap_len = null_bitmap_size(schema.columns.len());
-    if data.len() < bitmap_len {
-        bail!("tuple truncated: missing null bitmap");
-    }
-    let bitmap = &data[..bitmap_len];
-    let mut offset = bitmap_len;
-
-    let mut values = Vec::with_capacity(schema.columns.len());
-    for (i, column) in schema.columns.iter().enumerate() {
-        let is_null = bitmap[i / 8] & (1 << (i % 8)) != 0;
-        let (value, len) = deserialize_value(&data[offset..], column.data_type, is_null)?;
-        values.push(value);
-        offset += len;
-    }
-    Ok((values, offset))
-}
-
-fn insert(values: &[Value], schema: &Schema) -> Result<()> {
-    let bytes = serialize_tuple(values, schema)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(DATA_FILE)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    Ok(())
-}
-
-fn scan(schema: &Schema) -> Result<Vec<Vec<Value>>> {
-    let mut file = match File::open(DATA_FILE) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(e.into()),
-    };
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-
-    let mut tuples = Vec::new();
-    let mut offset = 0;
-    while offset < data.len() {
-        let (values, len) = deserialize_tuple(&data[offset..], schema)?;
-        tuples.push(values);
-        offset += len;
-    }
-    Ok(tuples)
-}
 
 fn main() -> Result<()> {
     let _ = std::fs::remove_file(DATA_FILE);
@@ -160,11 +27,20 @@ fn main() -> Result<()> {
         ],
     };
 
-    insert(&[Value::Int(1), Value::Varchar("Alice".to_string())], &schema)?;
-    insert(&[Value::Int(2), Value::Null], &schema)?;
-    insert(&[Value::Null, Value::Varchar("Charlie".to_string())], &schema)?;
+    let disk = DiskManager::open(DATA_FILE)?;
+    let mut table = Table::new(disk, schema);
 
-    let tuples = scan(&schema)?;
+    let r1 = table.insert(&[Value::Int(1), Value::Varchar("Alice".to_string())])?;
+    let r2 = table.insert(&[Value::Int(2), Value::Null])?;
+    let r3 = table.insert(&[Value::Null, Value::Varchar("Charlie".to_string())])?;
+
+    println!("inserted rids: {r1:?} {r2:?} {r3:?}");
+    println!("page_count = {}", table.page_count());
+
+    let r2_again = table.get(r2)?;
+    println!("get({r2:?}) = {r2_again:?}");
+
+    let tuples = table.scan()?;
     println!("scanned {} tuples:", tuples.len());
     for values in tuples {
         println!("  {values:?}");
@@ -173,18 +49,26 @@ fn main() -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+mod integration_tests {
     use super::*;
+    use std::path::PathBuf;
 
-    fn schema_2col() -> Schema {
+    fn temp_path(name: &str) -> PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("ccdb-{name}-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&p);
+        p
+    }
+
+    fn schema_kv() -> Schema {
         Schema {
             columns: vec![
                 Column {
-                    name: "id".to_string(),
+                    name: "k".to_string(),
                     data_type: DataType::Int,
                 },
                 Column {
-                    name: "name".to_string(),
+                    name: "v".to_string(),
                     data_type: DataType::Varchar,
                 },
             ],
@@ -192,49 +76,51 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_with_nulls() {
-        let schema = schema_2col();
-        let cases: Vec<Vec<Value>> = vec![
-            vec![Value::Int(1), Value::Varchar("Alice".to_string())],
-            vec![Value::Int(2), Value::Null],
-            vec![Value::Null, Value::Varchar("Charlie".to_string())],
-            vec![Value::Null, Value::Null],
-        ];
-        for original in cases {
-            let bytes = serialize_tuple(&original, &schema).unwrap();
-            let (decoded, consumed) = deserialize_tuple(&bytes, &schema).unwrap();
-            assert_eq!(consumed, bytes.len());
-            assert_eq!(decoded, original);
+    fn insert_spans_multiple_pages() {
+        let path = temp_path("multi-page");
+        let disk = DiskManager::open(&path).unwrap();
+        let mut t = Table::new(disk, schema_kv());
+
+        // ~1KB per tuple → forces multiple 4KB pages.
+        let big = "x".repeat(1024);
+        let n = 20;
+        let mut rids = Vec::new();
+        for i in 0..n {
+            rids.push(
+                t.insert(&[Value::Int(i), Value::Varchar(big.clone())])
+                    .unwrap(),
+            );
         }
+        assert!(t.page_count() > 1, "expected >1 pages, got {}", t.page_count());
+
+        let scanned = t.scan().unwrap();
+        assert_eq!(scanned.len(), n as usize);
+        for (i, row) in scanned.iter().enumerate() {
+            assert_eq!(row[0], Value::Int(i as i32));
+            assert_eq!(row[1], Value::Varchar(big.clone()));
+        }
+        for (i, rid) in rids.into_iter().enumerate() {
+            let row = t.get(rid).unwrap().unwrap();
+            assert_eq!(row[0], Value::Int(i as i32));
+        }
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
-    fn arity_mismatch_is_rejected() {
-        let schema = schema_2col();
-        let err = serialize_tuple(&[Value::Int(1)], &schema);
-        assert!(err.is_err());
-    }
-
-    #[test]
-    fn concatenated_tuples_decode_in_order() {
-        let schema = schema_2col();
-        let mut buf = Vec::new();
-        let inputs: Vec<Vec<Value>> = vec![
-            vec![Value::Int(10), Value::Varchar("x".to_string())],
-            vec![Value::Null, Value::Varchar("yy".to_string())],
-            vec![Value::Int(-7), Value::Null],
-        ];
-        for t in &inputs {
-            buf.extend(serialize_tuple(t, &schema).unwrap());
+    fn reopen_preserves_data() {
+        let path = temp_path("reopen");
+        {
+            let disk = DiskManager::open(&path).unwrap();
+            let mut t = Table::new(disk, schema_kv());
+            t.insert(&[Value::Int(42), Value::Varchar("hi".to_string())])
+                .unwrap();
         }
-
-        let mut decoded = Vec::new();
-        let mut off = 0;
-        while off < buf.len() {
-            let (vals, n) = deserialize_tuple(&buf[off..], &schema).unwrap();
-            decoded.push(vals);
-            off += n;
-        }
-        assert_eq!(decoded, inputs);
+        let disk = DiskManager::open(&path).unwrap();
+        let mut t = Table::new(disk, schema_kv());
+        let rows = t.scan().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Value::Int(42));
+        std::fs::remove_file(&path).ok();
     }
 }
