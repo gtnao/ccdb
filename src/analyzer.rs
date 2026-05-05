@@ -244,6 +244,7 @@ pub struct AnalyzedLiteral {
 #[derive(Debug, Clone)]
 pub enum LiteralValue {
     Integer(i64),
+    Float(f64),
     String(String),
     Boolean(bool),
     Null,
@@ -370,11 +371,12 @@ impl<'a> Analyzer<'a> {
             Expr::BinaryOp { left, op, right } => {
                 let l = self.analyze_expr(left)?;
                 let r = self.analyze_expr(right)?;
+                let result_type = infer_binary_type(*op, l.data_type(), r.data_type());
                 Ok(AnalyzedExpr::BinaryOp {
                     left: Box::new(l),
                     op: *op,
                     right: Box::new(r),
-                    result_type: infer_binary_type(*op),
+                    result_type,
                 })
             }
             Expr::UnaryOp { op, expr } => {
@@ -661,11 +663,12 @@ impl<'a> Analyzer<'a> {
             Expr::BinaryOp { left, op, right } => {
                 let l = self.analyze_post_agg(left, group_keys, aggs)?;
                 let r = self.analyze_post_agg(right, group_keys, aggs)?;
+                let result_type = infer_binary_type(*op, l.data_type(), r.data_type());
                 Ok(AnalyzedExpr::BinaryOp {
                     left: Box::new(l),
                     op: *op,
                     right: Box::new(r),
-                    result_type: infer_binary_type(*op),
+                    result_type,
                 })
             }
             Expr::UnaryOp { op, expr } => {
@@ -743,7 +746,7 @@ impl<'a> Analyzer<'a> {
                         bail!("column '{}' is not nullable", col.name);
                     }
                 }
-                Some(t) if t == col.data_type => {}
+                Some(t) if assignable(t, col.data_type) => {}
                 Some(t) => bail!(
                     "type mismatch for column '{}': expected {:?}, got {:?}",
                     col.name,
@@ -853,7 +856,7 @@ impl<'a> Analyzer<'a> {
                         bail!("column '{}' is not nullable", col.name);
                     }
                 }
-                Some(t) if t == col.data_type => {}
+                Some(t) if assignable(t, col.data_type) => {}
                 Some(t) => bail!(
                     "type mismatch in UPDATE for column '{}': expected {:?}, got {:?}",
                     col.name,
@@ -981,6 +984,7 @@ fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
     match (a, b) {
         (AnalyzedExpr::Literal(la), AnalyzedExpr::Literal(lb)) => match (&la.value, &lb.value) {
             (LiteralValue::Integer(x), LiteralValue::Integer(y)) => x == y,
+            (LiteralValue::Float(x), LiteralValue::Float(y)) => x.to_bits() == y.to_bits(),
             (LiteralValue::String(x), LiteralValue::String(y)) => x == y,
             (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x == y,
             (LiteralValue::Null, LiteralValue::Null) => true,
@@ -1025,15 +1029,22 @@ fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
     }
 }
 
-/// Type of an aggregate's result given its argument type. INT-only world
-/// for now: SUM/AVG/MIN/MAX of INT → INT; MIN/MAX of VARCHAR → VARCHAR;
-/// COUNT → INT regardless. AVG truncates to INT (no NUMERIC type yet).
+/// Type of an aggregate's result given its argument type.
+///   COUNT → INT
+///   SUM   → DOUBLE if arg is DOUBLE, otherwise INT
+///   AVG   → DOUBLE always (mathematical mean)
+///   MIN/MAX → same as arg
 fn infer_aggregate_type(kind: AggKind, arg_type: Option<DataType>) -> Result<DataType> {
     Ok(match kind {
         AggKind::Count => DataType::Int,
-        AggKind::Sum | AggKind::Avg => match arg_type {
+        AggKind::Sum => match arg_type {
+            Some(DataType::Double) => DataType::Double,
             Some(DataType::Int) | None => DataType::Int,
-            Some(t) => bail!("{:?} is not numeric for {:?}", t, kind),
+            Some(t) => bail!("{:?} is not numeric for SUM", t),
+        },
+        AggKind::Avg => match arg_type {
+            Some(DataType::Int) | Some(DataType::Double) | None => DataType::Double,
+            Some(t) => bail!("{:?} is not numeric for AVG", t),
         },
         AggKind::Min | AggKind::Max => match arg_type {
             Some(t) => t,
@@ -1047,6 +1058,10 @@ fn literal_to_analyzed(lit: &Literal) -> AnalyzedLiteral {
         Literal::Integer(n) => AnalyzedLiteral {
             value: LiteralValue::Integer(*n),
             data_type: Some(DataType::Int),
+        },
+        Literal::Float(f) => AnalyzedLiteral {
+            value: LiteralValue::Float(*f),
+            data_type: Some(DataType::Double),
         },
         Literal::String(s) => AnalyzedLiteral {
             value: LiteralValue::String(s.clone()),
@@ -1067,15 +1082,38 @@ fn ast_to_runtime(dt: ast::DataType) -> DataType {
     match dt {
         ast::DataType::Int => DataType::Int,
         ast::DataType::Varchar => DataType::Varchar,
+        ast::DataType::Double => DataType::Double,
     }
 }
 
-fn infer_binary_type(op: BinaryOperator) -> DataType {
+fn infer_binary_type(
+    op: BinaryOperator,
+    left: Option<DataType>,
+    right: Option<DataType>,
+) -> DataType {
     use BinaryOperator::*;
     match op {
         Eq | Ne | Lt | Le | Gt | Ge | And | Or => DataType::Bool,
-        Add | Sub | Mul | Div => DataType::Int,
+        Add | Sub | Mul | Div => {
+            // Numeric promotion: any DOUBLE in → DOUBLE out; otherwise INT.
+            if matches!(left, Some(DataType::Double))
+                || matches!(right, Some(DataType::Double))
+            {
+                DataType::Double
+            } else {
+                DataType::Int
+            }
+        }
     }
+}
+
+/// Whether a value of `from` can be assigned to a column of `to` (e.g. at
+/// INSERT/UPDATE). Exact match always works; INT widens to DOUBLE.
+fn assignable(from: DataType, to: DataType) -> bool {
+    if from == to {
+        return true;
+    }
+    matches!((from, to), (DataType::Int, DataType::Double))
 }
 
 fn infer_unary_type(op: UnaryOperator) -> DataType {

@@ -24,6 +24,7 @@ pub const PG_ATTRIBUTE_PAGE_ID: PageId = 1;
 pub const DT_INT: i32 = 0;
 pub const DT_VARCHAR: i32 = 1;
 pub const DT_BOOL: i32 = 2;
+pub const DT_DOUBLE: i32 = 3;
 
 pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
     // -- pg_class at page 0 --
@@ -91,6 +92,7 @@ pub fn datatype_from_int(dt: i32) -> Option<crate::tuple::DataType> {
         x if x == DT_INT => Some(crate::tuple::DataType::Int),
         x if x == DT_VARCHAR => Some(crate::tuple::DataType::Varchar),
         x if x == DT_BOOL => Some(crate::tuple::DataType::Bool),
+        x if x == DT_DOUBLE => Some(crate::tuple::DataType::Double),
         _ => None,
     }
 }

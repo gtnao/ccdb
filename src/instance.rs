@@ -338,6 +338,7 @@ fn column_desc_for(item: &AnalyzedSelectItem) -> ColumnDesc {
         Some(DataType::Int) => ColumnDesc::int(&name),
         Some(DataType::Varchar) => ColumnDesc::varchar(&name),
         Some(DataType::Bool) => ColumnDesc::bool(&name),
+        Some(DataType::Double) => ColumnDesc::double(&name),
         // NULL literal without column context — Postgres convention is "text".
         None => ColumnDesc::varchar(&name),
     }
@@ -356,8 +357,24 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Int(n) => Some(n.to_string()),
         Value::Varchar(s) => Some(s.clone()),
         Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
+        Value::Double(f) => Some(format_double(*f)),
         Value::Null => None,
     }
+}
+
+/// Postgres formats doubles with up to 15 significant digits and trims
+/// trailing zeros. We approximate with `{:.15}` then strip — good enough
+/// for psql display parity at our current precision needs.
+fn format_double(f: f64) -> String {
+    if f.is_nan() {
+        return "NaN".into();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    let s = format!("{f}");
+    // Rust's default {} on f64 already gives a reasonable shortest form.
+    s
 }
 
 #[cfg(test)]

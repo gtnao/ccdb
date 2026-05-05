@@ -15,6 +15,7 @@ const SSL_REQUEST: i32 = 80_877_103;
 const OID_BOOL: i32 = 16;
 const OID_INT4: i32 = 23;
 const OID_TEXT: i32 = 25;
+const OID_FLOAT8: i32 = 701;
 
 #[derive(Debug, Clone)]
 pub struct ColumnDesc {
@@ -43,6 +44,13 @@ impl ColumnDesc {
             name: name.to_string(),
             type_oid: OID_BOOL,
             type_size: 1,
+        }
+    }
+    pub fn double(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            type_oid: OID_FLOAT8,
+            type_size: 8,
         }
     }
 }

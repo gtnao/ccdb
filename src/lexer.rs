@@ -20,6 +20,7 @@ pub enum Token {
     Table,
     Int,
     Varchar,
+    Double,
     And,
     Or,
     Not,
@@ -43,6 +44,7 @@ pub enum Token {
     // Identifiers and literals
     Ident(String),
     Integer(i64),
+    Float(f64),
     String(String),
 
     // Punctuation / operators
@@ -195,6 +197,19 @@ impl Lexer {
         while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
             s.push(self.bump().unwrap());
         }
+        // Float literal: `123.45`. We require at least one digit after `.`
+        // so `t.col` (table-qualified column) is still a valid token sequence.
+        if matches!(self.peek(), Some('.')) {
+            // Peek one more to confirm a digit follows.
+            let next = self.input.get(self.pos + 1).copied();
+            if matches!(next, Some(c) if c.is_ascii_digit()) {
+                s.push(self.bump().unwrap()); // consume `.`
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    s.push(self.bump().unwrap());
+                }
+                return Ok(Token::Float(s.parse()?));
+            }
+        }
         Ok(Token::Integer(s.parse()?))
     }
 
@@ -221,6 +236,7 @@ impl Lexer {
             "TABLE" => Token::Table,
             "INT" | "INTEGER" => Token::Int,
             "VARCHAR" => Token::Varchar,
+            "DOUBLE" | "FLOAT" => Token::Double,
             "AND" => Token::And,
             "OR" => Token::Or,
             "NOT" => Token::Not,

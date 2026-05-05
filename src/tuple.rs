@@ -12,6 +12,8 @@ pub enum DataType {
     Int,
     Varchar,
     Bool,
+    /// 64-bit IEEE 754 floating point (`DOUBLE` / `FLOAT` keyword).
+    Double,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +34,7 @@ pub enum Value {
     Int(i32),
     Varchar(String),
     Bool(bool),
+    Double(f64),
 }
 
 fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
@@ -44,6 +47,7 @@ fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
             buf.extend_from_slice(bytes);
         }
         Value::Bool(v) => buf.push(if *v { 1 } else { 0 }),
+        Value::Double(v) => buf.extend_from_slice(&v.to_le_bytes()),
     }
 }
 
@@ -75,6 +79,13 @@ fn deserialize_value(data: &[u8], data_type: DataType, is_null: bool) -> Result<
                 bail!("not enough bytes for BOOL");
             }
             Ok((Value::Bool(data[0] != 0), 1))
+        }
+        DataType::Double => {
+            if data.len() < 8 {
+                bail!("not enough bytes for DOUBLE");
+            }
+            let v = f64::from_le_bytes(data[..8].try_into()?);
+            Ok((Value::Double(v), 8))
         }
     }
 }

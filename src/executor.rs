@@ -20,7 +20,7 @@ use crate::page::{PageId, Rid, SlotId};
 use crate::transaction::Transaction;
 use crate::transaction_manager::{Snapshot, TransactionManager};
 use crate::tuple::{
-    INVALID_TXN_ID, Schema, Value, deserialize_tuple_mvcc, serialize_tuple_mvcc,
+    DataType, INVALID_TXN_ID, Schema, Value, deserialize_tuple_mvcc, serialize_tuple_mvcc,
 };
 use crate::visibility;
 use crate::wal::{Lsn, WalManager, WalRecordType};
@@ -321,24 +321,39 @@ impl Executor for NestedLoopJoin<'_> {
 
 // -- HashAggregate -----------------------------------------------------------
 
-/// Per-aggregate accumulator state.
+/// Per-aggregate accumulator state. Numeric flavors split by input type so
+/// SUM/AVG over DOUBLE doesn't lose precision through an i64 detour.
 #[derive(Debug, Clone)]
 enum AggState {
     Count(i64),
-    /// (sum, saw_any) — saw_any distinguishes "all NULL" → NULL from sum=0.
-    Sum(i64, bool),
-    /// (sum, count) for AVG. count=0 → NULL.
-    Avg(i64, i64),
+    /// (sum, saw_any) — INT input.
+    SumInt(i64, bool),
+    /// (sum, saw_any) — DOUBLE input.
+    SumDouble(f64, bool),
+    /// (sum, count) — INT input. AVG always finalizes to DOUBLE.
+    AvgInt(i64, i64),
+    /// (sum, count) — DOUBLE input.
+    AvgDouble(f64, i64),
     Min(Option<Value>),
     Max(Option<Value>),
 }
 
 impl AggState {
-    fn init(kind: AggKind) -> Self {
-        match kind {
+    fn init(agg: &AnalyzedAggregate) -> Self {
+        let arg_type = match &agg.arg {
+            AggArg::Star => None,
+            AggArg::Expr(e) => e.data_type(),
+        };
+        match agg.kind {
             AggKind::Count => AggState::Count(0),
-            AggKind::Sum => AggState::Sum(0, false),
-            AggKind::Avg => AggState::Avg(0, 0),
+            AggKind::Sum => match arg_type {
+                Some(DataType::Double) => AggState::SumDouble(0.0, false),
+                _ => AggState::SumInt(0, false),
+            },
+            AggKind::Avg => match arg_type {
+                Some(DataType::Double) => AggState::AvgDouble(0.0, 0),
+                _ => AggState::AvgInt(0, 0),
+            },
             AggKind::Min => AggState::Min(None),
             AggKind::Max => AggState::Max(None),
         }
@@ -348,15 +363,12 @@ impl AggState {
     /// for COUNT(*) — every row counts regardless of any column being NULL.
     fn update(&mut self, arg: Option<&Value>) -> Result<()> {
         match self {
-            AggState::Count(n) => {
-                // COUNT(*) increments unconditionally. COUNT(expr) skips NULL.
-                match arg {
-                    None => *n += 1, // COUNT(*)
-                    Some(Value::Null) => {}
-                    Some(_) => *n += 1,
-                }
-            }
-            AggState::Sum(sum, any) => {
+            AggState::Count(n) => match arg {
+                None => *n += 1, // COUNT(*)
+                Some(Value::Null) => {}
+                Some(_) => *n += 1,
+            },
+            AggState::SumInt(sum, any) => {
                 if let Some(v) = arg {
                     match v {
                         Value::Null => {}
@@ -364,11 +376,27 @@ impl AggState {
                             *sum += *i as i64;
                             *any = true;
                         }
-                        other => bail!("SUM not supported on {other:?}"),
+                        other => bail!("SUM(INT) not supported on {other:?}"),
                     }
                 }
             }
-            AggState::Avg(sum, count) => {
+            AggState::SumDouble(sum, any) => {
+                if let Some(v) = arg {
+                    match v {
+                        Value::Null => {}
+                        Value::Double(d) => {
+                            *sum += *d;
+                            *any = true;
+                        }
+                        Value::Int(i) => {
+                            *sum += *i as f64;
+                            *any = true;
+                        }
+                        other => bail!("SUM(DOUBLE) not supported on {other:?}"),
+                    }
+                }
+            }
+            AggState::AvgInt(sum, count) => {
                 if let Some(v) = arg {
                     match v {
                         Value::Null => {}
@@ -376,7 +404,23 @@ impl AggState {
                             *sum += *i as i64;
                             *count += 1;
                         }
-                        other => bail!("AVG not supported on {other:?}"),
+                        other => bail!("AVG(INT) not supported on {other:?}"),
+                    }
+                }
+            }
+            AggState::AvgDouble(sum, count) => {
+                if let Some(v) = arg {
+                    match v {
+                        Value::Null => {}
+                        Value::Double(d) => {
+                            *sum += *d;
+                            *count += 1;
+                        }
+                        Value::Int(i) => {
+                            *sum += *i as f64;
+                            *count += 1;
+                        }
+                        other => bail!("AVG(DOUBLE) not supported on {other:?}"),
                     }
                 }
             }
@@ -404,22 +448,28 @@ impl AggState {
         Ok(())
     }
 
-    /// Convert finalized state into the output Value. INT-only AVG truncates.
     fn finalize(self) -> Value {
         match self {
             AggState::Count(n) => Value::Int(n as i32),
-            AggState::Sum(sum, any) => {
-                if any {
-                    Value::Int(sum as i32)
-                } else {
-                    Value::Null
-                }
+            AggState::SumInt(sum, any) => {
+                if any { Value::Int(sum as i32) } else { Value::Null }
             }
-            AggState::Avg(sum, count) => {
+            AggState::SumDouble(sum, any) => {
+                if any { Value::Double(sum) } else { Value::Null }
+            }
+            // AVG always emits DOUBLE — the standard mathematical mean.
+            AggState::AvgInt(sum, count) => {
                 if count == 0 {
                     Value::Null
                 } else {
-                    Value::Int((sum / count) as i32)
+                    Value::Double(sum as f64 / count as f64)
+                }
+            }
+            AggState::AvgDouble(sum, count) => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Double(sum / count as f64)
                 }
             }
             AggState::Min(v) | AggState::Max(v) => v.unwrap_or(Value::Null),
@@ -432,6 +482,18 @@ fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
         (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
         (Value::Varchar(x), Value::Varchar(y)) => Ok(x.cmp(y)),
         (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
+        (Value::Double(x), Value::Double(y)) => {
+            // partial_cmp returns None for NaN; treat NaN as equal so
+            // sort stays well-defined. (Real DBs collate NaN as greatest.)
+            Ok(x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal))
+        }
+        // Mixed numeric: promote INT → DOUBLE and recurse.
+        (Value::Int(x), Value::Double(y)) => Ok((*x as f64)
+            .partial_cmp(y)
+            .unwrap_or(std::cmp::Ordering::Equal)),
+        (Value::Double(x), Value::Int(y)) => Ok(x
+            .partial_cmp(&(*y as f64))
+            .unwrap_or(std::cmp::Ordering::Equal)),
         _ => bail!("cannot compare {a:?} and {b:?}"),
     }
 }
@@ -487,7 +549,7 @@ impl<'a> HashAggregate<'a> {
                 None => {
                     keys.push(key);
                     states.push(
-                        self.aggregates.iter().map(|a| AggState::init(a.kind)).collect(),
+                        self.aggregates.iter().map(AggState::init).collect(),
                     );
                     keys.len() - 1
                 }
@@ -506,7 +568,7 @@ impl<'a> HashAggregate<'a> {
         // produces zero rows.
         if !saw_any_input && self.group_keys.is_empty() && !self.aggregates.is_empty() {
             keys.push(Vec::new());
-            states.push(self.aggregates.iter().map(|a| AggState::init(a.kind)).collect());
+            states.push(self.aggregates.iter().map(AggState::init).collect());
         }
 
         for (k, s) in keys.into_iter().zip(states.into_iter()) {
@@ -708,6 +770,7 @@ fn literal_to_value(lit: &AnalyzedLiteral) -> Value {
         // Note: Literal::Integer is i64 in the AST but our runtime int is i32.
         // Truncation here is the same compromise as the storage tuple layout.
         LiteralValue::Integer(n) => Value::Int(*n as i32),
+        LiteralValue::Float(f) => Value::Double(*f),
         LiteralValue::String(s) => Value::Varchar(s.clone()),
         LiteralValue::Boolean(b) => Value::Bool(*b),
         LiteralValue::Null => Value::Null,
@@ -722,7 +785,37 @@ fn evaluate_binary(op: BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
     }
 
     use BinaryOperator::*;
+    // Numeric promotion: any DOUBLE operand pulls the other into DOUBLE.
+    let left_promote = match (l, r) {
+        (Value::Int(a), Value::Double(_)) => Some(Value::Double(*a as f64)),
+        _ => None,
+    };
+    let right_promote = match (l, r) {
+        (Value::Double(_), Value::Int(b)) => Some(Value::Double(*b as f64)),
+        _ => None,
+    };
+    let l = left_promote.as_ref().unwrap_or(l);
+    let r = right_promote.as_ref().unwrap_or(r);
+
     match (l, r) {
+        (Value::Double(a), Value::Double(b)) => Ok(match op {
+            Eq => Value::Bool(a == b),
+            Ne => Value::Bool(a != b),
+            Lt => Value::Bool(a < b),
+            Le => Value::Bool(a <= b),
+            Gt => Value::Bool(a > b),
+            Ge => Value::Bool(a >= b),
+            Add => Value::Double(a + b),
+            Sub => Value::Double(a - b),
+            Mul => Value::Double(a * b),
+            Div => {
+                if *b == 0.0 {
+                    bail!("division by zero");
+                }
+                Value::Double(a / b)
+            }
+            And | Or => bail!("AND/OR not supported on DOUBLE"),
+        }),
         (Value::Int(a), Value::Int(b)) => Ok(match op {
             Eq => Value::Bool(a == b),
             Ne => Value::Bool(a != b),
@@ -782,7 +875,7 @@ fn perform_create_table(
     tx: &mut Transaction,
 ) -> Result<()> {
     use crate::bootstrap::{
-        DT_BOOL, DT_INT, DT_VARCHAR, PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID,
+        DT_BOOL, DT_DOUBLE, DT_INT, DT_VARCHAR, PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID,
     };
 
     // Pick a fresh table_id (max existing + 1). Catalog scan is enough at
@@ -818,6 +911,7 @@ fn perform_create_table(
             crate::tuple::DataType::Int => DT_INT,
             crate::tuple::DataType::Varchar => DT_VARCHAR,
             crate::tuple::DataType::Bool => DT_BOOL,
+            crate::tuple::DataType::Double => DT_DOUBLE,
         };
         let row = serialize_tuple_mvcc(
             tx.id(),
@@ -843,7 +937,7 @@ fn perform_insert(
     stmt: &AnalyzedInsertStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
-    let values: Vec<Value> = stmt
+    let raw: Vec<Value> = stmt
         .values
         .iter()
         .map(|e| match e {
@@ -854,12 +948,30 @@ fn perform_insert(
     let table = catalog
         .table_by_id(stmt.table_id)?
         .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
+    // Coerce values to the column's storage type. The analyzer accepts INT
+    // values for DOUBLE columns; the storage layer needs the exact width.
+    let values: Vec<Value> = raw
+        .into_iter()
+        .zip(table.columns.iter())
+        .map(|(v, c)| coerce_for_storage(v, c.data_type))
+        .collect::<Result<_>>()?;
     let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &values);
     let (rid, _lsn) = insert_bytes(bpm, wal, tx, table.first_page_id, &bytes)?;
     lm.lock(tx.id(), rid, LockMode::Exclusive)
         .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
     tx.add_lock(rid);
     Ok(1)
+}
+
+/// Coerce an evaluated value into the column's declared storage type.
+/// The only widening currently allowed is INT → DOUBLE, mirroring the
+/// analyzer's `assignable()`. NULL passes through unchanged.
+fn coerce_for_storage(v: Value, target: DataType) -> Result<Value> {
+    Ok(match (&v, target) {
+        (Value::Null, _) => v,
+        (Value::Int(i), DataType::Double) => Value::Double(*i as f64),
+        _ => v,
+    })
 }
 
 // -- DELETE / UPDATE (not Executors either — both are bulk side effects) -----
@@ -978,7 +1090,8 @@ fn perform_update(
         let mut new_values = t.values.clone();
         for a in &stmt.assignments {
             let v = evaluate_expr(&a.value, &t)?;
-            new_values[a.column_index] = v;
+            let target = table.columns[a.column_index].data_type;
+            new_values[a.column_index] = coerce_for_storage(v, target)?;
         }
         let new_bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
         work.push((pid, slot, new_bytes));
@@ -1976,7 +2089,7 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Int(45)); // SUM = 10+5+8+3+12+7
-        assert_eq!(rows[0].values[1], Value::Int(7)); // AVG = 45/6 = 7 (truncated)
+        assert_eq!(rows[0].values[1], Value::Double(7.5)); // AVG = 45/6 = 7.5 (DOUBLE)
         assert_eq!(rows[0].values[2], Value::Int(3)); // MIN
         assert_eq!(rows[0].values[3], Value::Int(12)); // MAX
     }
@@ -2117,6 +2230,56 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let Value::Varchar(p0) = &rows[0].values[0] else { panic!() };
         assert_eq!(p0, "banana"); // SUM=27 > 18
+    }
+
+    #[test]
+    fn double_column_round_trip_and_arithmetic() {
+        let path = temp_path("dbl");
+        let disk = DiskManager::open(&path).unwrap();
+        let wal = std::sync::Arc::new(
+            crate::wal::WalManager::open(&path.with_extension("wal")).unwrap(),
+        );
+        let bpm = BufferPool::new(disk, 8, wal.clone());
+        let clog = std::sync::Arc::new(crate::clog::Clog::in_memory());
+        let tm = std::sync::Arc::new(
+            crate::transaction_manager::TransactionManager::new(clog),
+        );
+        crate::bootstrap::bootstrap(&bpm, &tm).unwrap();
+        let cat = Catalog::new(bpm.clone(), std::sync::Arc::clone(&tm));
+        run("CREATE TABLE m (id INT, ratio DOUBLE)", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO m VALUES (1, 1.5)", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO m VALUES (2, 2.25)", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO m VALUES (3, 0.75)", &cat, &bpm, &wal, &tm);
+
+        // Round-trip: stored DOUBLE comes back as DOUBLE.
+        let Output::Rows(rows) = run(
+            "SELECT ratio FROM m ORDER BY id",
+            &cat, &bpm, &wal, &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows[0].values[0], Value::Double(1.5));
+        assert_eq!(rows[1].values[0], Value::Double(2.25));
+
+        // INT + DOUBLE promotes to DOUBLE.
+        let Output::Rows(rows) = run(
+            "SELECT id + ratio FROM m ORDER BY id",
+            &cat, &bpm, &wal, &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows[0].values[0], Value::Double(2.5));
+        assert_eq!(rows[1].values[0], Value::Double(4.25));
+
+        // SUM(DOUBLE) → DOUBLE. AVG(DOUBLE) → DOUBLE.
+        let Output::Rows(rows) = run(
+            "SELECT SUM(ratio), AVG(ratio) FROM m",
+            &cat, &bpm, &wal, &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows[0].values[0], Value::Double(4.5));
+        assert_eq!(rows[0].values[1], Value::Double(1.5));
     }
 
     #[test]

@@ -114,6 +114,7 @@ pub struct ColumnDef {
 pub enum DataType {
     Int,
     Varchar,
+    Double,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -159,6 +160,7 @@ pub enum FuncArgs {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Literal {
     Integer(i64),
+    Float(f64),
     String(String),
     Boolean(bool),
     Null,

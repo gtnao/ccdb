@@ -237,6 +237,10 @@ impl Parser {
                 self.bump();
                 Ok(DataType::Varchar)
             }
+            Some(Token::Double) => {
+                self.bump();
+                Ok(DataType::Double)
+            }
             other => bail!("expected data type, got {other:?}"),
         }
     }
@@ -460,6 +464,11 @@ impl Parser {
                 let n = *n;
                 self.bump();
                 Ok(Expr::Literal(Literal::Integer(n)))
+            }
+            Some(Token::Float(f)) => {
+                let f = *f;
+                self.bump();
+                Ok(Expr::Literal(Literal::Float(f)))
             }
             Some(Token::String(s)) => {
                 let s = s.clone();
