@@ -12,7 +12,7 @@ use crate::analyzer::{
     AnalyzedSelectStatement, AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue, TableSource,
 };
 use crate::ast::{BinaryOperator, UnaryOperator};
-use crate::buffer_pool::BufferPoolManager;
+use crate::buffer_pool::BufferPool;
 use crate::catalog::Catalog;
 use crate::page::{PageId, Rid, SlotId};
 use crate::transaction::{Transaction, UndoLogEntry};
@@ -48,14 +48,14 @@ pub enum Output {
 // -- SeqScan -----------------------------------------------------------------
 
 pub struct SeqScan<'a> {
-    bpm: &'a mut BufferPoolManager,
+    bpm: &'a BufferPool,
     schema: Schema,
     cur_page: u32,
     cur_slot: u16,
 }
 
 impl<'a> SeqScan<'a> {
-    pub fn new(bpm: &'a mut BufferPoolManager, catalog: &Catalog, table_id: usize) -> Result<Self> {
+    pub fn new(bpm: &'a BufferPool, catalog: &Catalog, table_id: usize) -> Result<Self> {
         let schema = catalog
             .table_by_id(table_id)
             .ok_or_else(|| anyhow::anyhow!("table id {table_id} not in catalog"))?
@@ -79,14 +79,13 @@ impl Executor for SeqScan<'_> {
     fn next(&mut self) -> Result<Option<Tuple>> {
         let n = self.bpm.page_count();
         while self.cur_page < n {
-            // Inner block scopes the PageGuard so the borrow on `self.bpm`
-            // ends before we (potentially) move on to the next page.
             let found: Option<Vec<Value>> = {
                 let guard = self.bpm.fetch_page(self.cur_page)?;
-                let tc = guard.page().tuple_count();
+                let page = guard.read();
+                let tc = page.tuple_count();
                 let mut out = None;
                 while self.cur_slot < tc {
-                    if let Some(raw) = guard.page().get_tuple(self.cur_slot) {
+                    if let Some(raw) = page.get_tuple(self.cur_slot) {
                         let values = deserialize_tuple(raw, &self.schema)?;
                         self.cur_slot += 1;
                         out = Some(values);
@@ -266,7 +265,7 @@ fn evaluate_unary(op: UnaryOperator, v: &Value) -> Result<Value> {
 // -- INSERT (not an Executor) ------------------------------------------------
 
 fn perform_insert(
-    bpm: &mut BufferPoolManager,
+    bpm: &BufferPool,
     stmt: &AnalyzedInsertStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
@@ -291,7 +290,7 @@ fn perform_insert(
 /// modifications without worrying about re-visiting newly inserted rows
 /// (UPDATE does delete+insert; without snapshotting we'd loop forever).
 fn snapshot_table(
-    bpm: &mut BufferPoolManager,
+    bpm: &BufferPool,
     catalog: &Catalog,
     table_id: usize,
 ) -> Result<(Schema, Vec<(PageId, SlotId, Vec<Value>)>)> {
@@ -302,9 +301,10 @@ fn snapshot_table(
     let mut out = Vec::new();
     for pid in 0..bpm.page_count() {
         let guard = bpm.fetch_page(pid)?;
-        let tc = guard.page().tuple_count();
+        let page = guard.read();
+        let tc = page.tuple_count();
         for slot in 0..tc {
-            if let Some(raw) = guard.page().get_tuple(slot) {
+            if let Some(raw) = page.get_tuple(slot) {
                 let values = deserialize_tuple(raw, &schema)?;
                 out.push((pid, slot, values));
             }
@@ -323,7 +323,7 @@ fn matches(predicate: Option<&AnalyzedExpr>, tuple: &Tuple) -> Result<bool> {
 }
 
 fn perform_delete(
-    bpm: &mut BufferPoolManager,
+    bpm: &BufferPool,
     catalog: &Catalog,
     stmt: &AnalyzedDeleteStatement,
     tx: &mut Transaction,
@@ -341,8 +341,8 @@ fn perform_delete(
     for (rid, bytes) in &victims {
         let (pid, slot) = *rid;
         {
-            let mut g = bpm.fetch_page(pid)?;
-            g.page_mut().delete(slot)?;
+            let g = bpm.fetch_page(pid)?;
+            g.write().delete(slot)?;
         }
         if tx.is_active() {
             tx.record(UndoLogEntry::Delete {
@@ -355,7 +355,7 @@ fn perform_delete(
 }
 
 fn perform_update(
-    bpm: &mut BufferPoolManager,
+    bpm: &BufferPool,
     catalog: &Catalog,
     stmt: &AnalyzedUpdateStatement,
     tx: &mut Transaction,
@@ -384,8 +384,8 @@ fn perform_update(
     for (pid, slot, old_bytes, new_bytes) in work {
         // Tombstone the old slot first.
         {
-            let mut g = bpm.fetch_page(pid)?;
-            g.page_mut().delete(slot)?;
+            let g = bpm.fetch_page(pid)?;
+            g.write().delete(slot)?;
         }
         if tx.is_active() {
             tx.record(UndoLogEntry::Delete {
@@ -402,20 +402,20 @@ fn perform_update(
 }
 
 // Shared insertion helper. Returns the rid where the tuple landed.
-fn insert_bytes(bpm: &mut BufferPoolManager, bytes: &[u8]) -> Result<Rid> {
+fn insert_bytes(bpm: &BufferPool, bytes: &[u8]) -> Result<Rid> {
     let n = bpm.page_count();
     if n > 0 {
         let last = n - 1;
-        let mut g = bpm.fetch_page(last)?;
-        if let Ok(slot) = g.page_mut().insert(bytes) {
+        let g = bpm.fetch_page(last)?;
+        if let Ok(slot) = g.write().insert(bytes) {
             return Ok((last, slot));
         }
         drop(g);
     }
-    let mut g = bpm.new_page()?;
+    let g = bpm.new_page()?;
     let pid = g.page_id();
     let slot = g
-        .page_mut()
+        .write()
         .insert(bytes)
         .map_err(|e| anyhow::anyhow!("tuple does not fit on a fresh page: {e}"))?;
     Ok((pid, slot))
@@ -424,19 +424,19 @@ fn insert_bytes(bpm: &mut BufferPoolManager, bytes: &[u8]) -> Result<Rid> {
 /// Apply undo entries in reverse order. Used by ROLLBACK and by the
 /// connection-close path. Only safe to call when the page contents are still
 /// intact (no compaction has happened since the entry was recorded).
-pub fn rollback(bpm: &mut BufferPoolManager, tx: &mut Transaction) -> Result<()> {
+pub fn rollback(bpm: &BufferPool, tx: &mut Transaction) -> Result<()> {
     let mut log = tx.take_log();
     while let Some(entry) = log.pop() {
         match entry {
             UndoLogEntry::Insert { rid } => {
                 let (pid, slot) = rid;
-                let mut g = bpm.fetch_page(pid)?;
-                g.page_mut().delete(slot)?;
+                let g = bpm.fetch_page(pid)?;
+                g.write().delete(slot)?;
             }
             UndoLogEntry::Delete { rid, data } => {
                 let (pid, slot) = rid;
-                let mut g = bpm.fetch_page(pid)?;
-                g.page_mut().restore(slot, &data)?;
+                let g = bpm.fetch_page(pid)?;
+                g.write().restore(slot, &data)?;
             }
         }
     }
@@ -446,7 +446,7 @@ pub fn rollback(bpm: &mut BufferPoolManager, tx: &mut Transaction) -> Result<()>
 // -- ExecutionEngine ---------------------------------------------------------
 
 pub fn execute(
-    bpm: &mut BufferPoolManager,
+    bpm: &BufferPool,
     catalog: &Catalog,
     stmt: &AnalyzedStatement,
     tx: &mut Transaction,
@@ -492,7 +492,7 @@ pub fn execute(
 }
 
 fn build_select_pipeline<'a>(
-    bpm: &'a mut BufferPoolManager,
+    bpm: &'a BufferPool,
     catalog: &'a Catalog,
     stmt: &AnalyzedSelectStatement,
 ) -> Result<Box<dyn Executor + 'a>> {
@@ -535,7 +535,7 @@ mod tests {
         p
     }
 
-    fn run(sql: &str, cat: &Catalog, bpm: &mut BufferPoolManager) -> Output {
+    fn run(sql: &str, cat: &Catalog, bpm: &BufferPool) -> Output {
         let mut tx = Transaction::new();
         run_tx(sql, cat, bpm, &mut tx)
     }
@@ -543,7 +543,7 @@ mod tests {
     fn run_tx(
         sql: &str,
         cat: &Catalog,
-        bpm: &mut BufferPoolManager,
+        bpm: &BufferPool,
         tx: &mut Transaction,
     ) -> Output {
         let stmt = parse(sql).unwrap();
@@ -555,7 +555,7 @@ mod tests {
     fn insert_then_select_star() {
         let path = temp_path("insert-select");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
 
         for sql in [
@@ -563,9 +563,9 @@ mod tests {
             "INSERT INTO users VALUES (2, 'Bob')",
             "INSERT INTO users VALUES (3, NULL)",
         ] {
-            assert!(matches!(run(sql, &cat, &mut bpm), Output::Affected(1)));
+            assert!(matches!(run(sql, &cat, &bpm), Output::Affected(1)));
         }
-        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &mut bpm) else {
+        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &bpm) else {
             panic!()
         };
         assert_eq!(rows.len(), 3);
@@ -578,16 +578,16 @@ mod tests {
     fn where_filters_rows() {
         let path = temp_path("where");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         for i in 1..=5 {
             run(
                 &format!("INSERT INTO users VALUES ({i}, 'x')"),
                 &cat,
-                &mut bpm,
+                &bpm,
             );
         }
-        let Output::Rows(rows) = run("SELECT id FROM users WHERE id > 2", &cat, &mut bpm) else {
+        let Output::Rows(rows) = run("SELECT id FROM users WHERE id > 2", &cat, &bpm) else {
             panic!()
         };
         assert_eq!(rows.len(), 3);
@@ -599,10 +599,10 @@ mod tests {
     fn projection_evaluates_arithmetic() {
         let path = temp_path("proj");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (10, 'a')", &cat, &mut bpm);
-        let Output::Rows(rows) = run("SELECT id + 1 FROM users", &cat, &mut bpm) else {
+        run("INSERT INTO users VALUES (10, 'a')", &cat, &bpm);
+        let Output::Rows(rows) = run("SELECT id + 1 FROM users", &cat, &bpm) else {
             panic!()
         };
         assert_eq!(rows[0].values[0], Value::Int(11));
@@ -613,15 +613,15 @@ mod tests {
     fn null_predicate_excludes_row() {
         let path = temp_path("null-pred");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &mut bpm);
-        run("INSERT INTO users VALUES (2, NULL)", &cat, &mut bpm);
+        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm);
+        run("INSERT INTO users VALUES (2, NULL)", &cat, &bpm);
         // name = 'Alice' on the NULL row evaluates to NULL → row excluded.
         let Output::Rows(rows) = run(
             "SELECT id FROM users WHERE name = 'Alice'",
             &cat,
-            &mut bpm,
+            &bpm,
         ) else {
             panic!()
         };
@@ -634,20 +634,20 @@ mod tests {
     fn delete_with_predicate() {
         let path = temp_path("delete-pred");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         for i in 1..=4 {
             run(
                 &format!("INSERT INTO users VALUES ({i}, 'x')"),
                 &cat,
-                &mut bpm,
+                &bpm,
             );
         }
         assert!(matches!(
-            run("DELETE FROM users WHERE id > 2", &cat, &mut bpm),
+            run("DELETE FROM users WHERE id > 2", &cat, &bpm),
             Output::Affected(2)
         ));
-        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &mut bpm) else {
+        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &bpm) else {
             panic!()
         };
         assert_eq!(rows.len(), 2);
@@ -660,20 +660,20 @@ mod tests {
     fn delete_all_rows() {
         let path = temp_path("delete-all");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         for i in 1..=3 {
             run(
                 &format!("INSERT INTO users VALUES ({i}, 'x')"),
                 &cat,
-                &mut bpm,
+                &bpm,
             );
         }
         assert!(matches!(
-            run("DELETE FROM users", &cat, &mut bpm),
+            run("DELETE FROM users", &cat, &bpm),
             Output::Affected(3)
         ));
-        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &mut bpm) else {
+        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &bpm) else {
             panic!()
         };
         assert!(rows.is_empty());
@@ -684,19 +684,19 @@ mod tests {
     fn update_changes_matching_rows() {
         let path = temp_path("update");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &mut bpm);
-        run("INSERT INTO users VALUES (2, 'Bob')", &cat, &mut bpm);
+        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm);
+        run("INSERT INTO users VALUES (2, 'Bob')", &cat, &bpm);
         assert!(matches!(
             run(
                 "UPDATE users SET name = 'A2' WHERE id = 1",
                 &cat,
-                &mut bpm
+                &bpm
             ),
             Output::Affected(1)
         ));
-        let Output::Rows(rows) = run("SELECT id, name FROM users", &cat, &mut bpm) else {
+        let Output::Rows(rows) = run("SELECT id, name FROM users", &cat, &bpm) else {
             panic!()
         };
         // Order may shift because UPDATE = delete + insert; check by id.
@@ -716,19 +716,19 @@ mod tests {
         // Snapshot-then-apply guarantees we don't see our own writes.
         let path = temp_path("update-stable");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, 'a')", &cat, &mut bpm);
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm);
         // SET name = 'a' WHERE name = 'a' affects exactly one row, not infinite.
         assert!(matches!(
             run(
                 "UPDATE users SET name = 'a' WHERE name = 'a'",
                 &cat,
-                &mut bpm
+                &bpm
             ),
             Output::Affected(1)
         ));
-        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &mut bpm) else {
+        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &bpm) else {
             panic!()
         };
         assert_eq!(rows.len(), 1);
@@ -739,12 +739,12 @@ mod tests {
     fn null_propagates_in_arithmetic() {
         let path = temp_path("null-arith");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, NULL)", &cat, &mut bpm);
+        run("INSERT INTO users VALUES (1, NULL)", &cat, &bpm);
         // SELECT name (which is NULL) projects through; arithmetic on NULL would
         // also produce NULL — exercised via id (non-null) for the all-OK row.
-        let Output::Rows(rows) = run("SELECT name FROM users", &cat, &mut bpm) else {
+        let Output::Rows(rows) = run("SELECT name FROM users", &cat, &bpm) else {
             panic!()
         };
         assert_eq!(rows[0].values[0], Value::Null);
@@ -755,22 +755,22 @@ mod tests {
     fn rollback_undoes_insert() {
         let path = temp_path("tx-insert");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &mut bpm, &mut tx);
-        run_tx("BEGIN", &cat, &mut bpm, &mut tx);
-        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &mut bpm, &mut tx);
+        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &mut tx);
+        run_tx("BEGIN", &cat, &bpm, &mut tx);
+        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &mut tx);
         // Inside tx: 2 rows visible.
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &mut bpm, &mut tx)
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
         else {
             panic!()
         };
         assert_eq!(rows.len(), 2);
-        run_tx("ROLLBACK", &cat, &mut bpm, &mut tx);
+        run_tx("ROLLBACK", &cat, &bpm, &mut tx);
         // After rollback: just 1.
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &mut bpm, &mut tx)
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
         else {
             panic!()
         };
@@ -782,16 +782,16 @@ mod tests {
     fn rollback_undoes_delete() {
         let path = temp_path("tx-delete");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &mut bpm, &mut tx);
-        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &mut bpm, &mut tx);
-        run_tx("BEGIN", &cat, &mut bpm, &mut tx);
-        run_tx("DELETE FROM users WHERE id = 1", &cat, &mut bpm, &mut tx);
-        run_tx("ROLLBACK", &cat, &mut bpm, &mut tx);
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &mut bpm, &mut tx)
+        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &mut tx);
+        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &mut tx);
+        run_tx("BEGIN", &cat, &bpm, &mut tx);
+        run_tx("DELETE FROM users WHERE id = 1", &cat, &bpm, &mut tx);
+        run_tx("ROLLBACK", &cat, &bpm, &mut tx);
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
         else {
             panic!()
         };
@@ -804,26 +804,26 @@ mod tests {
         // UPDATE = delete + insert, so the undo log holds two entries per row.
         let path = temp_path("tx-update");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("INSERT INTO users VALUES (1, 'Alice')", &cat, &mut bpm, &mut tx);
-        run_tx("BEGIN", &cat, &mut bpm, &mut tx);
+        run_tx("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &mut tx);
+        run_tx("BEGIN", &cat, &bpm, &mut tx);
         run_tx(
             "UPDATE users SET name = 'A2' WHERE id = 1",
             &cat,
-            &mut bpm,
+            &bpm,
             &mut tx,
         );
         // Mid-tx the new value is visible.
-        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &mut bpm, &mut tx)
+        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &bpm, &mut tx)
         else {
             panic!()
         };
         assert_eq!(rows[0].values[0], Value::Varchar("A2".into()));
-        run_tx("ROLLBACK", &cat, &mut bpm, &mut tx);
-        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &mut bpm, &mut tx)
+        run_tx("ROLLBACK", &cat, &bpm, &mut tx);
+        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &bpm, &mut tx)
         else {
             panic!()
         };
@@ -836,14 +836,14 @@ mod tests {
     fn commit_persists_changes() {
         let path = temp_path("tx-commit");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("BEGIN", &cat, &mut bpm, &mut tx);
-        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &mut bpm, &mut tx);
-        run_tx("COMMIT", &cat, &mut bpm, &mut tx);
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &mut bpm, &mut tx)
+        run_tx("BEGIN", &cat, &bpm, &mut tx);
+        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &mut tx);
+        run_tx("COMMIT", &cat, &bpm, &mut tx);
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
         else {
             panic!()
         };
@@ -855,14 +855,14 @@ mod tests {
     fn nested_begin_errors() {
         let path = temp_path("tx-nested");
         let disk = DiskManager::open(&path).unwrap();
-        let mut bpm = BufferPoolManager::new(disk, 4);
+        let bpm = BufferPool::new(disk, 4);
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
         let stmt = parse("BEGIN").unwrap();
         let analyzed = analyze(&cat, &stmt).unwrap();
-        execute(&mut bpm, &cat, &analyzed, &mut tx).unwrap();
-        let err = execute(&mut bpm, &cat, &analyzed, &mut tx);
+        execute(&bpm, &cat, &analyzed, &mut tx).unwrap();
+        let err = execute(&bpm, &cat, &analyzed, &mut tx);
         assert!(err.is_err());
         std::fs::remove_file(&path).ok();
     }

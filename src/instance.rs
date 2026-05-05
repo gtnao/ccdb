@@ -1,20 +1,21 @@
 //! Server instance: TCP listener that speaks PG wire protocol.
 //!
-//! Single-threaded: connections are handled sequentially. The catalog and
-//! buffer pool persist across queries (and across connections, since clients
-//! observe the same on-disk state via the shared BPM).
+//! Multi-threaded: each accepted connection runs in its own thread. Shared
+//! state (catalog, buffer pool) is reachable via cheap Arc clones; the
+//! BufferPool internalizes its own locking.
 
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
+use std::thread;
 
 use anyhow::{Result, bail};
 
-use crate::analyzer::{
-    AnalyzedExpr, AnalyzedSelectItem, AnalyzedStatement, analyze,
-};
-use crate::buffer_pool::BufferPoolManager;
+use crate::analyzer::{AnalyzedExpr, AnalyzedSelectItem, AnalyzedStatement, analyze};
+use crate::buffer_pool::BufferPool;
 use crate::catalog::Catalog;
 use crate::disk::DiskManager;
 use crate::executor::{self, Output, execute};
+use crate::lock_manager::LockManager;
 use crate::parser::parse;
 use crate::protocol::{ColumnDesc, Connection, FrontendMessage};
 use crate::transaction::Transaction;
@@ -22,11 +23,12 @@ use crate::tuple::{DataType, Value};
 
 const DATA_FILE: &str = "table.db";
 const DEFAULT_PORT: u16 = 5433;
-const POOL_CAPACITY: usize = 16;
+const POOL_CAPACITY: usize = 64;
 
 pub struct Instance {
-    catalog: Catalog,
-    bpm: BufferPoolManager,
+    catalog: Arc<Catalog>,
+    bpm: BufferPool,
+    lock_manager: Arc<LockManager>,
 }
 
 impl Instance {
@@ -34,130 +36,147 @@ impl Instance {
         let _ = std::fs::remove_file(DATA_FILE);
         let disk = DiskManager::open(DATA_FILE)?;
         Ok(Self {
-            catalog: Catalog::new(),
-            bpm: BufferPoolManager::new(disk, POOL_CAPACITY),
+            catalog: Arc::new(Catalog::new()),
+            bpm: BufferPool::new(disk, POOL_CAPACITY),
+            lock_manager: Arc::new(LockManager::new()),
         })
     }
 
-    pub fn start(&mut self) -> Result<()> {
+    pub fn start(&self) -> Result<()> {
         let addr = format!("127.0.0.1:{DEFAULT_PORT}");
         let listener = TcpListener::bind(&addr)?;
-        eprintln!("ccdb listening on {addr} — connect with: psql -h localhost -p {DEFAULT_PORT}");
+        eprintln!(
+            "ccdb listening on {addr} (multi-threaded) — connect with: psql -h localhost -p {DEFAULT_PORT}"
+        );
 
         for stream in listener.incoming() {
             let stream = stream?;
             eprintln!("client connected: {:?}", stream.peer_addr());
             let conn = Connection::new(stream);
-            if let Err(e) = self.handle_client(conn) {
-                eprintln!("connection error: {e}");
-            }
-            // Flush after each client disconnects so writes survive crashes
-            // between sessions. (Future days will add WAL.)
-            self.bpm.flush_all()?;
+
+            let catalog = Arc::clone(&self.catalog);
+            let bpm = self.bpm.clone();
+            let lock_manager = Arc::clone(&self.lock_manager);
+
+            thread::spawn(move || {
+                if let Err(e) = handle_client(conn, catalog, bpm, lock_manager) {
+                    eprintln!("connection error: {e}");
+                }
+            });
         }
         Ok(())
     }
+}
 
-    fn handle_client(&mut self, mut conn: Connection<TcpStream>) -> Result<()> {
-        let startup = conn.read_startup()?;
-        eprintln!("startup params: {:?}", startup.params);
+fn handle_client(
+    mut conn: Connection<TcpStream>,
+    catalog: Arc<Catalog>,
+    bpm: BufferPool,
+    _lock_manager: Arc<LockManager>,
+) -> Result<()> {
+    let startup = conn.read_startup()?;
+    eprintln!(
+        "startup params: {:?} (thread {:?})",
+        startup.params,
+        thread::current().id()
+    );
 
-        conn.send_auth_ok()?;
-        conn.send_parameter_status("server_version", "ccdb-0.0.1")?;
-        conn.send_parameter_status("client_encoding", "UTF8")?;
-        conn.send_backend_key_data(1, 0xC0FFEE)?;
-        conn.send_ready_for_query()?;
+    conn.send_auth_ok()?;
+    conn.send_parameter_status("server_version", "ccdb-0.0.1")?;
+    conn.send_parameter_status("client_encoding", "UTF8")?;
+    conn.send_backend_key_data(1, 0xC0FFEE)?;
+    conn.send_ready_for_query()?;
 
-        let mut tx = Transaction::new();
+    let mut tx = Transaction::new();
 
-        let result = (|| -> Result<()> {
-            loop {
-                match conn.read_message()? {
-                    None => return Ok(()),
-                    Some(FrontendMessage::Terminate) => return Ok(()),
-                    Some(FrontendMessage::Unknown(t)) => {
-                        eprintln!("ignoring unknown message type: 0x{t:02x}");
-                        conn.send_ready_for_query()?;
+    let result = (|| -> Result<()> {
+        loop {
+            match conn.read_message()? {
+                None => return Ok(()),
+                Some(FrontendMessage::Terminate) => return Ok(()),
+                Some(FrontendMessage::Unknown(t)) => {
+                    eprintln!("ignoring unknown message type: 0x{t:02x}");
+                    conn.send_ready_for_query()?;
+                }
+                Some(FrontendMessage::Query(sql)) => {
+                    if sql.trim().is_empty() {
+                        conn.send_empty_query()?;
+                    } else if let Err(e) = run_query(&sql, &mut conn, &bpm, &catalog, &mut tx) {
+                        eprintln!("query error: {e}");
+                        conn.send_error(&e.to_string())?;
                     }
-                    Some(FrontendMessage::Query(sql)) => {
-                        if sql.trim().is_empty() {
-                            conn.send_empty_query()?;
-                        } else if let Err(e) = self.run_query(&sql, &mut conn, &mut tx) {
-                            eprintln!("query error: {e}");
-                            conn.send_error(&e.to_string())?;
-                        }
-                        conn.send_ready_for_query()?;
-                    }
+                    conn.send_ready_for_query()?;
                 }
             }
-        })();
-
-        // Auto-rollback any in-flight transaction so half-applied work doesn't
-        // become "committed" via the post-disconnect flush.
-        if tx.is_active() {
-            if let Err(e) = executor::rollback(&mut self.bpm, &mut tx) {
-                eprintln!("auto-rollback failed: {e}");
-            }
         }
+    })();
 
-        result
+    if tx.is_active() {
+        if let Err(e) = executor::rollback(&bpm, &mut tx) {
+            eprintln!("auto-rollback failed: {e}");
+        }
     }
 
-    fn run_query(
-        &mut self,
-        sql: &str,
-        conn: &mut Connection<TcpStream>,
-        tx: &mut Transaction,
-    ) -> Result<()> {
-        let stmt = parse(sql)?;
-        let analyzed = analyze(&self.catalog, &stmt)?;
+    // Per-connection flush so writes are durable across sessions.
+    bpm.flush_all()?;
 
-        match &analyzed {
-            AnalyzedStatement::Select(s) => {
-                let columns: Vec<ColumnDesc> =
-                    s.select_items.iter().map(column_desc_for).collect();
-                let out = execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
-                let rows = match out {
-                    Output::Rows(r) => r,
-                    other => bail!("SELECT yielded non-Rows output: {other:?}"),
-                };
-                conn.send_row_description(&columns)?;
-                for row in &rows {
-                    let vals: Vec<Option<String>> = row.values.iter().map(value_to_text).collect();
-                    conn.send_data_row(&vals)?;
-                }
-                conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
+    result
+}
+
+fn run_query(
+    sql: &str,
+    conn: &mut Connection<TcpStream>,
+    bpm: &BufferPool,
+    catalog: &Catalog,
+    tx: &mut Transaction,
+) -> Result<()> {
+    let stmt = parse(sql)?;
+    let analyzed = analyze(catalog, &stmt)?;
+
+    match &analyzed {
+        AnalyzedStatement::Select(s) => {
+            let columns: Vec<ColumnDesc> = s.select_items.iter().map(column_desc_for).collect();
+            let out = execute(bpm, catalog, &analyzed, tx)?;
+            let rows = match out {
+                Output::Rows(r) => r,
+                other => bail!("SELECT yielded non-Rows output: {other:?}"),
+            };
+            conn.send_row_description(&columns)?;
+            for row in &rows {
+                let vals: Vec<Option<String>> = row.values.iter().map(value_to_text).collect();
+                conn.send_data_row(&vals)?;
             }
-            AnalyzedStatement::Insert(_) => {
-                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed, tx)?)?;
-                conn.send_command_complete(&format!("INSERT 0 {n}"))?;
-            }
-            AnalyzedStatement::Delete(_) => {
-                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed, tx)?)?;
-                conn.send_command_complete(&format!("DELETE {n}"))?;
-            }
-            AnalyzedStatement::Update(_) => {
-                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed, tx)?)?;
-                conn.send_command_complete(&format!("UPDATE {n}"))?;
-            }
-            AnalyzedStatement::Begin => {
-                execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
-                conn.send_command_complete("BEGIN")?;
-            }
-            AnalyzedStatement::Commit => {
-                execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
-                conn.send_command_complete("COMMIT")?;
-            }
-            AnalyzedStatement::Rollback => {
-                execute(&mut self.bpm, &self.catalog, &analyzed, tx)?;
-                conn.send_command_complete("ROLLBACK")?;
-            }
-            AnalyzedStatement::CreateTable(_) => {
-                bail!("CREATE TABLE is not yet wired up (catalog is read-only)")
-            }
+            conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
         }
-        Ok(())
+        AnalyzedStatement::Insert(_) => {
+            let n = expect_affected(execute(bpm, catalog, &analyzed, tx)?)?;
+            conn.send_command_complete(&format!("INSERT 0 {n}"))?;
+        }
+        AnalyzedStatement::Delete(_) => {
+            let n = expect_affected(execute(bpm, catalog, &analyzed, tx)?)?;
+            conn.send_command_complete(&format!("DELETE {n}"))?;
+        }
+        AnalyzedStatement::Update(_) => {
+            let n = expect_affected(execute(bpm, catalog, &analyzed, tx)?)?;
+            conn.send_command_complete(&format!("UPDATE {n}"))?;
+        }
+        AnalyzedStatement::Begin => {
+            execute(bpm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("BEGIN")?;
+        }
+        AnalyzedStatement::Commit => {
+            execute(bpm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("COMMIT")?;
+        }
+        AnalyzedStatement::Rollback => {
+            execute(bpm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("ROLLBACK")?;
+        }
+        AnalyzedStatement::CreateTable(_) => {
+            bail!("CREATE TABLE is not yet wired up (catalog is read-only)")
+        }
     }
+    Ok(())
 }
 
 fn expect_affected(out: Output) -> Result<usize> {
@@ -196,12 +215,6 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
         Value::Null => None,
     }
-}
-
-// Internal so the trivial helpers are testable without an actual TCP server.
-#[allow(dead_code)]
-pub(crate) fn _value_to_text(v: &Value) -> Option<String> {
-    value_to_text(v)
 }
 
 #[cfg(test)]

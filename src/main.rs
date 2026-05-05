@@ -22,6 +22,6 @@ use anyhow::Result;
 use instance::Instance;
 
 fn main() -> Result<()> {
-    let mut instance = Instance::new()?;
+    let instance = Instance::new()?;
     instance.start()
 }

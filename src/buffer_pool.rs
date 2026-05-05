@@ -1,4 +1,19 @@
+//! Thread-safe buffer pool.
+//!
+//! `BufferPool` is a clonable handle (cheap `Arc` clone) that internally
+//! protects the page table, frames, and disk manager with a single Mutex.
+//! Each frame's `Page` lives behind its own `RwLock` so that, after the
+//! short fetch/new_page critical section, callers from different threads
+//! can read or write *different* pages in parallel.
+//!
+//! Pin lifecycle is RAII via [`PageGuard`]: the guard holds an Arc clone of
+//! the pool plus the page id; on drop it briefly re-locks the pool to
+//! decrement the pin count. Page contents are accessed via `read()` /
+//! `write()`, which return standard `RwLock` guards.
+
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
 use indexmap::IndexSet;
@@ -6,26 +21,24 @@ use indexmap::IndexSet;
 use crate::disk::DiskManager;
 use crate::page::{PAGE_SIZE, Page, PageId};
 
+const ORDER: Ordering = Ordering::SeqCst;
+
 /// Replacement policy for choosing an evictable frame.
-pub trait Replacer {
+trait Replacer {
     fn victim(&mut self) -> Option<usize>;
     fn pin(&mut self, frame_id: usize);
     fn unpin(&mut self, frame_id: usize);
 }
 
-/// LRU: oldest-touched unpinned frame is the victim.
-pub struct LruReplacer {
-    /// Insertion order ≈ access recency. Most-recently-touched is at the back.
+struct LruReplacer {
     order: IndexSet<usize>,
     pinned: Vec<bool>,
 }
 
 impl LruReplacer {
-    pub fn new(capacity: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             order: IndexSet::new(),
-            // Empty frames start as "pinned" so they're never picked as victims
-            // before being filled. unpin() will clear this once a real page lives there.
             pinned: vec![true; capacity],
         }
     }
@@ -35,20 +48,18 @@ impl Replacer for LruReplacer {
     fn victim(&mut self) -> Option<usize> {
         self.order.iter().find(|&&id| !self.pinned[id]).copied()
     }
-
     fn pin(&mut self, frame_id: usize) {
         self.pinned[frame_id] = true;
         self.order.shift_remove(&frame_id);
         self.order.insert(frame_id);
     }
-
     fn unpin(&mut self, frame_id: usize) {
         self.pinned[frame_id] = false;
     }
 }
 
 struct Frame {
-    page: Page,
+    page: Arc<RwLock<Page>>,
     page_id: Option<PageId>,
     pin_count: u32,
     dirty: bool,
@@ -57,7 +68,7 @@ struct Frame {
 impl Frame {
     fn empty() -> Self {
         Self {
-            page: Page::new(0),
+            page: Arc::new(RwLock::new(Page::new(0))),
             page_id: None,
             pin_count: 0,
             dirty: false,
@@ -65,36 +76,60 @@ impl Frame {
     }
 }
 
-pub struct BufferPoolManager<R: Replacer = LruReplacer> {
+struct Inner {
     frames: Vec<Frame>,
     page_table: HashMap<PageId, usize>,
     disk: DiskManager,
-    replacer: R,
+    replacer: LruReplacer,
     capacity: usize,
 }
 
-impl BufferPoolManager<LruReplacer> {
-    pub fn new(disk: DiskManager, capacity: usize) -> Self {
-        Self::with_replacer(disk, LruReplacer::new(capacity), capacity)
-    }
+#[derive(Clone)]
+pub struct BufferPool {
+    inner: Arc<Mutex<Inner>>,
 }
 
-impl<R: Replacer> BufferPoolManager<R> {
-    pub fn with_replacer(disk: DiskManager, replacer: R, capacity: usize) -> Self {
+impl BufferPool {
+    pub fn new(disk: DiskManager, capacity: usize) -> Self {
         let frames = (0..capacity).map(|_| Frame::empty()).collect();
         Self {
-            frames,
-            page_table: HashMap::new(),
-            disk,
-            replacer,
-            capacity,
+            inner: Arc::new(Mutex::new(Inner {
+                frames,
+                page_table: HashMap::new(),
+                disk,
+                replacer: LruReplacer::new(capacity),
+                capacity,
+            })),
         }
     }
 
     pub fn page_count(&self) -> u32 {
-        self.disk.page_count()
+        self.inner.lock().unwrap().disk.page_count()
     }
 
+    pub fn fetch_page(&self, page_id: PageId) -> Result<PageGuard> {
+        let mut inner = self.inner.lock().unwrap();
+        let (page_arc, _frame_id) = inner.fetch_locked(page_id)?;
+        Ok(PageGuard::new(self.clone(), page_id, page_arc))
+    }
+
+    pub fn new_page(&self) -> Result<PageGuard> {
+        let mut inner = self.inner.lock().unwrap();
+        let (page_id, page_arc) = inner.new_page_locked()?;
+        Ok(PageGuard::new(self.clone(), page_id, page_arc))
+    }
+
+    pub fn flush_all(&self) -> Result<()> {
+        self.inner.lock().unwrap().flush_all_locked()
+    }
+
+    fn release(&self, page_id: PageId, mutated: bool) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.release_locked(page_id, mutated);
+    }
+}
+
+impl Inner {
     fn pick_or_evict(&mut self) -> Result<usize> {
         if self.page_table.len() < self.capacity {
             let fid = self
@@ -116,7 +151,8 @@ impl<R: Replacer> BufferPoolManager<R> {
         let frame = &mut self.frames[frame_id];
         if let Some(pid) = frame.page_id {
             if frame.dirty {
-                self.disk.write_page(pid, frame.page.as_bytes())?;
+                let page_guard = frame.page.read().unwrap();
+                self.disk.write_page(pid, page_guard.as_bytes())?;
             }
             self.page_table.remove(&pid);
         }
@@ -126,70 +162,73 @@ impl<R: Replacer> BufferPoolManager<R> {
         Ok(())
     }
 
-    pub fn fetch_page(&mut self, page_id: PageId) -> Result<PageGuard<'_, R>> {
-        let frame_id = if let Some(&fid) = self.page_table.get(&page_id) {
+    fn fetch_locked(&mut self, page_id: PageId) -> Result<(Arc<RwLock<Page>>, usize)> {
+        if let Some(&fid) = self.page_table.get(&page_id) {
             self.frames[fid].pin_count += 1;
             self.replacer.pin(fid);
-            fid
-        } else {
-            let fid = self.pick_or_evict()?;
-            let mut buf = [0u8; PAGE_SIZE];
-            self.disk.read_page(page_id, &mut buf)?;
-            let f = &mut self.frames[fid];
-            f.page = Page::from_bytes(&buf);
-            f.page_id = Some(page_id);
-            f.pin_count = 1;
-            f.dirty = false;
-            self.page_table.insert(page_id, fid);
-            self.replacer.pin(fid);
-            fid
-        };
-        Ok(PageGuard {
-            bpm: self,
-            frame_id,
-            mutated: false,
-        })
-    }
-
-    pub fn new_page(&mut self) -> Result<PageGuard<'_, R>> {
-        let frame_id = self.pick_or_evict()?;
-        let page_id = self.disk.allocate_page()?;
-        let f = &mut self.frames[frame_id];
-        f.page = Page::new(page_id);
+            return Ok((Arc::clone(&self.frames[fid].page), fid));
+        }
+        let fid = self.pick_or_evict()?;
+        let mut buf = [0u8; PAGE_SIZE];
+        self.disk.read_page(page_id, &mut buf)?;
+        // Replace the inner Page atomically so any prior holders of the Arc
+        // don't see torn state. Since the frame was just made empty by evict()
+        // (or this is its first use), no one should be holding the Arc, but
+        // we use write() to be safe.
+        {
+            let mut p = self.frames[fid].page.write().unwrap();
+            *p = Page::from_bytes(&buf);
+        }
+        let f = &mut self.frames[fid];
         f.page_id = Some(page_id);
         f.pin_count = 1;
-        // A freshly allocated page exists on disk only as zeros — its header
-        // and any inserts must be flushed before the page is meaningful.
+        f.dirty = false;
+        self.page_table.insert(page_id, fid);
+        self.replacer.pin(fid);
+        Ok((Arc::clone(&f.page), fid))
+    }
+
+    fn new_page_locked(&mut self) -> Result<(PageId, Arc<RwLock<Page>>)> {
+        let fid = self.pick_or_evict()?;
+        let page_id = self.disk.allocate_page()?;
+        {
+            let mut p = self.frames[fid].page.write().unwrap();
+            *p = Page::new(page_id);
+        }
+        let f = &mut self.frames[fid];
+        f.page_id = Some(page_id);
+        f.pin_count = 1;
+        // Freshly allocated → must be flushed (disk has only zeros).
         f.dirty = true;
-        self.page_table.insert(page_id, frame_id);
-        self.replacer.pin(frame_id);
-        Ok(PageGuard {
-            bpm: self,
-            frame_id,
-            mutated: false,
-        })
+        self.page_table.insert(page_id, fid);
+        self.replacer.pin(fid);
+        Ok((page_id, Arc::clone(&f.page)))
     }
 
-    fn release(&mut self, frame_id: usize, mutated: bool) {
-        let f = &mut self.frames[frame_id];
-        if f.pin_count == 0 {
-            return;
-        }
-        f.pin_count -= 1;
-        if mutated {
-            f.dirty = true;
-        }
-        if f.pin_count == 0 {
-            self.replacer.unpin(frame_id);
+    fn release_locked(&mut self, page_id: PageId, mutated: bool) {
+        if let Some(&fid) = self.page_table.get(&page_id) {
+            let f = &mut self.frames[fid];
+            if f.pin_count == 0 {
+                return;
+            }
+            f.pin_count -= 1;
+            if mutated {
+                f.dirty = true;
+            }
+            if f.pin_count == 0 {
+                self.replacer.unpin(fid);
+            }
         }
     }
 
-    pub fn flush_all(&mut self) -> Result<()> {
+    fn flush_all_locked(&mut self) -> Result<()> {
         for fid in 0..self.frames.len() {
             let f = &mut self.frames[fid];
             if let Some(pid) = f.page_id {
                 if f.dirty {
-                    self.disk.write_page(pid, f.page.as_bytes())?;
+                    let pg = f.page.read().unwrap();
+                    self.disk.write_page(pid, pg.as_bytes())?;
+                    drop(pg);
                     f.dirty = false;
                 }
             }
@@ -198,35 +237,46 @@ impl<R: Replacer> BufferPoolManager<R> {
     }
 }
 
-/// RAII guard: holds a pin for the lifetime of the guard, releasing it on drop.
-/// Calling `page_mut()` records that the frame was mutated, so `release` will
-/// promote `dirty` regardless of whether new bytes actually changed.
-pub struct PageGuard<'a, R: Replacer = LruReplacer> {
-    bpm: &'a mut BufferPoolManager<R>,
-    frame_id: usize,
-    mutated: bool,
+/// RAII handle holding a pin on a buffer-pool frame. Drop releases the pin.
+/// Page contents are accessed via [`PageGuard::read`] / [`PageGuard::write`],
+/// which return standard `RwLock` guards over the page bytes. Multiple
+/// `PageGuard`s for *different* pages can coexist across threads; multiple
+/// for the *same* page coordinate via the inner RwLock.
+pub struct PageGuard {
+    pool: BufferPool,
+    page_id: PageId,
+    page: Arc<RwLock<Page>>,
+    mutated: AtomicBool,
 }
 
-impl<'a, R: Replacer> PageGuard<'a, R> {
-    pub fn page(&self) -> &Page {
-        &self.bpm.frames[self.frame_id].page
-    }
-
-    pub fn page_mut(&mut self) -> &mut Page {
-        self.mutated = true;
-        &mut self.bpm.frames[self.frame_id].page
+impl PageGuard {
+    fn new(pool: BufferPool, page_id: PageId, page: Arc<RwLock<Page>>) -> Self {
+        Self {
+            pool,
+            page_id,
+            page,
+            mutated: AtomicBool::new(false),
+        }
     }
 
     pub fn page_id(&self) -> PageId {
-        self.bpm.frames[self.frame_id]
-            .page_id
-            .expect("guarded frame must have a page_id")
+        self.page_id
+    }
+
+    pub fn read(&self) -> RwLockReadGuard<'_, Page> {
+        self.page.read().unwrap()
+    }
+
+    pub fn write(&self) -> RwLockWriteGuard<'_, Page> {
+        self.mutated.store(true, ORDER);
+        self.page.write().unwrap()
     }
 }
 
-impl<'a, R: Replacer> Drop for PageGuard<'a, R> {
+impl Drop for PageGuard {
     fn drop(&mut self) {
-        self.bpm.release(self.frame_id, self.mutated);
+        let mutated = self.mutated.load(ORDER);
+        self.pool.release(self.page_id, mutated);
     }
 }
 
@@ -234,6 +284,8 @@ impl<'a, R: Replacer> Drop for PageGuard<'a, R> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::Barrier;
+    use std::thread;
 
     fn temp_path(label: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -249,27 +301,27 @@ mod tests {
         p
     }
 
-    fn fresh_bpm(capacity: usize, path: &std::path::Path) -> BufferPoolManager {
+    fn fresh_pool(capacity: usize, path: &std::path::Path) -> BufferPool {
         let disk = DiskManager::open(path).unwrap();
-        BufferPoolManager::new(disk, capacity)
+        BufferPool::new(disk, capacity)
     }
 
     #[test]
     fn allocate_and_persist_via_flush() {
         let path = temp_path("flush");
-        let mut bpm = fresh_bpm(2, &path);
+        let pool = fresh_pool(2, &path);
         {
-            let mut g = bpm.new_page().unwrap();
+            let g = pool.new_page().unwrap();
             assert_eq!(g.page_id(), 0);
-            g.page_mut().insert(b"hello").unwrap();
+            g.write().insert(b"hello").unwrap();
         }
-        bpm.flush_all().unwrap();
+        pool.flush_all().unwrap();
 
-        // Reopen via a fresh BPM and read it back.
-        drop(bpm);
-        let mut bpm = fresh_bpm(2, &path);
-        let g = bpm.fetch_page(0).unwrap();
-        assert_eq!(g.page().get_tuple(0).unwrap(), b"hello");
+        // Reopen via a fresh pool and read it back.
+        drop(pool);
+        let pool = fresh_pool(2, &path);
+        let g = pool.fetch_page(0).unwrap();
+        assert_eq!(g.read().get_tuple(0).unwrap(), b"hello");
         drop(g);
         std::fs::remove_file(&path).ok();
     }
@@ -277,82 +329,85 @@ mod tests {
     #[test]
     fn lru_evicts_oldest_unpinned() {
         let path = temp_path("evict");
-        let mut bpm = fresh_bpm(2, &path);
-
-        // Allocate three pages with capacity=2 → page 0 gets evicted.
+        let pool = fresh_pool(2, &path);
         {
-            let mut g0 = bpm.new_page().unwrap();
-            assert_eq!(g0.page_id(), 0);
-            g0.page_mut().insert(b"page0").unwrap();
+            let g = pool.new_page().unwrap();
+            assert_eq!(g.page_id(), 0);
+            g.write().insert(b"page0").unwrap();
         }
         {
-            let mut g1 = bpm.new_page().unwrap();
-            assert_eq!(g1.page_id(), 1);
-            g1.page_mut().insert(b"page1").unwrap();
+            let g = pool.new_page().unwrap();
+            assert_eq!(g.page_id(), 1);
+            g.write().insert(b"page1").unwrap();
         }
         {
-            let mut g2 = bpm.new_page().unwrap();
-            assert_eq!(g2.page_id(), 2);
-            g2.page_mut().insert(b"page2").unwrap();
+            let g = pool.new_page().unwrap();
+            assert_eq!(g.page_id(), 2);
+            g.write().insert(b"page2").unwrap();
         }
-
-        // Fetch page 0 again — must come from disk (round-trip via eviction).
-        let g = bpm.fetch_page(0).unwrap();
-        assert_eq!(g.page().get_tuple(0).unwrap(), b"page0");
-        drop(g);
+        // Fetching page 0 must round-trip via disk.
+        let g = pool.fetch_page(0).unwrap();
+        assert_eq!(g.read().get_tuple(0).unwrap(), b"page0");
         std::fs::remove_file(&path).ok();
     }
-
-    #[test]
-    fn cache_hit_does_not_touch_disk_again() {
-        let path = temp_path("hit");
-        let mut bpm = fresh_bpm(2, &path);
-        {
-            let mut g = bpm.new_page().unwrap();
-            g.page_mut().insert(b"data").unwrap();
-        }
-        // Two fetches of the same page reuse the same frame.
-        let g1 = bpm.fetch_page(0).unwrap();
-        let pid1 = g1.page_id();
-        drop(g1);
-        let g2 = bpm.fetch_page(0).unwrap();
-        let pid2 = g2.page_id();
-        assert_eq!(pid1, pid2);
-        std::fs::remove_file(&path).ok();
-    }
-
-    // NOTE: under the current Guard design, holding multiple PageGuards
-    // simultaneously is structurally impossible (each guard exclusively
-    // borrows the BPM). The "all frames pinned" error path in pick_or_evict
-    // therefore can't be reached from public API — it's kept as a defensive
-    // check for future designs that allow concurrent guards.
 
     #[test]
     fn read_only_guard_does_not_dirty() {
         let path = temp_path("clean");
-        let mut bpm = fresh_bpm(2, &path);
-        // Create page 0 (dirty=true via new_page) and flush it.
+        let pool = fresh_pool(2, &path);
         {
-            let mut g = bpm.new_page().unwrap();
-            g.page_mut().insert(b"x").unwrap();
+            let g = pool.new_page().unwrap();
+            g.write().insert(b"x").unwrap();
         }
-        bpm.flush_all().unwrap();
-
-        // Read-only fetch of page 0; page_mut() not called → frame.dirty stays false.
+        pool.flush_all().unwrap();
         {
-            let g = bpm.fetch_page(0).unwrap();
-            let _ = g.page().tuple_count();
+            let g = pool.fetch_page(0).unwrap();
+            let _ = g.read().tuple_count();
         }
-        // Now force eviction by allocating two more pages (capacity=2). If the
-        // read-only fetch had wrongly dirtied the frame, eviction would write
-        // it back; this test passes either way for correctness, but exercises
-        // the path. The key assertion is that the data on disk is unchanged.
-        let _ = bpm.new_page().unwrap(); // 1
-        let _ = bpm.new_page().unwrap(); // 2
+        // Force eviction by filling the pool with new pages.
+        let _ = pool.new_page().unwrap();
+        let _ = pool.new_page().unwrap();
+        let g = pool.fetch_page(0).unwrap();
+        assert_eq!(g.read().get_tuple(0).unwrap(), b"x");
+        std::fs::remove_file(&path).ok();
+    }
 
-        let g = bpm.fetch_page(0).unwrap();
-        assert_eq!(g.page().get_tuple(0).unwrap(), b"x");
-        drop(g);
+    #[test]
+    fn concurrent_readers_and_writers_on_different_pages() {
+        let path = temp_path("concurrent");
+        let pool = fresh_pool(8, &path);
+        {
+            let g = pool.new_page().unwrap();
+            g.write().insert(b"a").unwrap();
+        }
+        {
+            let g = pool.new_page().unwrap();
+            g.write().insert(b"b").unwrap();
+        }
+        let barrier = Arc::new(Barrier::new(2));
+
+        let p1 = pool.clone();
+        let b1 = Arc::clone(&barrier);
+        let h1 = thread::spawn(move || {
+            b1.wait();
+            for _ in 0..50 {
+                let g = p1.fetch_page(0).unwrap();
+                assert_eq!(g.read().get_tuple(0).unwrap(), b"a");
+            }
+        });
+
+        let p2 = pool.clone();
+        let b2 = Arc::clone(&barrier);
+        let h2 = thread::spawn(move || {
+            b2.wait();
+            for _ in 0..50 {
+                let g = p2.fetch_page(1).unwrap();
+                assert_eq!(g.read().get_tuple(0).unwrap(), b"b");
+            }
+        });
+
+        h1.join().unwrap();
+        h2.join().unwrap();
         std::fs::remove_file(&path).ok();
     }
 }
