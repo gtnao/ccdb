@@ -1,3 +1,4 @@
 /target
 /table.db
 /wal.log
+/checkpoint.meta

@@ -6,6 +6,7 @@ mod analyzer;
 mod ast;
 mod buffer_pool;
 mod catalog;
+mod checkpoint;
 mod disk;
 mod executor;
 mod instance;
@@ -16,6 +17,7 @@ mod parser;
 mod protocol;
 mod recovery;
 mod transaction;
+mod transaction_manager;
 mod tuple;
 mod wal;
 

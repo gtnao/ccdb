@@ -19,12 +19,15 @@ use crate::lock_manager::LockManager;
 use crate::parser::parse;
 use crate::protocol::{ColumnDesc, Connection, FrontendMessage};
 use crate::recovery;
-use crate::transaction::{self, Transaction};
+use crate::transaction::Transaction;
+use crate::transaction_manager::TransactionManager;
 use crate::tuple::{DataType, Value};
-use crate::wal::{self, WalManager};
+use crate::wal::{self, WalManager, WalRecordType};
+use crate::checkpoint;
 
 const DATA_FILE: &str = "table.db";
 const WAL_FILE: &str = "wal.log";
+const DATA_DIR: &str = ".";
 const DEFAULT_PORT: u16 = 5433;
 const POOL_CAPACITY: usize = 64;
 
@@ -33,6 +36,7 @@ pub struct Instance {
     bpm: BufferPool,
     lock_manager: Arc<LockManager>,
     wal: Arc<WalManager>,
+    tm: Arc<TransactionManager>,
 }
 
 impl Instance {
@@ -40,31 +44,31 @@ impl Instance {
         if init {
             let _ = std::fs::remove_file(DATA_FILE);
             let _ = std::fs::remove_file(WAL_FILE);
+            checkpoint::delete(DATA_DIR)?;
         }
 
-        // Read any pre-existing WAL records *before* opening WalManager for
-        // append, so we can replay them onto the buffer pool.
         let wal_records = wal::read_records(WAL_FILE)?;
+        let checkpoint_lsn = checkpoint::read_lsn(DATA_DIR)?;
 
         let disk = DiskManager::open(DATA_FILE)?;
         let wal = Arc::new(WalManager::open(WAL_FILE)?);
         let bpm = BufferPool::new(disk, POOL_CAPACITY, Arc::clone(&wal));
+        let tm = Arc::new(TransactionManager::new());
 
         if !wal_records.is_empty() {
-            // Advance the WAL's LSN counter past anything on disk *before*
-            // recovery, so any CLRs we write during undo get fresh LSNs.
             let max_lsn = wal_records.iter().map(|r| r.lsn).max().unwrap_or(0);
             wal.set_next_lsn(max_lsn + 1);
 
-            let stats = recovery::recover(&bpm, &wal, &wal_records)?;
+            let stats = recovery::recover(&bpm, &wal, &wal_records, checkpoint_lsn)?;
             eprintln!(
-                "recovery: committed={} uncommitted={} redo={} undo={}",
+                "recovery: checkpoint={:?} committed={} uncommitted={} redo={} undo={}",
+                checkpoint_lsn,
                 stats.committed_txns,
                 stats.uncommitted_txns,
                 stats.redo_applied,
                 stats.undo_applied,
             );
-            transaction::set_next_txn_id(stats.max_txn_id + 1);
+            tm.set_next_txn_id(stats.max_txn_id + 1);
         }
 
         Ok(Self {
@@ -72,7 +76,21 @@ impl Instance {
             bpm,
             lock_manager: Arc::new(LockManager::new()),
             wal,
+            tm,
         })
+    }
+
+    /// Take a fuzzy checkpoint: snapshot ATT + DPT, write a Checkpoint
+    /// record, fsync the WAL, then update checkpoint.meta.
+    pub fn checkpoint(&self) -> Result<()> {
+        let att = self.tm.att_snapshot();
+        let dpt = self.bpm.dpt_snapshot();
+        let lsn = self
+            .wal
+            .append(0, 0, WalRecordType::Checkpoint { att, dpt })?;
+        self.wal.flush()?;
+        checkpoint::write_lsn(DATA_DIR, lsn)?;
+        Ok(())
     }
 
     pub fn start(&self) -> Result<()> {
@@ -91,13 +109,42 @@ impl Instance {
             let bpm = self.bpm.clone();
             let lock_manager = Arc::clone(&self.lock_manager);
             let wal = Arc::clone(&self.wal);
+            let tm = Arc::clone(&self.tm);
+            // Each connection holds an Instance handle for the CHECKPOINT path.
+            let instance_handle = InstanceHandle {
+                bpm: self.bpm.clone(),
+                wal: Arc::clone(&self.wal),
+                tm: Arc::clone(&self.tm),
+            };
 
             thread::spawn(move || {
-                if let Err(e) = handle_client(conn, catalog, bpm, lock_manager, wal) {
+                if let Err(e) = handle_client(conn, catalog, bpm, lock_manager, wal, tm, instance_handle) {
                     eprintln!("connection error: {e}");
                 }
             });
         }
+        Ok(())
+    }
+}
+
+/// Subset of `Instance` reachable from a connection thread. Lets a
+/// CHECKPOINT statement trigger the same routine as the public method.
+#[derive(Clone)]
+struct InstanceHandle {
+    bpm: BufferPool,
+    wal: Arc<WalManager>,
+    tm: Arc<TransactionManager>,
+}
+
+impl InstanceHandle {
+    fn checkpoint(&self) -> Result<()> {
+        let att = self.tm.att_snapshot();
+        let dpt = self.bpm.dpt_snapshot();
+        let lsn = self
+            .wal
+            .append(0, 0, WalRecordType::Checkpoint { att, dpt })?;
+        self.wal.flush()?;
+        checkpoint::write_lsn(DATA_DIR, lsn)?;
         Ok(())
     }
 }
@@ -108,6 +155,8 @@ fn handle_client(
     bpm: BufferPool,
     lock_manager: Arc<LockManager>,
     wal: Arc<WalManager>,
+    tm: Arc<TransactionManager>,
+    instance: InstanceHandle,
 ) -> Result<()> {
     let startup = conn.read_startup()?;
     eprintln!(
@@ -122,7 +171,7 @@ fn handle_client(
     conn.send_backend_key_data(1, 0xC0FFEE)?;
     conn.send_ready_for_query()?;
 
-    let mut tx = Transaction::new();
+    let mut tx = Transaction::new(Arc::clone(&tm));
 
     let result = (|| -> Result<()> {
         loop {
@@ -136,9 +185,16 @@ fn handle_client(
                 Some(FrontendMessage::Query(sql)) => {
                     if sql.trim().is_empty() {
                         conn.send_empty_query()?;
-                    } else if let Err(e) =
-                        run_query(&sql, &mut conn, &bpm, &lock_manager, &wal, &catalog, &mut tx)
-                    {
+                    } else if let Err(e) = run_query(
+                        &sql,
+                        &mut conn,
+                        &bpm,
+                        &lock_manager,
+                        &wal,
+                        &catalog,
+                        &mut tx,
+                        &instance,
+                    ) {
                         eprintln!("query error: {e}");
                         conn.send_error(&e.to_string())?;
                     }
@@ -173,6 +229,7 @@ fn run_query(
     wal: &WalManager,
     catalog: &Catalog,
     tx: &mut Transaction,
+    instance: &InstanceHandle,
 ) -> Result<()> {
     let stmt = parse(sql)?;
     let analyzed = analyze(catalog, &stmt)?;
@@ -215,6 +272,10 @@ fn run_query(
         AnalyzedStatement::Rollback => {
             execute(bpm, lm, wal, catalog, &analyzed, tx)?;
             conn.send_command_complete("ROLLBACK")?;
+        }
+        AnalyzedStatement::Checkpoint => {
+            instance.checkpoint()?;
+            conn.send_command_complete("CHECKPOINT")?;
         }
         AnalyzedStatement::CreateTable(_) => {
             bail!("CREATE TABLE is not yet wired up (catalog is read-only)")

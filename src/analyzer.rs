@@ -52,6 +52,7 @@ pub enum AnalyzedStatement {
     Begin,
     Commit,
     Rollback,
+    Checkpoint,
 }
 
 #[derive(Debug, Clone)]
@@ -551,6 +552,7 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
         Statement::Begin => AnalyzedStatement::Begin,
         Statement::Commit => AnalyzedStatement::Commit,
         Statement::Rollback => AnalyzedStatement::Rollback,
+        Statement::Checkpoint => AnalyzedStatement::Checkpoint,
     })
 }
 

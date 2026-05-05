@@ -8,21 +8,11 @@
 //! ROLLBACK / auto-commit boundary.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::page::Rid;
+use crate::transaction_manager::TransactionManager;
 use crate::wal::Lsn;
-
-static NEXT_TXN_ID: AtomicU64 = AtomicU64::new(1);
-
-fn fresh_txn_id() -> u64 {
-    NEXT_TXN_ID.fetch_add(1, Ordering::SeqCst)
-}
-
-/// Recovery uses this to advance past txn_ids that already appear in the WAL.
-pub fn set_next_txn_id(id: u64) {
-    NEXT_TXN_ID.store(id, Ordering::SeqCst);
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxState {
@@ -55,16 +45,19 @@ pub struct Transaction {
     log: Vec<UndoLogEntry>,
     held_locks: HashSet<Rid>,
     last_lsn: Lsn,
+    tm: Arc<TransactionManager>,
 }
 
 impl Transaction {
-    pub fn new() -> Self {
+    pub fn new(tm: Arc<TransactionManager>) -> Self {
+        let id = tm.begin();
         Self {
             state: TxState::Inactive,
-            id: fresh_txn_id(),
+            id,
             log: Vec::new(),
             held_locks: HashSet::new(),
             last_lsn: 0,
+            tm,
         }
     }
 
@@ -78,6 +71,7 @@ impl Transaction {
 
     pub fn set_last_lsn(&mut self, lsn: Lsn) {
         self.last_lsn = lsn;
+        self.tm.update_last_lsn(self.id, lsn);
     }
 
     pub fn is_active(&self) -> bool {
@@ -85,7 +79,9 @@ impl Transaction {
     }
 
     pub fn begin(&mut self) {
-        self.id = fresh_txn_id();
+        // Cleanly close the previous boundary in the ATT before opening a new id.
+        self.tm.commit(self.id);
+        self.id = self.tm.begin();
         self.state = TxState::Active;
         self.log.clear();
         self.held_locks.clear();
@@ -96,13 +92,16 @@ impl Transaction {
         self.log.clear();
         self.state = TxState::Inactive;
         self.last_lsn = 0;
+        self.tm.commit(self.id);
     }
 
     /// Start a fresh auto-commit boundary. No-op while explicit BEGIN is in
     /// effect.
     pub fn refresh_autocommit(&mut self) {
         if !self.is_active() {
-            self.id = fresh_txn_id();
+            // Close the previous auto-commit's ATT entry.
+            self.tm.commit(self.id);
+            self.id = self.tm.begin();
             self.log.clear();
             self.held_locks.clear();
             self.last_lsn = 0;
@@ -118,9 +117,6 @@ impl Transaction {
         self.held_locks.insert(rid);
     }
 
-    /// Drains the undo log without touching `last_lsn` (rollback still needs
-    /// it to chain CLRs). State remains as-is — the caller decides when to
-    /// flip back to Inactive.
     pub fn drain_log(&mut self) -> Vec<UndoLogEntry> {
         std::mem::take(&mut self.log)
     }
@@ -128,6 +124,7 @@ impl Transaction {
     pub fn set_inactive(&mut self) {
         self.state = TxState::Inactive;
         self.last_lsn = 0;
+        self.tm.abort(self.id);
     }
 
     pub fn take_held_locks(&mut self) -> HashSet<Rid> {
@@ -135,9 +132,11 @@ impl Transaction {
     }
 }
 
-impl Default for Transaction {
-    fn default() -> Self {
-        Self::new()
+impl Drop for Transaction {
+    fn drop(&mut self) {
+        // Connection ended without a clean lifecycle — make sure we don't
+        // leak the txn in the ATT.
+        self.tm.abort(self.id);
     }
 }
 
@@ -147,7 +146,7 @@ mod tests {
 
     #[test]
     fn lifecycle() {
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
         let id_before = tx.id();
         tx.begin();
         assert!(tx.is_active());
@@ -165,7 +164,7 @@ mod tests {
 
     #[test]
     fn refresh_changes_id_only_when_inactive() {
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
         let id1 = tx.id();
         tx.refresh_autocommit();
         let id2 = tx.id();

@@ -20,7 +20,7 @@ use indexmap::IndexSet;
 
 use crate::disk::DiskManager;
 use crate::page::{PAGE_SIZE, Page, PageId};
-use crate::wal::WalManager;
+use crate::wal::{Lsn, WalManager};
 
 const ORDER: Ordering = Ordering::SeqCst;
 
@@ -84,6 +84,10 @@ struct Inner {
     replacer: LruReplacer,
     capacity: usize,
     wal: Arc<WalManager>,
+    /// Dirty Page Table: `page_id → rec_lsn`. `rec_lsn` is the LSN at
+    /// which the page first became dirty since its last flush. Used by
+    /// fuzzy checkpoint to bound recovery's redo phase.
+    dpt: HashMap<PageId, Lsn>,
 }
 
 #[derive(Clone)]
@@ -102,8 +106,14 @@ impl BufferPool {
                 replacer: LruReplacer::new(capacity),
                 capacity,
                 wal,
+                dpt: HashMap::new(),
             })),
         }
+    }
+
+    /// Snapshot of the current DPT for inclusion in a Checkpoint record.
+    pub fn dpt_snapshot(&self) -> HashMap<PageId, Lsn> {
+        self.inner.lock().unwrap().dpt.clone()
     }
 
     pub fn page_count(&self) -> u32 {
@@ -155,12 +165,11 @@ impl Inner {
         if let Some(pid) = frame.page_id {
             if frame.dirty {
                 let page_guard = frame.page.read().unwrap();
-                // WAL invariant: log records describing this page must be on
-                // disk *before* we write the page itself.
                 self.wal.flush_to(page_guard.page_lsn())?;
                 self.disk.write_page(pid, page_guard.as_bytes())?;
             }
             self.page_table.remove(&pid);
+            self.dpt.remove(&pid);
         }
         frame.page_id = None;
         frame.dirty = false;
@@ -219,7 +228,14 @@ impl Inner {
             }
             f.pin_count -= 1;
             if mutated {
+                let was_clean = !f.dirty;
                 f.dirty = true;
+                if was_clean {
+                    // First-write since last flush: rec_lsn = current page_lsn
+                    // (which the writer has just stamped via set_page_lsn).
+                    let page_lsn = f.page.read().unwrap().page_lsn();
+                    self.dpt.entry(page_id).or_insert(page_lsn);
+                }
             }
             if f.pin_count == 0 {
                 self.replacer.unpin(fid);
@@ -239,6 +255,7 @@ impl Inner {
                     self.disk.write_page(pid, pg.as_bytes())?;
                     drop(pg);
                     f.dirty = false;
+                    self.dpt.remove(&pid);
                 }
             }
         }

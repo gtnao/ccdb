@@ -34,14 +34,33 @@ pub fn recover(
     bpm: &BufferPool,
     wal: &WalManager,
     records: &[WalRecord],
+    checkpoint_lsn: Option<Lsn>,
 ) -> Result<RecoveryStats> {
     if records.is_empty() {
         return Ok(RecoveryStats::default());
     }
 
+    // Find the most recent Checkpoint record at or after `checkpoint_lsn`.
+    // Its ATT/DPT seed analyze; redo can start from min(rec_lsn in DPT).
+    let ckpt_idx = checkpoint_lsn.and_then(|target| {
+        records
+            .iter()
+            .position(|r| r.lsn == target && matches!(r.record_type, WalRecordType::Checkpoint { .. }))
+    });
+
     let analysis = analyze(records);
 
-    let redo_applied = redo(bpm, records)?;
+    // For redo: start at min(rec_lsn in DPT from the checkpoint), or from
+    // the beginning if no checkpoint. Records before the start LSN are
+    // guaranteed to already be on disk.
+    let redo_start = ckpt_idx
+        .and_then(|i| match &records[i].record_type {
+            WalRecordType::Checkpoint { dpt, .. } => dpt.values().copied().min(),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    let redo_applied = redo_from(bpm, records, redo_start)?;
     let undo_applied = undo(bpm, wal, records, &analysis)?;
 
     bpm.flush_all()?;
@@ -96,6 +115,9 @@ fn analyze(records: &[WalRecord]) -> Analysis {
                 // CLR implies prior Insert/Delete by this txn.
                 wrote_dml.insert(r.txn_id);
             }
+            WalRecordType::Checkpoint { .. } => {
+                // Pure metadata; no per-txn effect on classification.
+            }
         }
     }
 
@@ -109,9 +131,12 @@ fn analyze(records: &[WalRecord]) -> Analysis {
     }
 }
 
-fn redo(bpm: &BufferPool, records: &[WalRecord]) -> Result<usize> {
+fn redo_from(bpm: &BufferPool, records: &[WalRecord], start_lsn: Lsn) -> Result<usize> {
     let mut count = 0;
     for r in records {
+        if r.lsn < start_lsn {
+            continue;
+        }
         match &r.record_type {
             WalRecordType::Insert { rid, data } => {
                 if redo_insert(bpm, *rid, data, r.lsn)? {
@@ -288,6 +313,11 @@ fn undo(
                     // just follow the chain.
                     cur = r.prev_lsn;
                 }
+                WalRecordType::Checkpoint { .. } => {
+                    // Checkpoint records are not part of any txn's chain;
+                    // shouldn't be reached by prev_lsn following, but be defensive.
+                    cur = r.prev_lsn;
+                }
             }
         }
     }
@@ -350,7 +380,7 @@ mod tests {
         let recs = crate::wal::read_records(&wal_path).unwrap();
         let (pool, wal) = make_pool(&data, &wal_path);
         wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
-        let stats = recover(&pool, &wal, &recs).unwrap();
+        let stats = recover(&pool, &wal, &recs, None).unwrap();
         assert_eq!(stats.committed_txns, 1);
         assert_eq!(stats.redo_applied, 1);
         assert_eq!(stats.undo_applied, 0);
@@ -383,7 +413,7 @@ mod tests {
         let recs = crate::wal::read_records(&wal_path).unwrap();
         let (pool, wal) = make_pool(&data, &wal_path);
         wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
-        let stats = recover(&pool, &wal, &recs).unwrap();
+        let stats = recover(&pool, &wal, &recs, None).unwrap();
         assert_eq!(stats.committed_txns, 0);
         assert_eq!(stats.uncommitted_txns, 1);
         assert_eq!(stats.redo_applied, 1);
@@ -434,7 +464,7 @@ mod tests {
         let recs = crate::wal::read_records(&wal_path).unwrap();
         let (pool, wal) = make_pool(&data, &wal_path);
         wal.set_next_lsn(recs.iter().map(|r| r.lsn).max().unwrap_or(0) + 1);
-        let stats = recover(&pool, &wal, &recs).unwrap();
+        let stats = recover(&pool, &wal, &recs, None).unwrap();
         // The Insert was already compensated; undo phase should write 0 new
         // undo records (the CLR's undo_next_lsn jumps past the Insert).
         assert_eq!(stats.uncommitted_txns, 1);

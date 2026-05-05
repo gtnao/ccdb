@@ -50,6 +50,10 @@ impl Parser {
                 self.bump();
                 Statement::Rollback
             }
+            Some(Token::Checkpoint) => {
+                self.bump();
+                Statement::Checkpoint
+            }
             other => bail!(
                 "expected statement keyword, got {other:?}"
             ),

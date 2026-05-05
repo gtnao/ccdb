@@ -687,6 +687,11 @@ pub fn execute(
         AnalyzedStatement::CreateTable(_) => {
             bail!("CREATE TABLE execution is not yet wired up (catalog is read-only)")
         }
+        AnalyzedStatement::Checkpoint => {
+            // Handled at the connection layer (instance.rs) — has access to
+            // the global ATT and DPT, which the executor doesn't.
+            bail!("CHECKPOINT must be handled outside the executor")
+        }
     })();
 
     // Bracket the auto-commit DML records with Commit (or Abort on error).
@@ -776,7 +781,7 @@ mod tests {
     }
 
     fn run(sql: &str, cat: &Catalog, bpm: &BufferPool, wal: &WalManager) -> Output {
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
         let lm = LockManager::new();
         run_full(sql, cat, bpm, &lm, wal, &mut tx)
     }
@@ -1005,7 +1010,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
 
         run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
         run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
@@ -1032,7 +1037,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
 
         run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
         run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &wal, &mut tx);
@@ -1054,7 +1059,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
 
         run_tx("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &wal, &mut tx);
         run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
@@ -1087,7 +1092,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
 
         run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
         run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
@@ -1106,7 +1111,7 @@ mod tests {
         let disk = DiskManager::open(&path).unwrap();
         let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
 
         let stmt = parse("BEGIN").unwrap();
         let analyzed = analyze(&cat, &stmt).unwrap();
@@ -1137,7 +1142,7 @@ mod tests {
 
         // Seed one row.
         {
-            let mut tx = Transaction::new();
+            let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
             run_full(
                 "INSERT INTO users VALUES (1, 'init')",
                 &cat,
@@ -1158,7 +1163,7 @@ mod tests {
         let bar_a = Arc::clone(&barrier);
         let h_a = thread::spawn(move || {
             bar_a.wait();
-            let mut tx = Transaction::new();
+            let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
             run_full("BEGIN", &cat_a, &bpm_a, &lm_a, &wal_a, &mut tx);
             run_full(
                 "UPDATE users SET name = 'A' WHERE id = 1",
@@ -1182,7 +1187,7 @@ mod tests {
         let h_b = thread::spawn(move || {
             bar_b.wait();
             b_can_proceed.recv().unwrap();
-            let mut tx = Transaction::new();
+            let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
             run_full("BEGIN", &cat_b, &bpm_b, &lm_b, &wal_b, &mut tx);
             run_full(
                 "UPDATE users SET name = 'B' WHERE id = 1",
@@ -1199,7 +1204,7 @@ mod tests {
         h_b.join().unwrap();
 
         // After both commit, B's update wins (it ran second, post-A's release).
-        let mut tx = Transaction::new();
+        let mut tx = Transaction::new(std::sync::Arc::new(crate::transaction_manager::TransactionManager::new()));
         let Output::Rows(rows) = run_full(
             "SELECT name FROM users WHERE id = 1",
             &cat,

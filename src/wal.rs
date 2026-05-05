@@ -9,6 +9,7 @@
 //! This file is the *write side*; recovery (replay / undo on restart) lands
 //! in the next day.
 
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
 
-use crate::page::Rid;
+use crate::page::{PageId, Rid};
 
 pub type Lsn = u64;
 
@@ -42,6 +43,13 @@ pub enum WalRecordType {
         undo_next_lsn: Lsn,
         redo: ClrRedo,
     },
+    /// Fuzzy checkpoint. Persists the Active Transaction Table and the
+    /// Dirty Page Table at the time the checkpoint started — recovery uses
+    /// these as its starting point.
+    Checkpoint {
+        att: HashMap<u64, Lsn>,
+        dpt: HashMap<PageId, Lsn>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -56,6 +64,7 @@ const TAG_ABORT: u8 = 2;
 const TAG_INSERT: u8 = 3;
 const TAG_DELETE: u8 = 4;
 const TAG_CLR: u8 = 5;
+const TAG_CHECKPOINT: u8 = 6;
 
 const CLR_UNDO_INSERT: u8 = 0;
 const CLR_UNDO_DELETE: u8 = 1;
@@ -112,6 +121,19 @@ impl WalRecord {
                         buf.extend_from_slice(&slot.to_le_bytes());
                         buf.extend_from_slice(data);
                     }
+                }
+            }
+            WalRecordType::Checkpoint { att, dpt } => {
+                buf.push(TAG_CHECKPOINT);
+                buf.extend_from_slice(&(att.len() as u32).to_le_bytes());
+                for (txn_id, last_lsn) in att {
+                    buf.extend_from_slice(&txn_id.to_le_bytes());
+                    buf.extend_from_slice(&last_lsn.to_le_bytes());
+                }
+                buf.extend_from_slice(&(dpt.len() as u32).to_le_bytes());
+                for (pid, rec_lsn) in dpt {
+                    buf.extend_from_slice(&pid.to_le_bytes());
+                    buf.extend_from_slice(&rec_lsn.to_le_bytes());
                 }
             }
         }
@@ -181,6 +203,39 @@ impl WalRecord {
                     other => bail!("unknown CLR redo tag: {other}"),
                 };
                 WalRecordType::Clr { undo_next_lsn, redo }
+            }
+            TAG_CHECKPOINT => {
+                if rest.len() < 4 {
+                    bail!("Checkpoint record missing att length");
+                }
+                let att_len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
+                let mut p = 4;
+                let mut att = HashMap::with_capacity(att_len);
+                for _ in 0..att_len {
+                    if rest.len() < p + 16 {
+                        bail!("Checkpoint att truncated");
+                    }
+                    let id = u64::from_le_bytes(rest[p..p + 8].try_into().unwrap());
+                    let lsn = u64::from_le_bytes(rest[p + 8..p + 16].try_into().unwrap());
+                    att.insert(id, lsn);
+                    p += 16;
+                }
+                if rest.len() < p + 4 {
+                    bail!("Checkpoint missing dpt length");
+                }
+                let dpt_len = u32::from_le_bytes(rest[p..p + 4].try_into().unwrap()) as usize;
+                p += 4;
+                let mut dpt = HashMap::with_capacity(dpt_len);
+                for _ in 0..dpt_len {
+                    if rest.len() < p + 12 {
+                        bail!("Checkpoint dpt truncated");
+                    }
+                    let pid = u32::from_le_bytes(rest[p..p + 4].try_into().unwrap());
+                    let rec_lsn = u64::from_le_bytes(rest[p + 4..p + 12].try_into().unwrap());
+                    dpt.insert(pid, rec_lsn);
+                    p += 12;
+                }
+                WalRecordType::Checkpoint { att, dpt }
             }
             other => bail!("unknown WAL tag: {other}"),
         };

@@ -10,6 +10,7 @@ pub enum Statement {
     Begin,
     Commit,
     Rollback,
+    Checkpoint,
 }
 
 #[derive(Debug, Clone, PartialEq)]
