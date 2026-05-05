@@ -69,6 +69,12 @@ impl Parser {
 
     fn parse_select(&mut self) -> Result<Statement> {
         self.expect(&Token::Select)?;
+        let distinct = if matches!(self.peek(), Some(Token::Distinct)) {
+            self.bump();
+            true
+        } else {
+            false
+        };
         let mut columns = Vec::new();
         loop {
             if matches!(self.peek(), Some(Token::Asterisk)) {
@@ -154,6 +160,7 @@ impl Parser {
             having,
             order_by,
             limit,
+            distinct,
         }))
     }
 
@@ -732,8 +739,16 @@ mod tests {
                 having: None,
                 order_by: Vec::new(),
                 limit: None,
+                distinct: false,
             })
         );
+    }
+
+    #[test]
+    fn parse_select_distinct() {
+        let s = parse("SELECT DISTINCT name FROM t").unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        assert!(sel.distinct);
     }
 
     #[test]

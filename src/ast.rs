@@ -45,6 +45,9 @@ pub struct SelectStatement {
     pub order_by: Vec<OrderBy>,
     /// Cap on rows emitted to the client. Omitted ⇒ no cap.
     pub limit: Option<u64>,
+    /// `SELECT DISTINCT col, ...` — analyzer treats this as adding the
+    /// projected expressions to GROUP BY (semantically equivalent).
+    pub distinct: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]

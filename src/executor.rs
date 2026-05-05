@@ -2152,6 +2152,30 @@ mod tests {
     }
 
     #[test]
+    fn select_distinct_dedupes() {
+        let (cat, bpm, wal, tm) = setup_users();
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (2, 'a')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (3, 'b')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (4, NULL)", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (5, NULL)", &cat, &bpm, &wal, &tm);
+        let Output::Rows(rows) = run(
+            "SELECT DISTINCT name FROM users ORDER BY name",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        // Distinct values: 'a', 'b', NULL → 3 rows. Order: a, b, NULL (NULL last under ASC).
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].values[0], Value::Varchar("a".into()));
+        assert_eq!(rows[1].values[0], Value::Varchar("b".into()));
+        assert_eq!(rows[2].values[0], Value::Null);
+    }
+
+    #[test]
     fn order_by_asc_default() {
         let (cat, bpm, wal, tm) = setup_users();
         for (i, name) in [(3, "c"), (1, "a"), (2, "b")] {

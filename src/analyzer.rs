@@ -513,9 +513,29 @@ impl<'a> Analyzer<'a> {
             None => None,
         };
 
-        // GROUP BY: each expression analyzed against input tuples.
-        let group_keys: Vec<AnalyzedExpr> = s
-            .group_by
+        // GROUP BY: each expression analyzed against input tuples. DISTINCT
+        // is desugared into "group by every projected expression" so the
+        // existing HashAggregate path handles it for free.
+        let mut group_by_ast: Vec<Expr> = s.group_by.clone();
+        if s.distinct {
+            if !s.group_by.is_empty() {
+                bail!("DISTINCT combined with explicit GROUP BY is not supported");
+            }
+            for c in &s.columns {
+                match c {
+                    SelectColumn::Asterisk => {
+                        bail!("`SELECT DISTINCT *` is not supported");
+                    }
+                    SelectColumn::Expr { expr, .. } => {
+                        if contains_aggregate(expr) {
+                            bail!("DISTINCT combined with aggregate functions is not supported");
+                        }
+                        group_by_ast.push(expr.clone());
+                    }
+                }
+            }
+        }
+        let group_keys: Vec<AnalyzedExpr> = group_by_ast
             .iter()
             .map(|e| self.analyze_expr(e))
             .collect::<Result<_>>()?;
