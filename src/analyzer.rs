@@ -292,6 +292,10 @@ pub struct AnalyzedColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Serialized DEFAULT expression (Expr::Display form). The executor
+    /// hands it to pg_attribute.default_text; the analyzer re-parses it
+    /// at INSERT time to apply.
+    pub default_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -916,13 +920,24 @@ impl<'a> Analyzer<'a> {
                 let expr = match col_to_value_idx[col_idx] {
                     Some(vi) => self.analyze_expr(&row[vi])?,
                     None => {
-                        if !col.nullable {
-                            bail!(
-                                "column '{}' is not nullable and was not given a value",
-                                col.name
-                            );
+                        // Apply DEFAULT if the column has one.
+                        if let Some(text) = &col.default_text {
+                            let parsed = crate::parser::parse_expr_str(text).map_err(|e| {
+                                anyhow::anyhow!(
+                                    "failed to parse stored DEFAULT for column '{}': {e}",
+                                    col.name
+                                )
+                            })?;
+                            self.analyze_expr(&parsed)?
+                        } else {
+                            if !col.nullable {
+                                bail!(
+                                    "column '{}' is not nullable and was not given a value",
+                                    col.name
+                                );
+                            }
+                            AnalyzedExpr::Literal(literal_to_analyzed(&Literal::Null))
                         }
-                        AnalyzedExpr::Literal(literal_to_analyzed(&Literal::Null))
                     }
                 };
                 match expr.data_type() {
@@ -1339,6 +1354,7 @@ impl<'a> Analyzer<'a> {
                 name: c.name.clone(),
                 data_type: ast_to_runtime(c.data_type),
                 nullable: c.nullable,
+                default_text: c.default.as_ref().map(|e| e.to_string()),
             })
             .collect();
         let primary_key_column = match s.primary_key.len() {

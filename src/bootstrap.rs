@@ -97,6 +97,8 @@ pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
                     Value::Int(*dt),
                     Value::Bool(*nul),
                     Value::Int(*ord),
+                    // System-table columns have no DEFAULT (Phase 4-2a).
+                    Value::Varchar(String::new()),
                 ],
             );
             p.insert(&bytes)?;

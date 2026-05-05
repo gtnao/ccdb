@@ -1440,6 +1440,7 @@ fn perform_create_table(
             crate::tuple::DataType::Time => DT_TIME,
             crate::tuple::DataType::Interval => DT_INTERVAL,
         };
+        let default_text = col.default_text.clone().unwrap_or_default();
         let row = serialize_tuple_mvcc(
             tx.id(),
             INVALID_TXN_ID,
@@ -1449,6 +1450,7 @@ fn perform_create_table(
                 Value::Int(dt),
                 Value::Bool(col.nullable),
                 Value::Int(ord as i32),
+                Value::Varchar(default_text),
             ],
         );
         insert_bytes(bpm, wal, tx, PG_ATTRIBUTE_PAGE_ID, &row)?;

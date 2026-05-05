@@ -219,6 +219,11 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// `DEFAULT <expr>` from CREATE TABLE. Carried as a parsed Expr so the
+    /// analyzer can bind it. Currently only literal expressions persist
+    /// across the catalog round-trip (function-call defaults like
+    /// CURRENT_TIMESTAMP would need a stable text encoding — TODO).
+    pub default: Option<Expr>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -309,4 +314,72 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Not,
     Neg,
+}
+
+impl std::fmt::Display for Expr {
+    /// Round-trip-able SQL serialization for the subset that survives a
+    /// `pg_attribute.default_text` save: literals, unary ±/NOT, the usual
+    /// binary operators, function calls, IS NULL. Used to persist DEFAULT
+    /// expressions; the analyzer re-parses them on every INSERT that
+    /// omits the column.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expr::Literal(l) => match l {
+                Literal::Integer(n) => write!(f, "{n}"),
+                Literal::Float(x) => write!(f, "{x}"),
+                Literal::Boolean(b) => write!(f, "{}", if *b { "TRUE" } else { "FALSE" }),
+                Literal::Null => write!(f, "NULL"),
+                Literal::String(s) => write!(f, "'{}'", s.replace('\'', "''")),
+                Literal::Timestamp(t) => write!(f, "TIMESTAMP '{t}us'"),
+                Literal::Date(d) => write!(f, "DATE '{d}d'"),
+                Literal::Time(t) => write!(f, "TIME '{t}us'"),
+                Literal::Interval { months, days, micros } => {
+                    write!(f, "INTERVAL '{months}m {days}d {micros}us'")
+                }
+            },
+            Expr::Column { qualifier: Some(q), name } => write!(f, "{q}.{name}"),
+            Expr::Column { qualifier: None, name } => write!(f, "{name}"),
+            Expr::UnaryOp { op, expr } => {
+                let op_s = match op {
+                    UnaryOperator::Not => "NOT ",
+                    UnaryOperator::Neg => "-",
+                };
+                write!(f, "({op_s}{expr})")
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let op_s = match op {
+                    BinaryOperator::Eq => "=",
+                    BinaryOperator::Ne => "<>",
+                    BinaryOperator::Lt => "<",
+                    BinaryOperator::Le => "<=",
+                    BinaryOperator::Gt => ">",
+                    BinaryOperator::Ge => ">=",
+                    BinaryOperator::And => "AND",
+                    BinaryOperator::Or => "OR",
+                    BinaryOperator::Add => "+",
+                    BinaryOperator::Sub => "-",
+                    BinaryOperator::Mul => "*",
+                    BinaryOperator::Div => "/",
+                };
+                write!(f, "({left} {op_s} {right})")
+            }
+            Expr::IsNull { expr, negated: false } => write!(f, "({expr} IS NULL)"),
+            Expr::IsNull { expr, negated: true } => write!(f, "({expr} IS NOT NULL)"),
+            Expr::FuncCall { name, args } => {
+                write!(f, "{name}(")?;
+                match args {
+                    FuncArgs::Star => write!(f, "*")?,
+                    FuncArgs::Exprs(es) => {
+                        for (i, e) in es.iter().enumerate() {
+                            if i > 0 {
+                                write!(f, ", ")?;
+                            }
+                            write!(f, "{e}")?;
+                        }
+                    }
+                }
+                write!(f, ")")
+            }
+        }
+    }
 }

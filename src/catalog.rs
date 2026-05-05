@@ -24,6 +24,10 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
+    /// Serialized DEFAULT expression. Lives in pg_attribute.default_text
+    /// as a Value::Varchar and is re-parsed by the analyzer on every
+    /// INSERT that omits this column. Empty string ⇒ no DEFAULT.
+    pub default_text: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -207,12 +211,20 @@ impl Catalog {
                 Value::Int(n) => *n,
                 _ => continue,
             };
+            // default_text added in Phase 4-2a. Empty string or missing
+            // value means "no DEFAULT". Older bootstrap rows predate the
+            // column so a missing position is tolerated.
+            let default_text = match values.get(5) {
+                Some(Value::Varchar(s)) if !s.is_empty() => Some(s.clone()),
+                _ => None,
+            };
             rows.push((
                 ord,
                 ColumnDef {
                     name: cname,
                     data_type: dt,
                     nullable,
+                    default_text,
                 },
             ));
         }
@@ -474,6 +486,10 @@ pub fn pg_attribute_schema() -> Schema {
             Column {
                 name: "ordinal_position".to_string(),
                 data_type: DataType::Int,
+            },
+            Column {
+                name: "default_text".to_string(),
+                data_type: DataType::Varchar,
             },
         ],
     }

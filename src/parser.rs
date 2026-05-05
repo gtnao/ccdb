@@ -327,6 +327,7 @@ impl Parser {
             // Trailing column constraints in any order. We accept them and
             // mostly ignore — only NOT NULL has runtime meaning.
             let mut nullable = true;
+            let mut default = None;
             loop {
                 match self.peek() {
                     Some(Token::Not) => {
@@ -334,10 +335,9 @@ impl Parser {
                         self.expect(&Token::Null)?;
                         nullable = false;
                     }
-                    // `DEFAULT <expr>` — value is parsed and discarded.
                     Some(Token::Default) => {
                         self.bump();
-                        let _ = self.parse_expr()?;
+                        default = Some(self.parse_expr()?);
                     }
                     // Column-level `PRIMARY KEY`. Records this column as
                     // the table's PK; the executor will create the unique
@@ -357,6 +357,7 @@ impl Parser {
                 name,
                 data_type,
                 nullable,
+                default,
             });
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.bump();
@@ -1344,6 +1345,19 @@ pub fn parse(sql: &str) -> Result<Statement> {
     Parser::new(tokens).parse()
 }
 
+/// Parse a bare SQL expression (no surrounding statement). Used by the
+/// analyzer to re-bind a DEFAULT clause stored as Expr::Display text in
+/// pg_attribute.
+pub fn parse_expr_str(s: &str) -> Result<Expr> {
+    let tokens = Lexer::new(s).tokenize()?;
+    let mut p = Parser::new(tokens);
+    let expr = p.parse_expr()?;
+    if let Some(extra) = p.peek() {
+        bail!("unexpected trailing token in expression: {extra:?}");
+    }
+    Ok(expr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,11 +1618,13 @@ mod tests {
                     name: "id".into(),
                     data_type: DataType::Int,
                     nullable: true,
+                    default: None,
                 },
                 ColumnDef {
                     name: "name".into(),
                     data_type: DataType::Varchar,
                     nullable: true,
+                    default: None,
                 },
             ]
         );
