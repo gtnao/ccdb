@@ -29,6 +29,9 @@ pub const DT_VARCHAR: i32 = 1;
 pub const DT_BOOL: i32 = 2;
 pub const DT_DOUBLE: i32 = 3;
 pub const DT_TIMESTAMP: i32 = 4;
+pub const DT_DATE: i32 = 5;
+pub const DT_TIME: i32 = 6;
+pub const DT_INTERVAL: i32 = 7;
 
 pub fn bootstrap(bpm: &BufferPool, tm: &TransactionManager) -> Result<()> {
     // -- pg_class at page 0 --
@@ -111,6 +114,9 @@ pub fn datatype_from_int(dt: i32) -> Option<crate::tuple::DataType> {
         x if x == DT_BOOL => Some(crate::tuple::DataType::Bool),
         x if x == DT_DOUBLE => Some(crate::tuple::DataType::Double),
         x if x == DT_TIMESTAMP => Some(crate::tuple::DataType::Timestamp),
+        x if x == DT_DATE => Some(crate::tuple::DataType::Date),
+        x if x == DT_TIME => Some(crate::tuple::DataType::Time),
+        x if x == DT_INTERVAL => Some(crate::tuple::DataType::Interval),
         _ => None,
     }
 }

@@ -17,6 +17,15 @@ pub enum DataType {
     /// `TIMESTAMP WITHOUT TIME ZONE` — i64 microseconds since
     /// 2000-01-01 UTC midnight (PostgreSQL epoch).
     Timestamp,
+    /// `DATE` — i32 days since 2000-01-01 (PG epoch).
+    Date,
+    /// `TIME WITHOUT TIME ZONE` — i64 microseconds since 00:00:00.
+    Time,
+    /// `INTERVAL` — three-field calendar duration. Months and days are
+    /// kept separate from microseconds because their length depends on
+    /// context (a month is 28-31 days, a day is usually 24h but can be
+    /// 23h or 25h around DST). PG layout: 16 bytes total.
+    Interval,
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +50,13 @@ pub enum Value {
     /// Microseconds from PostgreSQL epoch (2000-01-01 UTC midnight). Stored
     /// as i64 little-endian (8 bytes). Range: ~292000 BC to AD 294276.
     Timestamp(i64),
+    /// Days from PG epoch (2000-01-01). i32 LE (4 bytes).
+    Date(i32),
+    /// Microseconds since 00:00:00. i64 LE (8 bytes). 0 ≤ x < 86400 * 10^6.
+    Time(i64),
+    /// 3-field calendar duration. Stored as 16 bytes:
+    ///   `[months: i32 LE | days: i32 LE | micros: i64 LE]`
+    Interval { months: i32, days: i32, micros: i64 },
 }
 
 fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
@@ -55,6 +71,13 @@ fn serialize_value(value: &Value, buf: &mut Vec<u8>) {
         Value::Bool(v) => buf.push(if *v { 1 } else { 0 }),
         Value::Double(v) => buf.extend_from_slice(&v.to_le_bytes()),
         Value::Timestamp(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        Value::Date(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        Value::Time(v) => buf.extend_from_slice(&v.to_le_bytes()),
+        Value::Interval { months, days, micros } => {
+            buf.extend_from_slice(&months.to_le_bytes());
+            buf.extend_from_slice(&days.to_le_bytes());
+            buf.extend_from_slice(&micros.to_le_bytes());
+        }
     }
 }
 
@@ -100,6 +123,36 @@ fn deserialize_value(data: &[u8], data_type: DataType, is_null: bool) -> Result<
             }
             let v = i64::from_le_bytes(data[..8].try_into()?);
             Ok((Value::Timestamp(v), 8))
+        }
+        DataType::Date => {
+            if data.len() < 4 {
+                bail!("not enough bytes for DATE");
+            }
+            let v = i32::from_le_bytes(data[..4].try_into()?);
+            Ok((Value::Date(v), 4))
+        }
+        DataType::Time => {
+            if data.len() < 8 {
+                bail!("not enough bytes for TIME");
+            }
+            let v = i64::from_le_bytes(data[..8].try_into()?);
+            Ok((Value::Time(v), 8))
+        }
+        DataType::Interval => {
+            if data.len() < 16 {
+                bail!("not enough bytes for INTERVAL");
+            }
+            let months = i32::from_le_bytes(data[0..4].try_into()?);
+            let days = i32::from_le_bytes(data[4..8].try_into()?);
+            let micros = i64::from_le_bytes(data[8..16].try_into()?);
+            Ok((
+                Value::Interval {
+                    months,
+                    days,
+                    micros,
+                },
+                16,
+            ))
         }
     }
 }

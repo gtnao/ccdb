@@ -379,6 +379,19 @@ impl Parser {
                 self.skip_optional_size();
                 Ok(DataType::Timestamp)
             }
+            Some(Token::Date) => {
+                self.bump();
+                Ok(DataType::Date)
+            }
+            Some(Token::Time) => {
+                self.bump();
+                self.skip_optional_size();
+                Ok(DataType::Time)
+            }
+            Some(Token::Interval) => {
+                self.bump();
+                Ok(DataType::Interval)
+            }
             other => bail!("expected data type, got {other:?}"),
         }
     }
@@ -683,16 +696,31 @@ impl Parser {
             Some(Token::Timestamp) => {
                 // `TIMESTAMP 'YYYY-MM-DD HH:MM:SS[.fff]'` — typed literal.
                 self.bump();
-                let s = match self.peek() {
-                    Some(Token::String(s)) => {
-                        let s = s.clone();
-                        self.bump();
-                        s
-                    }
-                    other => bail!("expected string after TIMESTAMP, got {other:?}"),
-                };
+                let s = self.expect_string_literal_after("TIMESTAMP")?;
                 let micros = parse_timestamp_literal(&s)?;
                 Ok(Expr::Literal(Literal::Timestamp(micros)))
+            }
+            Some(Token::Date) => {
+                self.bump();
+                let s = self.expect_string_literal_after("DATE")?;
+                let days = parse_date_literal(&s)?;
+                Ok(Expr::Literal(Literal::Date(days)))
+            }
+            Some(Token::Time) => {
+                self.bump();
+                let s = self.expect_string_literal_after("TIME")?;
+                let micros = parse_time_literal(&s)?;
+                Ok(Expr::Literal(Literal::Time(micros)))
+            }
+            Some(Token::Interval) => {
+                self.bump();
+                let s = self.expect_string_literal_after("INTERVAL")?;
+                let (months, days, micros) = parse_interval_literal(&s)?;
+                Ok(Expr::Literal(Literal::Interval {
+                    months,
+                    days,
+                    micros,
+                }))
             }
             Some(Token::Integer(n)) => {
                 let n = *n;
@@ -812,6 +840,114 @@ pub fn parse_timestamp_literal(s: &str) -> Result<i64> {
     delta
         .num_microseconds()
         .ok_or_else(|| anyhow::anyhow!("timestamp out of range"))
+}
+
+impl Parser {
+    /// Read the string literal that follows a typed-literal keyword
+    /// (e.g. `TIMESTAMP '...'`, `DATE '...'`). The keyword itself must
+    /// already have been consumed.
+    fn expect_string_literal_after(&mut self, kw: &'static str) -> Result<String> {
+        match self.peek() {
+            Some(Token::String(s)) => {
+                let s = s.clone();
+                self.bump();
+                Ok(s)
+            }
+            other => bail!("expected string literal after {kw}, got {other:?}"),
+        }
+    }
+}
+
+/// `DATE 'YYYY-MM-DD'` → days since 2000-01-01.
+pub fn parse_date_literal(s: &str) -> Result<i32> {
+    let d = chrono::NaiveDate::parse_from_str(s.trim(), "%Y-%m-%d")
+        .map_err(|e| anyhow::anyhow!("invalid date literal {s:?}: {e}"))?;
+    let pg_epoch = chrono::NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+    let delta = d.signed_duration_since(pg_epoch).num_days();
+    if delta < i32::MIN as i64 || delta > i32::MAX as i64 {
+        bail!("date out of i32 range");
+    }
+    Ok(delta as i32)
+}
+
+/// `TIME 'HH:MM:SS[.fff]'` → microseconds since 00:00:00.
+pub fn parse_time_literal(s: &str) -> Result<i64> {
+    let candidates: &[&str] = &["%H:%M:%S%.f", "%H:%M:%S", "%H:%M"];
+    let t = candidates
+        .iter()
+        .find_map(|fmt| chrono::NaiveTime::parse_from_str(s.trim(), fmt).ok())
+        .ok_or_else(|| anyhow::anyhow!("invalid time literal: {s:?}"))?;
+    let micros = t.signed_duration_since(chrono::NaiveTime::MIN)
+        .num_microseconds()
+        .ok_or_else(|| anyhow::anyhow!("time out of range"))?;
+    Ok(micros)
+}
+
+/// `INTERVAL '...'` → `(months, days, micros)`. Accepts a small subset of
+/// PostgreSQL's interval syntax that covers the common cases:
+///   - `'<n> year[s]'` / `'<n> month[s]'` / `'<n> week[s]'`
+///   - `'<n> day[s]'` / `'<n> hour[s]'` / `'<n> minute[s]'` / `'<n> second[s]'`
+///   - `'<n> millisecond[s]'` / `'<n> microsecond[s]'`
+///   - HH:MM:SS form (e.g. `'12:30:00'` for 12 hours 30 minutes)
+///   - Combinations separated by spaces (`'1 day 12:00:00'`)
+/// Negative units like `'-3 days'` and ago / mixed signs are *not* supported
+/// yet; postpone to a richer interval parser when tests demand it.
+pub fn parse_interval_literal(s: &str) -> Result<(i32, i32, i64)> {
+    let mut months: i32 = 0;
+    let mut days: i32 = 0;
+    let mut micros: i64 = 0;
+    let trimmed = s.trim();
+    // Tokenise on whitespace, then walk pairs.
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    let mut i = 0;
+    while i < tokens.len() {
+        let tok = tokens[i];
+        // HH:MM:SS form?
+        if let Some(t) = parse_hms(tok) {
+            micros += t;
+            i += 1;
+            continue;
+        }
+        // <number> <unit>
+        if i + 1 >= tokens.len() {
+            bail!("interval token without unit: {tok:?}");
+        }
+        let n: i64 = tok
+            .parse()
+            .map_err(|_| anyhow::anyhow!("bad interval number: {tok:?}"))?;
+        let unit = tokens[i + 1].to_ascii_lowercase();
+        let unit = unit.trim_end_matches('s'); // plural → singular
+        match unit {
+            "year" => months += (n * 12) as i32,
+            "month" | "mon" => months += n as i32,
+            "week" => days += (n * 7) as i32,
+            "day" => days += n as i32,
+            "hour" | "hr" | "h" => micros += n * 3_600_000_000,
+            "minute" | "min" | "m" => micros += n * 60_000_000,
+            "second" | "sec" | "s" => micros += n * 1_000_000,
+            "millisecond" | "ms" => micros += n * 1_000,
+            "microsecond" | "us" => micros += n,
+            other => bail!("unknown interval unit: {other:?}"),
+        }
+        i += 2;
+    }
+    Ok((months, days, micros))
+}
+
+fn parse_hms(s: &str) -> Option<i64> {
+    // Accept `HH:MM` and `HH:MM:SS[.fff]`.
+    let parts: Vec<&str> = s.split(':').collect();
+    if parts.len() < 2 || parts.len() > 3 {
+        return None;
+    }
+    let h: i64 = parts[0].parse().ok()?;
+    let m: i64 = parts[1].parse().ok()?;
+    let mut micros = h * 3_600_000_000 + m * 60_000_000;
+    if let Some(sec_part) = parts.get(2) {
+        let sec: f64 = sec_part.parse().ok()?;
+        micros += (sec * 1_000_000.0).round() as i64;
+    }
+    Some(micros)
 }
 
 pub fn parse(sql: &str) -> Result<Statement> {

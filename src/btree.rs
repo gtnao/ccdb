@@ -61,6 +61,15 @@ pub fn encode_key(v: &Value) -> KeyBytes {
         Value::Bool(b) => vec![*b as u8],
         Value::Double(f) => f.to_le_bytes().to_vec(),
         Value::Timestamp(t) => t.to_le_bytes().to_vec(),
+        Value::Date(d) => d.to_le_bytes().to_vec(),
+        Value::Time(t) => t.to_le_bytes().to_vec(),
+        Value::Interval { months, days, micros } => {
+            let mut v = Vec::with_capacity(16);
+            v.extend_from_slice(&months.to_le_bytes());
+            v.extend_from_slice(&days.to_le_bytes());
+            v.extend_from_slice(&micros.to_le_bytes());
+            v
+        }
         Value::Null => Vec::new(),
     }
 }
@@ -95,6 +104,31 @@ pub fn decode_key(bytes: &[u8], ty: DataType) -> Result<Value> {
             }
             Ok(Value::Timestamp(i64::from_le_bytes(bytes.try_into().unwrap())))
         }
+        DataType::Date => {
+            if bytes.len() != 4 {
+                bail!("DATE key wrong length: {}", bytes.len());
+            }
+            Ok(Value::Date(i32::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        DataType::Time => {
+            if bytes.len() != 8 {
+                bail!("TIME key wrong length: {}", bytes.len());
+            }
+            Ok(Value::Time(i64::from_le_bytes(bytes.try_into().unwrap())))
+        }
+        DataType::Interval => {
+            if bytes.len() != 16 {
+                bail!("INTERVAL key wrong length: {}", bytes.len());
+            }
+            let months = i32::from_le_bytes(bytes[0..4].try_into().unwrap());
+            let days = i32::from_le_bytes(bytes[4..8].try_into().unwrap());
+            let micros = i64::from_le_bytes(bytes[8..16].try_into().unwrap());
+            Ok(Value::Interval {
+                months,
+                days,
+                micros,
+            })
+        }
     }
 }
 
@@ -114,6 +148,8 @@ pub fn compare_keys(a: &[u8], b: &[u8], ty: DataType) -> Result<Ordering> {
             Ok(x.partial_cmp(y).unwrap_or(Ordering::Equal))
         }
         (Value::Timestamp(x), Value::Timestamp(y)) => Ok(x.cmp(y)),
+        (Value::Date(x), Value::Date(y)) => Ok(x.cmp(y)),
+        (Value::Time(x), Value::Time(y)) => Ok(x.cmp(y)),
         _ => bail!("type mismatch in key comparison"),
     }
 }

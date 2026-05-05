@@ -23,6 +23,9 @@ const OID_INT4: i32 = 23;
 const OID_TEXT: i32 = 25;
 const OID_FLOAT8: i32 = 701;
 const OID_TIMESTAMP: i32 = 1114;
+const OID_DATE: i32 = 1082;
+const OID_TIME: i32 = 1083;
+const OID_INTERVAL: i32 = 1186;
 
 #[derive(Debug, Clone)]
 pub struct ColumnDesc {
@@ -65,6 +68,27 @@ impl ColumnDesc {
             name: name.to_string(),
             type_oid: OID_TIMESTAMP,
             type_size: 8,
+        }
+    }
+    pub fn date(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            type_oid: OID_DATE,
+            type_size: 4,
+        }
+    }
+    pub fn time(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            type_oid: OID_TIME,
+            type_size: 8,
+        }
+    }
+    pub fn interval(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            type_oid: OID_INTERVAL,
+            type_size: 16,
         }
     }
 }

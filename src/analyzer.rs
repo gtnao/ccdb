@@ -262,6 +262,9 @@ pub enum LiteralValue {
     Null,
     /// PG-epoch microseconds (already parsed by lexer/parser).
     Timestamp(i64),
+    Date(i32),
+    Time(i64),
+    Interval { months: i32, days: i32, micros: i64 },
 }
 
 impl AnalyzedExpr {
@@ -1053,6 +1056,20 @@ fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
             (LiteralValue::String(x), LiteralValue::String(y)) => x == y,
             (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x == y,
             (LiteralValue::Timestamp(x), LiteralValue::Timestamp(y)) => x == y,
+            (LiteralValue::Date(x), LiteralValue::Date(y)) => x == y,
+            (LiteralValue::Time(x), LiteralValue::Time(y)) => x == y,
+            (
+                LiteralValue::Interval {
+                    months: m1,
+                    days: d1,
+                    micros: u1,
+                },
+                LiteralValue::Interval {
+                    months: m2,
+                    days: d2,
+                    micros: u2,
+                },
+            ) => m1 == m2 && d1 == d2 && u1 == u2,
             (LiteralValue::Null, LiteralValue::Null) => true,
             _ => false,
         },
@@ -1137,6 +1154,26 @@ fn literal_to_analyzed(lit: &Literal) -> AnalyzedLiteral {
             value: LiteralValue::Timestamp(*t),
             data_type: Some(DataType::Timestamp),
         },
+        Literal::Date(d) => AnalyzedLiteral {
+            value: LiteralValue::Date(*d),
+            data_type: Some(DataType::Date),
+        },
+        Literal::Time(t) => AnalyzedLiteral {
+            value: LiteralValue::Time(*t),
+            data_type: Some(DataType::Time),
+        },
+        Literal::Interval {
+            months,
+            days,
+            micros,
+        } => AnalyzedLiteral {
+            value: LiteralValue::Interval {
+                months: *months,
+                days: *days,
+                micros: *micros,
+            },
+            data_type: Some(DataType::Interval),
+        },
         Literal::Boolean(b) => AnalyzedLiteral {
             value: LiteralValue::Boolean(*b),
             data_type: Some(DataType::Bool),
@@ -1154,6 +1191,9 @@ fn ast_to_runtime(dt: ast::DataType) -> DataType {
         ast::DataType::Varchar => DataType::Varchar,
         ast::DataType::Double => DataType::Double,
         ast::DataType::Timestamp => DataType::Timestamp,
+        ast::DataType::Date => DataType::Date,
+        ast::DataType::Time => DataType::Time,
+        ast::DataType::Interval => DataType::Interval,
     }
 }
 

@@ -615,6 +615,34 @@ fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
             .partial_cmp(&(*y as f64))
             .unwrap_or(std::cmp::Ordering::Equal)),
         (Value::Timestamp(x), Value::Timestamp(y)) => Ok(x.cmp(y)),
+        (Value::Date(x), Value::Date(y)) => Ok(x.cmp(y)),
+        (Value::Time(x), Value::Time(y)) => Ok(x.cmp(y)),
+        // Intervals don't have a total order in general (1 month vs 30 days
+        // depends on context), but for sort stability we order by the rough
+        // total micros = months*30d + days*1d + micros. This is approximate
+        // — PostgreSQL does the same by convention.
+        (
+            Value::Interval {
+                months: m1,
+                days: d1,
+                micros: u1,
+            },
+            Value::Interval {
+                months: m2,
+                days: d2,
+                micros: u2,
+            },
+        ) => {
+            const D_PER_MONTH: i64 = 30;
+            const US_PER_DAY: i64 = 86_400_000_000;
+            let total1 = (*m1 as i64) * D_PER_MONTH * US_PER_DAY
+                + (*d1 as i64) * US_PER_DAY
+                + u1;
+            let total2 = (*m2 as i64) * D_PER_MONTH * US_PER_DAY
+                + (*d2 as i64) * US_PER_DAY
+                + u2;
+            Ok(total1.cmp(&total2))
+        }
         _ => bail!("cannot compare {a:?} and {b:?}"),
     }
 }
@@ -895,6 +923,17 @@ fn literal_to_value(lit: &AnalyzedLiteral) -> Value {
         LiteralValue::String(s) => Value::Varchar(s.clone()),
         LiteralValue::Boolean(b) => Value::Bool(*b),
         LiteralValue::Timestamp(t) => Value::Timestamp(*t),
+        LiteralValue::Date(d) => Value::Date(*d),
+        LiteralValue::Time(t) => Value::Time(*t),
+        LiteralValue::Interval {
+            months,
+            days,
+            micros,
+        } => Value::Interval {
+            months: *months,
+            days: *days,
+            micros: *micros,
+        },
         LiteralValue::Null => Value::Null,
     }
 }
@@ -982,6 +1021,24 @@ fn evaluate_binary(op: BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
             // INTERVAL arithmetic comes in Phase 1-3.
             _ => bail!("unsupported op {op:?} on TIMESTAMP"),
         }),
+        (Value::Date(a), Value::Date(b)) => Ok(match op {
+            Eq => Value::Bool(a == b),
+            Ne => Value::Bool(a != b),
+            Lt => Value::Bool(a < b),
+            Le => Value::Bool(a <= b),
+            Gt => Value::Bool(a > b),
+            Ge => Value::Bool(a >= b),
+            _ => bail!("unsupported op {op:?} on DATE"),
+        }),
+        (Value::Time(a), Value::Time(b)) => Ok(match op {
+            Eq => Value::Bool(a == b),
+            Ne => Value::Bool(a != b),
+            Lt => Value::Bool(a < b),
+            Le => Value::Bool(a <= b),
+            Gt => Value::Bool(a > b),
+            Ge => Value::Bool(a >= b),
+            _ => bail!("unsupported op {op:?} on TIME"),
+        }),
         _ => bail!("type mismatch in binary op {op:?}"),
     }
 }
@@ -1007,8 +1064,8 @@ fn perform_create_table(
     tx: &mut Transaction,
 ) -> Result<()> {
     use crate::bootstrap::{
-        DT_BOOL, DT_DOUBLE, DT_INT, DT_TIMESTAMP, DT_VARCHAR, PG_ATTRIBUTE_PAGE_ID,
-        PG_CLASS_PAGE_ID,
+        DT_BOOL, DT_DATE, DT_DOUBLE, DT_INT, DT_INTERVAL, DT_TIME, DT_TIMESTAMP, DT_VARCHAR,
+        PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID,
     };
 
     // Pick a fresh table_id (max existing + 1). Catalog scan is enough at
@@ -1047,6 +1104,9 @@ fn perform_create_table(
             crate::tuple::DataType::Bool => DT_BOOL,
             crate::tuple::DataType::Double => DT_DOUBLE,
             crate::tuple::DataType::Timestamp => DT_TIMESTAMP,
+            crate::tuple::DataType::Date => DT_DATE,
+            crate::tuple::DataType::Time => DT_TIME,
+            crate::tuple::DataType::Interval => DT_INTERVAL,
         };
         let row = serialize_tuple_mvcc(
             tx.id(),

@@ -613,6 +613,9 @@ fn column_desc_for(item: &AnalyzedSelectItem) -> ColumnDesc {
         Some(DataType::Bool) => ColumnDesc::bool(&name),
         Some(DataType::Double) => ColumnDesc::double(&name),
         Some(DataType::Timestamp) => ColumnDesc::timestamp(&name),
+        Some(DataType::Date) => ColumnDesc::date(&name),
+        Some(DataType::Time) => ColumnDesc::time(&name),
+        Some(DataType::Interval) => ColumnDesc::interval(&name),
         // NULL literal without column context — Postgres convention is "text".
         None => ColumnDesc::varchar(&name),
     }
@@ -633,6 +636,9 @@ fn value_to_text(v: &Value) -> Option<String> {
         Value::Bool(b) => Some(if *b { "t" } else { "f" }.to_string()),
         Value::Double(f) => Some(format_double(*f)),
         Value::Timestamp(t) => Some(format_timestamp(*t)),
+        Value::Date(d) => Some(format_date(*d)),
+        Value::Time(t) => Some(format_time(*t)),
+        Value::Interval { months, days, micros } => Some(format_interval(*months, *days, *micros)),
         Value::Null => None,
     }
 }
@@ -669,6 +675,60 @@ fn format_timestamp(micros: i64) -> String {
         // Use chrono's %.f which trims trailing zeros automatically.
         dt.format("%Y-%m-%d %H:%M:%S%.f").to_string()
     }
+}
+
+/// Format a DATE (days since PG epoch 2000-01-01) as `YYYY-MM-DD`.
+fn format_date(days: i32) -> String {
+    use chrono::{Duration, NaiveDate};
+    let epoch = NaiveDate::from_ymd_opt(2000, 1, 1).unwrap();
+    let d = epoch + Duration::days(days as i64);
+    d.format("%Y-%m-%d").to_string()
+}
+
+/// Format a TIME (μs since 00:00:00) as `HH:MM:SS[.f]`.
+fn format_time(micros: i64) -> String {
+    use chrono::{Duration, NaiveTime};
+    let t = NaiveTime::MIN + Duration::microseconds(micros);
+    let frac = micros.rem_euclid(1_000_000);
+    if frac == 0 {
+        t.format("%H:%M:%S").to_string()
+    } else {
+        t.format("%H:%M:%S%.f").to_string()
+    }
+}
+
+/// Format an INTERVAL using PostgreSQL's default verbose form
+/// (`'1 year 2 mons 3 days 04:05:06'`). Components that are zero are
+/// omitted; an all-zero interval is rendered as `'00:00:00'` to mirror PG.
+fn format_interval(months: i32, days: i32, micros: i64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let years = months / 12;
+    let mons = months % 12;
+    if years != 0 {
+        parts.push(format!("{years} year{}", if years.abs() == 1 { "" } else { "s" }));
+    }
+    if mons != 0 {
+        parts.push(format!("{mons} mon{}", if mons.abs() == 1 { "" } else { "s" }));
+    }
+    if days != 0 {
+        parts.push(format!("{days} day{}", if days.abs() == 1 { "" } else { "s" }));
+    }
+    if micros != 0 || parts.is_empty() {
+        let total_secs = micros / 1_000_000;
+        let h = total_secs / 3600;
+        let m = (total_secs % 3600) / 60;
+        let s = total_secs % 60;
+        let frac = micros.rem_euclid(1_000_000);
+        if frac == 0 {
+            parts.push(format!("{h:02}:{m:02}:{s:02}"));
+        } else {
+            // Trim trailing zeros from the fractional part.
+            let frac_str = format!("{frac:06}");
+            let trimmed = frac_str.trim_end_matches('0');
+            parts.push(format!("{h:02}:{m:02}:{s:02}.{trimmed}"));
+        }
+    }
+    parts.join(" ")
 }
 
 #[cfg(test)]

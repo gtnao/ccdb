@@ -128,6 +128,9 @@ pub enum DataType {
     Varchar,
     Double,
     Timestamp,
+    Date,
+    Time,
+    Interval,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -179,6 +182,12 @@ pub enum Literal {
     Null,
     /// `TIMESTAMP '2024-01-01 12:34:56'` — already parsed to PG epoch microseconds.
     Timestamp(i64),
+    /// `DATE 'YYYY-MM-DD'` — already parsed to days since PG epoch.
+    Date(i32),
+    /// `TIME 'HH:MM:SS[.f]'` — μs since 00:00:00.
+    Time(i64),
+    /// `INTERVAL '...'` — already parsed to (months, days, micros).
+    Interval { months: i32, days: i32, micros: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
