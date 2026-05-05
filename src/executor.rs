@@ -9,8 +9,9 @@ use anyhow::{Result, bail};
 
 use crate::analyzer::{
     AggArg, AggKind, AnalyzedAggregate, AnalyzedCreateIndexStatement, AnalyzedDeleteStatement,
-    AnalyzedExpr, AnalyzedFrom, AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedOrderBy,
-    AnalyzedSelectStatement, AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue,
+    AnalyzedDropIndexStatement, AnalyzedDropTableStatement, AnalyzedExpr, AnalyzedFrom,
+    AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedOrderBy, AnalyzedSelectStatement,
+    AnalyzedStatement, AnalyzedTruncateStatement, AnalyzedUpdateStatement, LiteralValue,
     TableSource,
 };
 use crate::ast::{BinaryOperator, JoinType, OrderDir, UnaryOperator};
@@ -1481,6 +1482,218 @@ fn perform_create_index(
     Ok(())
 }
 
+/// `DROP TABLE` — tombstone the catalog rows for the table and its indexes.
+/// Heap pages and index pages become orphaned; VACUUM reclaims them later.
+fn perform_drop_table(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    catalog: &Catalog,
+    stmt: &AnalyzedDropTableStatement,
+    tx: &mut Transaction,
+) -> Result<()> {
+    use crate::bootstrap::{PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID, PG_INDEX_PAGE_ID};
+    for (table_id, _name) in &stmt.tables {
+        // Tombstone pg_class row(s) for this table.
+        tombstone_catalog_rows(bpm, wal, tx, PG_CLASS_PAGE_ID, |vals| {
+            matches!(&vals[0], Value::Int(n) if *n as usize == *table_id)
+        })?;
+        // Tombstone every pg_attribute row for the table.
+        tombstone_catalog_rows(bpm, wal, tx, PG_ATTRIBUTE_PAGE_ID, |vals| {
+            matches!(&vals[0], Value::Int(n) if *n as usize == *table_id)
+        })?;
+        // Tombstone every pg_index row that points at the table.
+        tombstone_catalog_rows(bpm, wal, tx, PG_INDEX_PAGE_ID, |vals| {
+            matches!(&vals[2], Value::Int(n) if *n as usize == *table_id)
+        })?;
+    }
+    Ok(())
+}
+
+/// `DROP INDEX` — tombstone the pg_index row.
+fn perform_drop_index(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    _catalog: &Catalog,
+    stmt: &AnalyzedDropIndexStatement,
+    tx: &mut Transaction,
+) -> Result<()> {
+    use crate::bootstrap::PG_INDEX_PAGE_ID;
+    if stmt.index_id == usize::MAX {
+        return Ok(()); // IF EXISTS on missing
+    }
+    let idx_id = stmt.index_id;
+    tombstone_catalog_rows(bpm, wal, tx, PG_INDEX_PAGE_ID, |vals| {
+        matches!(&vals[0], Value::Int(n) if *n as usize == idx_id)
+    })?;
+    Ok(())
+}
+
+/// `TRUNCATE TABLE` — install a fresh empty heap page for each target,
+/// orphaning the prior chain (cleaned by VACUUM). Indexes are also reset.
+/// Returns the number of tables truncated.
+fn perform_truncate(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    catalog: &Catalog,
+    stmt: &AnalyzedTruncateStatement,
+    tx: &mut Transaction,
+) -> Result<usize> {
+    use crate::bootstrap::{PG_CLASS_PAGE_ID, PG_INDEX_PAGE_ID};
+    use crate::catalog::{pg_class_schema, pg_index_schema};
+    for (table_id, _) in &stmt.tables {
+        let table_id = *table_id;
+        // Allocate a fresh empty heap page and patch pg_class.first_page_id.
+        let new_page_id = {
+            let g = bpm.new_page()?;
+            g.page_id()
+        };
+        rewrite_catalog_row(
+            bpm,
+            wal,
+            tx,
+            PG_CLASS_PAGE_ID,
+            &pg_class_schema(),
+            |vals| matches!(&vals[0], Value::Int(n) if *n as usize == table_id),
+            |vals| {
+                let mut v = vals.to_vec();
+                v[2] = Value::Int(new_page_id as i32);
+                v
+            },
+        )?;
+        // Reset every index on the table to a fresh empty leaf.
+        for idx in catalog.indexes_for_table(table_id)? {
+            let new_root = crate::btree::new_empty_root(bpm)?;
+            let id = idx.index_id;
+            rewrite_catalog_row(
+                bpm,
+                wal,
+                tx,
+                PG_INDEX_PAGE_ID,
+                &pg_index_schema(),
+                |vals| matches!(&vals[0], Value::Int(n) if *n as usize == id),
+                |vals| {
+                    let mut v = vals.to_vec();
+                    v[4] = Value::Int(new_root as i32);
+                    v
+                },
+            )?;
+        }
+    }
+    Ok(stmt.tables.len())
+}
+
+/// Walk a catalog page chain; for every visible row whose values satisfy
+/// `pred`, mark it deleted (xmax = current tx) and write a Delete WAL record.
+/// Used by DROP TABLE / DROP INDEX to remove catalog entries logically.
+fn tombstone_catalog_rows(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tx: &mut Transaction,
+    first_page: PageId,
+    pred: impl Fn(&[Value]) -> bool,
+) -> Result<()> {
+    use crate::catalog::{pg_attribute_schema, pg_class_schema, pg_index_schema};
+    use crate::bootstrap::{PG_ATTRIBUTE_PAGE_ID, PG_CLASS_PAGE_ID, PG_INDEX_PAGE_ID};
+    let schema = match first_page {
+        PG_CLASS_PAGE_ID => pg_class_schema(),
+        PG_ATTRIBUTE_PAGE_ID => pg_attribute_schema(),
+        PG_INDEX_PAGE_ID => pg_index_schema(),
+        _ => bail!("tombstone_catalog_rows: unknown catalog page {first_page}"),
+    };
+    let mut victims: Vec<(PageId, SlotId)> = Vec::new();
+    let mut cur = first_page;
+    while cur != crate::page::NO_NEXT_PAGE && cur < bpm.page_count() {
+        let g = bpm.fetch_page(cur)?;
+        let p = g.read();
+        let next = p.next_page_id();
+        for slot in 0..p.tuple_count() {
+            if let Some(raw) = p.get_tuple(slot) {
+                let (_, xmax, vals) = deserialize_tuple_mvcc(raw, &schema)?;
+                if xmax == 0 && pred(&vals) {
+                    victims.push((cur, slot));
+                }
+            }
+        }
+        drop(p);
+        drop(g);
+        cur = next;
+    }
+    for (pid, slot) in victims {
+        let g = bpm.fetch_page(pid)?;
+        let mut p = g.write();
+        p.set_tuple_xmax(slot, tx.id())?;
+        let lsn = log_record(
+            wal,
+            tx,
+            WalRecordType::Delete {
+                rid: (pid, slot),
+                xmax: tx.id(),
+            },
+        )?;
+        p.set_page_lsn(lsn);
+    }
+    Ok(())
+}
+
+/// Replace the matching catalog row with a freshly-built one. Used by
+/// TRUNCATE to swap out first_page_id and root_page_id pointers without
+/// affecting the table_id / name. The old row is tombstoned so concurrent
+/// readers under MVCC continue to see the prior version until commit.
+fn rewrite_catalog_row(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tx: &mut Transaction,
+    first_page: PageId,
+    schema: &Schema,
+    pred: impl Fn(&[Value]) -> bool,
+    transform: impl Fn(&[Value]) -> Vec<Value>,
+) -> Result<()> {
+    let mut found: Option<(PageId, SlotId, Vec<Value>)> = None;
+    let mut cur = first_page;
+    while cur != crate::page::NO_NEXT_PAGE && cur < bpm.page_count() {
+        let g = bpm.fetch_page(cur)?;
+        let p = g.read();
+        let next = p.next_page_id();
+        for slot in 0..p.tuple_count() {
+            if let Some(raw) = p.get_tuple(slot) {
+                let (_, xmax, vals) = deserialize_tuple_mvcc(raw, schema)?;
+                if xmax == 0 && pred(&vals) {
+                    found = Some((cur, slot, vals));
+                    break;
+                }
+            }
+        }
+        if found.is_some() {
+            break;
+        }
+        drop(p);
+        drop(g);
+        cur = next;
+    }
+    let (page_id, slot, old_vals) = found
+        .ok_or_else(|| anyhow::anyhow!("rewrite_catalog_row: matching row not found"))?;
+    // Tombstone the old row.
+    {
+        let g = bpm.fetch_page(page_id)?;
+        let mut p = g.write();
+        p.set_tuple_xmax(slot, tx.id())?;
+        let lsn = log_record(
+            wal,
+            tx,
+            WalRecordType::Delete {
+                rid: (page_id, slot),
+                xmax: tx.id(),
+            },
+        )?;
+        p.set_page_lsn(lsn);
+    }
+    // Insert the rewritten one (system-txn xmin to keep visible across recoveries).
+    let new_vals = transform(&old_vals);
+    let bytes = serialize_tuple_mvcc(crate::bootstrap::SYSTEM_TXN_ID, INVALID_TXN_ID, &new_vals);
+    insert_bytes(bpm, wal, tx, first_page, &bytes)?;
+    Ok(())
+}
+
 fn perform_insert(
     bpm: &BufferPool,
     lm: &LockManager,
@@ -1991,6 +2204,23 @@ pub fn execute(
             perform_create_index(bpm, wal, catalog, s, tx)?;
             Ok(Output::Affected(0))
         }
+        AnalyzedStatement::AlterTableAddIndex(s) => {
+            // ALTER TABLE ... ADD PRIMARY KEY / UNIQUE — currently the same
+            // as CREATE INDEX (no uniqueness enforcement until Phase 4).
+            perform_create_index(bpm, wal, catalog, s, tx)?;
+            Ok(Output::Affected(0))
+        }
+        AnalyzedStatement::DropTable(s) => {
+            perform_drop_table(bpm, wal, catalog, s, tx)?;
+            Ok(Output::Affected(0))
+        }
+        AnalyzedStatement::DropIndex(s) => {
+            perform_drop_index(bpm, wal, catalog, s, tx)?;
+            Ok(Output::Affected(0))
+        }
+        AnalyzedStatement::Truncate(s) => Ok(Output::Affected(perform_truncate(
+            bpm, wal, catalog, s, tx,
+        )?)),
         AnalyzedStatement::Checkpoint => {
             // Handled at the connection layer (instance.rs) — has access to
             // the global ATT and DPT, which the executor doesn't.

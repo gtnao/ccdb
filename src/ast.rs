@@ -8,6 +8,10 @@ pub enum Statement {
     Update(UpdateStatement),
     CreateTable(CreateTableStatement),
     CreateIndex(CreateIndexStatement),
+    DropTable(DropTableStatement),
+    DropIndex(DropIndexStatement),
+    TruncateTable(TruncateStatement),
+    AlterTable(AlterTableStatement),
     Begin,
     Commit,
     Rollback,
@@ -116,6 +120,43 @@ pub struct CreateIndexStatement {
     pub name: String,
     pub table: String,
     pub column: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropTableStatement {
+    pub tables: Vec<String>,
+    pub if_exists: bool,
+    /// CASCADE/RESTRICT — currently only parsed; nothing depends on tables
+    /// in a way that CASCADE would need to remove. Recorded so syntactic
+    /// completeness is preserved.
+    pub cascade: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndexStatement {
+    pub name: String,
+    pub if_exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TruncateStatement {
+    pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTableStatement {
+    pub table: String,
+    pub action: AlterTableAction,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterTableAction {
+    /// `ADD [CONSTRAINT name] PRIMARY KEY (col, ...)` — currently single-column.
+    /// Constraint enforcement is Phase 4; this commit just creates a B+Tree
+    /// index on the column.
+    AddPrimaryKey { columns: Vec<String> },
+    /// `ADD [CONSTRAINT name] UNIQUE (col, ...)` — same caveat.
+    AddUnique { columns: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq)]

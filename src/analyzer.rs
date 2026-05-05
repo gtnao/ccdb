@@ -14,9 +14,10 @@ use std::mem;
 use anyhow::{Result, bail};
 
 use crate::ast::{
-    self, BinaryOperator, CreateIndexStatement, CreateTableStatement, DeleteStatement, Expr,
+    self, AlterTableAction, AlterTableStatement, BinaryOperator, CreateIndexStatement,
+    CreateTableStatement, DeleteStatement, DropIndexStatement, DropTableStatement, Expr,
     FromClause, FuncArgs, InsertStatement, JoinType, Literal, OrderDir, SelectColumn,
-    SelectStatement, Statement, TableRef, UnaryOperator, UpdateStatement,
+    SelectStatement, Statement, TableRef, TruncateStatement, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -54,6 +55,10 @@ pub enum AnalyzedStatement {
     Update(AnalyzedUpdateStatement),
     CreateTable(AnalyzedCreateTableStatement),
     CreateIndex(AnalyzedCreateIndexStatement),
+    DropTable(AnalyzedDropTableStatement),
+    DropIndex(AnalyzedDropIndexStatement),
+    Truncate(AnalyzedTruncateStatement),
+    AlterTableAddIndex(AnalyzedCreateIndexStatement),
     Begin,
     Commit,
     Rollback,
@@ -209,6 +214,25 @@ pub struct AnalyzedCreateIndexStatement {
     pub column_index: usize,
     pub column_name: String,
     pub data_type: DataType,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedDropTableStatement {
+    /// Resolved (table_id, name) pairs; only includes tables that actually
+    /// existed (the rest were silently skipped under IF EXISTS).
+    pub tables: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedDropIndexStatement {
+    pub index_id: usize,
+    pub name: String,
+    pub table_id: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedTruncateStatement {
+    pub tables: Vec<(usize, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -947,6 +971,91 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_drop_table(
+        &self,
+        s: &DropTableStatement,
+    ) -> Result<AnalyzedDropTableStatement> {
+        let mut tables = Vec::new();
+        for name in &s.tables {
+            match self.catalog.find_table(name)? {
+                Some((id, _)) => tables.push((id, name.clone())),
+                None if s.if_exists => continue,
+                None => bail!("table '{name}' not found"),
+            }
+        }
+        Ok(AnalyzedDropTableStatement { tables })
+    }
+
+    fn analyze_drop_index(
+        &self,
+        s: &DropIndexStatement,
+    ) -> Result<Option<AnalyzedDropIndexStatement>> {
+        match self.catalog.find_index(&s.name)? {
+            Some(idx) => Ok(Some(AnalyzedDropIndexStatement {
+                index_id: idx.index_id,
+                name: idx.name,
+                table_id: idx.table_id,
+            })),
+            None if s.if_exists => Ok(None),
+            None => bail!("index '{}' not found", s.name),
+        }
+    }
+
+    fn analyze_truncate(&self, s: &TruncateStatement) -> Result<AnalyzedTruncateStatement> {
+        let mut tables = Vec::new();
+        for name in &s.tables {
+            let (id, _) = self
+                .catalog
+                .find_table(name)?
+                .ok_or_else(|| anyhow::anyhow!("table '{name}' not found"))?;
+            tables.push((id, name.clone()));
+        }
+        Ok(AnalyzedTruncateStatement { tables })
+    }
+
+    /// `ALTER TABLE ... ADD PRIMARY KEY/UNIQUE (col)` reuses CREATE INDEX
+    /// machinery (Phase 4 will add the uniqueness enforcement).
+    fn analyze_alter_table(
+        &self,
+        s: &AlterTableStatement,
+    ) -> Result<AnalyzedCreateIndexStatement> {
+        let (table_id, table) = self
+            .catalog
+            .find_table(&s.table)?
+            .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
+        let columns = match &s.action {
+            AlterTableAction::AddPrimaryKey { columns } => columns,
+            AlterTableAction::AddUnique { columns } => columns,
+        };
+        if columns.len() != 1 {
+            bail!("multi-column constraints not supported yet");
+        }
+        let col_name = &columns[0];
+        let (col_idx, col) = table
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, c)| c.name == *col_name)
+            .ok_or_else(|| anyhow::anyhow!("column '{col_name}' not found"))?;
+        // Auto-name: `<table>_<col>_pkey` mirrors PG.
+        let kind = match s.action {
+            AlterTableAction::AddPrimaryKey { .. } => "pkey",
+            AlterTableAction::AddUnique { .. } => "key",
+        };
+        let auto_name = format!("{}_{}_{}", s.table, col_name, kind);
+        if self.catalog.find_index(&auto_name)?.is_some() {
+            bail!("index '{auto_name}' already exists");
+        }
+        Ok(AnalyzedCreateIndexStatement {
+            name: auto_name,
+            table_id,
+            table_name: s.table.clone(),
+            column_index: col_idx,
+            column_name: col.name.clone(),
+            data_type: col.data_type,
+        })
+    }
+
     fn analyze_create_index(
         &self,
         s: &CreateIndexStatement,
@@ -1292,6 +1401,20 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
         Statement::Update(s) => AnalyzedStatement::Update(a.analyze_update(s)?),
         Statement::CreateTable(s) => AnalyzedStatement::CreateTable(a.analyze_create_table(s)?),
         Statement::CreateIndex(s) => AnalyzedStatement::CreateIndex(a.analyze_create_index(s)?),
+        Statement::DropTable(s) => AnalyzedStatement::DropTable(a.analyze_drop_table(s)?),
+        Statement::DropIndex(s) => match a.analyze_drop_index(s)? {
+            Some(d) => AnalyzedStatement::DropIndex(d),
+            // IF EXISTS on a missing index → emit empty drop so executor no-ops.
+            None => AnalyzedStatement::DropIndex(AnalyzedDropIndexStatement {
+                index_id: usize::MAX,
+                name: s.name.clone(),
+                table_id: usize::MAX,
+            }),
+        },
+        Statement::TruncateTable(s) => AnalyzedStatement::Truncate(a.analyze_truncate(s)?),
+        Statement::AlterTable(s) => {
+            AnalyzedStatement::AlterTableAddIndex(a.analyze_alter_table(s)?)
+        }
         Statement::Begin => AnalyzedStatement::Begin,
         Statement::Commit => AnalyzedStatement::Commit,
         Statement::Rollback => AnalyzedStatement::Rollback,

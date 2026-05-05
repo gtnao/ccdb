@@ -465,9 +465,21 @@ fn run_query_with_options(
             execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("CREATE TABLE")?;
         }
-        AnalyzedStatement::CreateIndex(_) => {
+        AnalyzedStatement::CreateIndex(_) | AnalyzedStatement::AlterTableAddIndex(_) => {
             execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("CREATE INDEX")?;
+        }
+        AnalyzedStatement::DropTable(_) => {
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("DROP TABLE")?;
+        }
+        AnalyzedStatement::DropIndex(_) => {
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("DROP INDEX")?;
+        }
+        AnalyzedStatement::Truncate(_) => {
+            let n = expect_affected(execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?)?;
+            conn.send_command_complete(&format!("TRUNCATE TABLE {n}"))?;
         }
     }
     Ok(())

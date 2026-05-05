@@ -38,6 +38,9 @@ impl Parser {
             Some(Token::Delete) => self.parse_delete()?,
             Some(Token::Update) => self.parse_update()?,
             Some(Token::Create) => self.parse_create_table()?,
+            Some(Token::Drop) => self.parse_drop()?,
+            Some(Token::Truncate) => self.parse_truncate()?,
+            Some(Token::Alter) => self.parse_alter()?,
             Some(Token::Begin) => {
                 self.bump();
                 Statement::Begin
@@ -329,6 +332,135 @@ impl Parser {
             table,
             columns,
         }))
+    }
+
+    /// `DROP TABLE [IF EXISTS] name [, name, ...] [CASCADE | RESTRICT]`
+    /// or `DROP INDEX [IF EXISTS] name`.
+    fn parse_drop(&mut self) -> Result<Statement> {
+        self.expect(&Token::Drop)?;
+        match self.peek() {
+            Some(Token::Table) => {
+                self.bump();
+                let if_exists = if matches!(self.peek(), Some(Token::If)) {
+                    self.bump();
+                    self.expect(&Token::Exists)?;
+                    true
+                } else {
+                    false
+                };
+                let mut tables = vec![self.parse_ident()?];
+                while matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    tables.push(self.parse_ident()?);
+                }
+                let cascade = match self.peek() {
+                    Some(Token::Cascade) => {
+                        self.bump();
+                        true
+                    }
+                    Some(Token::Restrict) => {
+                        self.bump();
+                        false
+                    }
+                    _ => false,
+                };
+                Ok(Statement::DropTable(DropTableStatement {
+                    tables,
+                    if_exists,
+                    cascade,
+                }))
+            }
+            Some(Token::Index) => {
+                self.bump();
+                let if_exists = if matches!(self.peek(), Some(Token::If)) {
+                    self.bump();
+                    self.expect(&Token::Not)?;
+                    self.expect(&Token::Exists)?;
+                    true
+                } else {
+                    false
+                };
+                let name = self.parse_ident()?;
+                Ok(Statement::DropIndex(DropIndexStatement { name, if_exists }))
+            }
+            other => bail!("expected TABLE or INDEX after DROP, got {other:?}"),
+        }
+    }
+
+    /// `TRUNCATE [TABLE] name [, name, ...]`.
+    fn parse_truncate(&mut self) -> Result<Statement> {
+        self.expect(&Token::Truncate)?;
+        if matches!(self.peek(), Some(Token::Table)) {
+            self.bump();
+        }
+        let mut tables = vec![self.parse_ident()?];
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.bump();
+            tables.push(self.parse_ident()?);
+        }
+        Ok(Statement::TruncateTable(TruncateStatement { tables }))
+    }
+
+    /// `ALTER TABLE name <action>`.
+    fn parse_alter(&mut self) -> Result<Statement> {
+        self.expect(&Token::Alter)?;
+        self.expect(&Token::Table)?;
+        let table = self.parse_ident()?;
+        // Only ADD CONSTRAINT / ADD PRIMARY KEY / ADD UNIQUE supported.
+        // ADD/DROP/RENAME COLUMN is deferred (storage layout migration).
+        if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("ADD"))
+            || matches!(self.peek(), Some(Token::Ident(_)))
+        {
+            // We use Ident("ADD") rather than a keyword for simplicity; the
+            // parser already keeps ADD as Ident.
+            let kw = self.parse_ident()?;
+            if !kw.eq_ignore_ascii_case("ADD") {
+                bail!("ALTER TABLE: expected ADD, got {kw:?}");
+            }
+            // Optional CONSTRAINT <name>.
+            if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("CONSTRAINT"))
+            {
+                self.bump();
+                let _name = self.parse_ident()?; // name is recorded in pg_constraint later
+            }
+            match self.peek() {
+                Some(Token::Primary) => {
+                    self.bump();
+                    self.expect(&Token::Key)?;
+                    self.expect(&Token::LParen)?;
+                    let columns = self.parse_ident_list()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Statement::AlterTable(AlterTableStatement {
+                        table,
+                        action: AlterTableAction::AddPrimaryKey { columns },
+                    }))
+                }
+                Some(tok) if matches!(tok, Token::Ident(s) if s.eq_ignore_ascii_case("UNIQUE")) => {
+                    self.bump();
+                    self.expect(&Token::LParen)?;
+                    let columns = self.parse_ident_list()?;
+                    self.expect(&Token::RParen)?;
+                    Ok(Statement::AlterTable(AlterTableStatement {
+                        table,
+                        action: AlterTableAction::AddUnique { columns },
+                    }))
+                }
+                other => bail!(
+                    "ALTER TABLE ADD: expected PRIMARY KEY or UNIQUE, got {other:?}"
+                ),
+            }
+        } else {
+            bail!("ALTER TABLE: only ADD ... is supported")
+        }
+    }
+
+    fn parse_ident_list(&mut self) -> Result<Vec<String>> {
+        let mut out = vec![self.parse_ident()?];
+        while matches!(self.peek(), Some(Token::Comma)) {
+            self.bump();
+            out.push(self.parse_ident()?);
+        }
+        Ok(out)
     }
 
     /// `CREATE INDEX <name> ON <table> (<col>)` — currently single-column only.
