@@ -940,14 +940,14 @@ fn perform_insert(
     let table = catalog
         .table_by_id(stmt.table_id)?
         .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
+    // Empty tuple for evaluating constant expressions in VALUES (no column
+    // refs allowed — those would be caught earlier).
+    let empty = Tuple::new(Vec::new());
     let mut count = 0;
     for row in &stmt.rows {
         let raw: Vec<Value> = row
             .iter()
-            .map(|e| match e {
-                AnalyzedExpr::Literal(lit) => Ok(literal_to_value(lit)),
-                _ => bail!("INSERT VALUES must be literals (no exprs yet)"),
-            })
+            .map(|e| evaluate_expr(e, &empty))
             .collect::<Result<_>>()?;
         // Coerce values to the column's storage type. The analyzer accepts INT
         // values for DOUBLE columns; the storage layer needs the exact width.

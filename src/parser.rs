@@ -226,6 +226,13 @@ impl Parser {
             return self.parse_create_index_noop();
         }
         self.expect(&Token::Table)?;
+        // Optional `IF NOT EXISTS` — accepted but not enforced. Re-creating
+        // an existing table will still fail in analyze_create_table.
+        if matches!(self.peek(), Some(Token::If)) {
+            self.bump();
+            self.expect(&Token::Not)?;
+            self.expect(&Token::Exists)?;
+        }
         let table = self.parse_ident()?;
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
@@ -525,6 +532,43 @@ impl Parser {
             return Ok(Expr::IsNull {
                 expr: Box::new(left),
                 negated,
+            });
+        }
+        // `expr IN (a, b, c)` — desugar to `expr=a OR expr=b OR expr=c`.
+        // `expr NOT IN (...)` wraps the result in a NOT.
+        if matches!(self.peek(), Some(Token::In))
+            || (matches!(self.peek(), Some(Token::Not))
+                && matches!(self.tokens.get(self.pos + 1), Some(Token::In)))
+        {
+            let negated = if matches!(self.peek(), Some(Token::Not)) {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            self.bump(); // IN
+            self.expect(&Token::LParen)?;
+            let mut items = vec![self.parse_expr()?];
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                items.push(self.parse_expr()?);
+            }
+            self.expect(&Token::RParen)?;
+            // Build a left-folded OR chain: ((lhs=a OR lhs=b) OR lhs=c).
+            let mut iter = items.into_iter();
+            let first = iter.next().expect("IN list non-empty");
+            let mut acc = bin(left.clone(), BinaryOperator::Eq, first);
+            for v in iter {
+                let eq = bin(left.clone(), BinaryOperator::Eq, v);
+                acc = bin(acc, BinaryOperator::Or, eq);
+            }
+            return Ok(if negated {
+                Expr::UnaryOp {
+                    op: UnaryOperator::Not,
+                    expr: Box::new(acc),
+                }
+            } else {
+                acc
             });
         }
         // `expr BETWEEN low AND high` — desugar to `expr >= low AND expr <= high`.

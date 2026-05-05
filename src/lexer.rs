@@ -47,6 +47,9 @@ pub enum Token {
     Index,
     Between,
     Distinct,
+    In,
+    If,
+    Exists,
 
     // Identifiers and literals
     Ident(String),
@@ -270,6 +273,9 @@ impl Lexer {
             "INDEX" => Token::Index,
             "BETWEEN" => Token::Between,
             "DISTINCT" => Token::Distinct,
+            "IN" => Token::In,
+            "IF" => Token::If,
+            "EXISTS" => Token::Exists,
             _ => Token::Ident(s),
         }
     }
