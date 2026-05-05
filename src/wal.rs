@@ -69,6 +69,16 @@ pub enum WalRecordType {
         seq_page_id: PageId,
         new_last_value: i64,
     },
+    /// A page's structural identity changed — its `page_kind` byte was
+    /// rewritten, typically when a freshly allocated page is converted
+    /// into a B+Tree leaf or a sequence relation. Recovery's redo
+    /// re-applies this so the on-disk image of a never-flushed page can
+    /// be reconstructed without forcing a sync at allocation time.
+    /// Encoded `kind` values match `PageKind` u8 repr.
+    PageInit {
+        page_id: PageId,
+        kind: u8,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -87,6 +97,7 @@ const TAG_CLR: u8 = 5;
 const TAG_CHECKPOINT: u8 = 6;
 const TAG_INDEX_INSERT: u8 = 7;
 const TAG_SEQ_ADVANCE: u8 = 8;
+const TAG_PAGE_INIT: u8 = 9;
 
 const CLR_UNDO_INSERT: u8 = 0;
 const CLR_UNDO_DELETE: u8 = 1;
@@ -158,6 +169,11 @@ impl WalRecord {
                 buf.push(TAG_SEQ_ADVANCE);
                 buf.extend_from_slice(&seq_page_id.to_le_bytes());
                 buf.extend_from_slice(&new_last_value.to_le_bytes());
+            }
+            WalRecordType::PageInit { page_id, kind } => {
+                buf.push(TAG_PAGE_INIT);
+                buf.extend_from_slice(&page_id.to_le_bytes());
+                buf.push(*kind);
             }
             WalRecordType::Checkpoint { att, dpt } => {
                 buf.push(TAG_CHECKPOINT);
@@ -276,6 +292,14 @@ impl WalRecord {
                     seq_page_id,
                     new_last_value,
                 }
+            }
+            TAG_PAGE_INIT => {
+                if rest.len() < 5 {
+                    bail!("PageInit record too short");
+                }
+                let page_id = u32::from_le_bytes(rest[0..4].try_into().unwrap());
+                let kind = rest[4];
+                WalRecordType::PageInit { page_id, kind }
             }
             TAG_CHECKPOINT => {
                 if rest.len() < 4 {

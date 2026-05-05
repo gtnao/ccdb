@@ -777,19 +777,30 @@ pub fn leftmost_leaf(bpm: &BufferPool, root: PageId) -> Result<PageId> {
 }
 
 /// Allocate a fresh empty leaf and return its page id. Used by CREATE INDEX
-/// before any rows exist. Force-flushes so the BTreeLeaf page_kind is on disk
-/// before any crash — there is no WAL record that would let recovery
-/// reconstruct the page kind otherwise, and a crash with the on-disk image
-/// tagged as Heap would make subsequent btree::insert fail with "non-btree page".
-pub fn new_empty_root(bpm: &BufferPool) -> Result<PageId> {
+/// before any rows exist. The PageInit WAL record makes the BTreeLeaf
+/// page_kind recoverable: even if the page never reaches disk before a
+/// crash, redo will re-tag it. No more sync-on-allocate.
+pub fn new_empty_root(
+    bpm: &BufferPool,
+    wal: &crate::wal::WalManager,
+    tx: &mut crate::transaction::Transaction,
+) -> Result<PageId> {
     let g = bpm.new_page()?;
     let pid = g.page_id();
+    let lsn = wal.append(
+        tx.id(),
+        tx.last_lsn(),
+        crate::wal::WalRecordType::PageInit {
+            page_id: pid,
+            kind: PageKind::BTreeLeaf as u8,
+        },
+    )?;
+    tx.set_last_lsn(lsn);
     {
         let mut p = g.write();
         init_leaf(&mut p);
+        p.set_page_lsn(lsn);
     }
-    drop(g);
-    bpm.flush_page(pid)?;
     Ok(pid)
 }
 
@@ -821,6 +832,18 @@ mod tests {
         BufferPool::new(disk, 32, wal)
     }
 
+    /// Test-only: allocate a fresh empty leaf without going through the
+    /// WAL. The pure-tree tests don't exercise recovery, so the PageInit
+    /// record isn't needed; this avoids threading a WAL/Transaction
+    /// through every test.
+    fn test_empty_root(bpm: &BufferPool) -> PageId {
+        let g = bpm.new_page().unwrap();
+        let pid = g.page_id();
+        let mut p = g.write();
+        init_leaf(&mut p);
+        pid
+    }
+
     fn k(n: i32) -> KeyBytes {
         encode_key(&Value::Int(n))
     }
@@ -828,7 +851,7 @@ mod tests {
     #[test]
     fn insert_and_lookup_within_one_leaf() {
         let bpm = temp_bpm();
-        let root = new_empty_root(&bpm).unwrap();
+        let root = test_empty_root(&bpm);
         // Pairs of (key, slot_within_distinguishing_page). Use distinct rids
         // for the two key=1 entries so the (key, rid) idempotence check
         // doesn't dedup them.
@@ -848,7 +871,7 @@ mod tests {
         // Reinserting the same (key, rid) pair (as recovery's redo does)
         // must not duplicate the entry.
         let bpm = temp_bpm();
-        let root = new_empty_root(&bpm).unwrap();
+        let root = test_empty_root(&bpm);
         for _ in 0..3 {
             let _ = insert(&bpm, root, &k(42), (10, 5), DataType::Int).unwrap();
         }
@@ -861,7 +884,7 @@ mod tests {
     #[test]
     fn split_grows_tree() {
         let bpm = temp_bpm();
-        let mut root = new_empty_root(&bpm).unwrap();
+        let mut root = test_empty_root(&bpm);
         // Force at least one split: each leaf entry is ~12 bytes (key 4 +
         // rid 6 + len 2) plus 4 bytes slot = ~16. PAGE_SIZE/16 ≈ 256.
         // Insert 600 keys to trigger at least two leaf splits.
@@ -881,7 +904,7 @@ mod tests {
     #[test]
     fn ordered_scan_via_first_ge() {
         let bpm = temp_bpm();
-        let mut root = new_empty_root(&bpm).unwrap();
+        let mut root = test_empty_root(&bpm);
         for i in [50, 10, 30, 20, 40] {
             root = insert(&bpm, root, &k(i), (i as PageId, 0), DataType::Int).unwrap();
         }
@@ -908,7 +931,7 @@ mod tests {
     #[test]
     fn delete_then_lookup_misses() {
         let bpm = temp_bpm();
-        let root = new_empty_root(&bpm).unwrap();
+        let root = test_empty_root(&bpm);
         for i in 0..10 {
             let _ = insert(&bpm, root, &k(i), (i as PageId, 0), DataType::Int).unwrap();
         }

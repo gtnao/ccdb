@@ -1483,7 +1483,7 @@ fn perform_create_index(
     let new_index_id = max_id + 1;
 
     // Allocate root.
-    let root = crate::btree::new_empty_root(bpm)?;
+    let root = crate::btree::new_empty_root(bpm, wal, tx)?;
 
     // Bulk insert: scan heap, push each (key, rid) into the tree. We use a
     // system snapshot so we see all rows; visibility is checked at scan time
@@ -1556,18 +1556,25 @@ fn perform_create_sequence(
     }
     let new_seq_id = max_id + 1;
 
-    // Allocate the sequence relation page. Flush right away so the
-    // SequenceRel page_kind is on disk — recovery has no WAL record that
-    // would re-tag a Heap page as SequenceRel.
+    // Allocate the sequence relation page. The PageInit WAL record makes
+    // the SequenceRel page_kind recoverable — redo will re-tag the page
+    // even if it never made it to disk before a crash.
     let seq_page_id = {
         let g = bpm.new_page()?;
         let pid = g.page_id();
+        let lsn = log_record(
+            wal,
+            tx,
+            WalRecordType::PageInit {
+                page_id: pid,
+                kind: crate::page::PageKind::SequenceRel as u8,
+            },
+        )?;
         {
             let mut p = g.write();
             crate::sequence::init_sequence_page(&mut p);
+            p.set_page_lsn(lsn);
         }
-        drop(g);
-        bpm.flush_page(pid)?;
         pid
     };
 
@@ -1687,7 +1694,7 @@ fn perform_truncate(
         )?;
         // Reset every index on the table to a fresh empty leaf.
         for idx in catalog.indexes_for_table(table_id)? {
-            let new_root = crate::btree::new_empty_root(bpm)?;
+            let new_root = crate::btree::new_empty_root(bpm, wal, tx)?;
             let id = idx.index_id;
             rewrite_catalog_row(
                 bpm,

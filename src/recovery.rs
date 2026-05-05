@@ -128,7 +128,8 @@ fn analyze(records: &[WalRecord]) -> Analysis {
             WalRecordType::Insert { .. }
             | WalRecordType::Delete { .. }
             | WalRecordType::IndexInsert { .. }
-            | WalRecordType::SequenceAdvance { .. } => {
+            | WalRecordType::SequenceAdvance { .. }
+            | WalRecordType::PageInit { .. } => {
                 wrote_dml.insert(r.txn_id);
             }
             WalRecordType::Clr { .. } => {
@@ -170,6 +171,11 @@ fn redo_from(bpm: &BufferPool, records: &[WalRecord], start_lsn: Lsn) -> Result<
             }
             WalRecordType::SequenceAdvance { seq_page_id, new_last_value } => {
                 if redo_seq_advance(bpm, *seq_page_id, *new_last_value, r.lsn)? {
+                    count += 1;
+                }
+            }
+            WalRecordType::PageInit { page_id, kind } => {
+                if redo_page_init(bpm, *page_id, *kind, r.lsn)? {
                     count += 1;
                 }
             }
@@ -286,6 +292,38 @@ fn ensure_page_allocated(bpm: &BufferPool, page_id: u32) -> Result<()> {
         let _ = bpm.new_page()?;
     }
     Ok(())
+}
+
+/// Redo a PageInit record: re-tag the page's structural identity (page_kind)
+/// and reset its slot/data area to "empty for that kind." The page may be
+/// in any state on disk — recovery's job is to set it to whatever the
+/// allocator originally produced. Idempotent via the standard page_lsn
+/// gate.
+fn redo_page_init(
+    bpm: &BufferPool,
+    page_id: u32,
+    kind_byte: u8,
+    record_lsn: Lsn,
+) -> Result<bool> {
+    use crate::page::{Page, PageKind};
+    ensure_page_allocated(bpm, page_id)?;
+    let g = bpm.fetch_page(page_id)?;
+    let mut p = g.write();
+    if p.page_lsn() >= record_lsn {
+        return Ok(false);
+    }
+    let kind = PageKind::from_u8(kind_byte);
+    // Reset bytes to a fresh empty page, then restore identity. For
+    // SequenceRel we additionally re-init the sequence-state region
+    // (last_value=0, log_cnt=0, is_called=false) — a subsequent
+    // SequenceAdvance redo (if any) overwrites it.
+    *p = Page::new(page_id);
+    p.set_page_kind(kind);
+    if matches!(kind, PageKind::SequenceRel) {
+        crate::sequence::init_sequence_page(&mut p);
+    }
+    p.set_page_lsn(record_lsn);
+    Ok(true)
 }
 
 fn redo_insert(bpm: &BufferPool, rid: Rid, data: &[u8], record_lsn: Lsn) -> Result<bool> {
