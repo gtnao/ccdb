@@ -14,6 +14,7 @@ mod lock_manager;
 mod page;
 mod parser;
 mod protocol;
+mod recovery;
 mod transaction;
 mod tuple;
 mod wal;

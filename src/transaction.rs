@@ -18,6 +18,11 @@ fn fresh_txn_id() -> u64 {
     NEXT_TXN_ID.fetch_add(1, Ordering::SeqCst)
 }
 
+/// Recovery uses this to advance past txn_ids that already appear in the WAL.
+pub fn set_next_txn_id(id: u64) {
+    NEXT_TXN_ID.store(id, Ordering::SeqCst);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TxState {
     Inactive,

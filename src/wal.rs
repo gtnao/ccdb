@@ -174,6 +174,15 @@ impl WalManager {
     pub fn flushed_lsn(&self) -> Lsn {
         self.flushed_lsn.load(Ordering::SeqCst)
     }
+
+    /// Bump both counters past `lsn`. Called by recovery so newly-appended
+    /// records continue past whatever was on disk at startup.
+    pub fn set_next_lsn(&self, lsn: Lsn) {
+        self.next_lsn.store(lsn, Ordering::SeqCst);
+        let _ = self
+            .flushed_lsn
+            .fetch_max(lsn.saturating_sub(1), Ordering::SeqCst);
+    }
 }
 
 /// Read all records from a WAL file. Returns `Ok(vec![])` if the file

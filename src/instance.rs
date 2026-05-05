@@ -18,9 +18,10 @@ use crate::executor::{self, Output, execute};
 use crate::lock_manager::LockManager;
 use crate::parser::parse;
 use crate::protocol::{ColumnDesc, Connection, FrontendMessage};
-use crate::transaction::Transaction;
+use crate::recovery;
+use crate::transaction::{self, Transaction};
 use crate::tuple::{DataType, Value};
-use crate::wal::WalManager;
+use crate::wal::{self, WalManager};
 
 const DATA_FILE: &str = "table.db";
 const WAL_FILE: &str = "wal.log";
@@ -40,11 +41,33 @@ impl Instance {
             let _ = std::fs::remove_file(DATA_FILE);
             let _ = std::fs::remove_file(WAL_FILE);
         }
+
+        // Read any pre-existing WAL records *before* opening WalManager for
+        // append, so we can replay them onto the buffer pool.
+        let wal_records = wal::read_records(WAL_FILE)?;
+
         let disk = DiskManager::open(DATA_FILE)?;
         let wal = Arc::new(WalManager::open(WAL_FILE)?);
+        let bpm = BufferPool::new(disk, POOL_CAPACITY, Arc::clone(&wal));
+
+        if !wal_records.is_empty() {
+            let stats = recovery::recover(&bpm, &wal_records)?;
+            eprintln!(
+                "recovery: committed={} uncommitted={} redo={} undo={}",
+                stats.committed_txns,
+                stats.uncommitted_txns,
+                stats.redo_applied,
+                stats.undo_applied,
+            );
+            // Advance counters so newly-issued LSNs / txn_ids don't collide
+            // with values already written to the WAL.
+            wal.set_next_lsn(stats.max_lsn + 1);
+            transaction::set_next_txn_id(stats.max_txn_id + 1);
+        }
+
         Ok(Self {
             catalog: Arc::new(Catalog::new()),
-            bpm: BufferPool::new(disk, POOL_CAPACITY, Arc::clone(&wal)),
+            bpm,
             lock_manager: Arc::new(LockManager::new()),
             wal,
         })
