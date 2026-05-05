@@ -20,8 +20,10 @@ use crate::parser::parse;
 use crate::protocol::{ColumnDesc, Connection, FrontendMessage};
 use crate::transaction::Transaction;
 use crate::tuple::{DataType, Value};
+use crate::wal::WalManager;
 
 const DATA_FILE: &str = "table.db";
+const WAL_FILE: &str = "wal.log";
 const DEFAULT_PORT: u16 = 5433;
 const POOL_CAPACITY: usize = 64;
 
@@ -29,16 +31,22 @@ pub struct Instance {
     catalog: Arc<Catalog>,
     bpm: BufferPool,
     lock_manager: Arc<LockManager>,
+    wal: Arc<WalManager>,
 }
 
 impl Instance {
-    pub fn new() -> Result<Self> {
-        let _ = std::fs::remove_file(DATA_FILE);
+    pub fn new(init: bool) -> Result<Self> {
+        if init {
+            let _ = std::fs::remove_file(DATA_FILE);
+            let _ = std::fs::remove_file(WAL_FILE);
+        }
         let disk = DiskManager::open(DATA_FILE)?;
+        let wal = Arc::new(WalManager::open(WAL_FILE)?);
         Ok(Self {
             catalog: Arc::new(Catalog::new()),
-            bpm: BufferPool::new(disk, POOL_CAPACITY),
+            bpm: BufferPool::new(disk, POOL_CAPACITY, Arc::clone(&wal)),
             lock_manager: Arc::new(LockManager::new()),
+            wal,
         })
     }
 
@@ -57,9 +65,10 @@ impl Instance {
             let catalog = Arc::clone(&self.catalog);
             let bpm = self.bpm.clone();
             let lock_manager = Arc::clone(&self.lock_manager);
+            let wal = Arc::clone(&self.wal);
 
             thread::spawn(move || {
-                if let Err(e) = handle_client(conn, catalog, bpm, lock_manager) {
+                if let Err(e) = handle_client(conn, catalog, bpm, lock_manager, wal) {
                     eprintln!("connection error: {e}");
                 }
             });
@@ -73,6 +82,7 @@ fn handle_client(
     catalog: Arc<Catalog>,
     bpm: BufferPool,
     lock_manager: Arc<LockManager>,
+    wal: Arc<WalManager>,
 ) -> Result<()> {
     let startup = conn.read_startup()?;
     eprintln!(
@@ -102,7 +112,7 @@ fn handle_client(
                     if sql.trim().is_empty() {
                         conn.send_empty_query()?;
                     } else if let Err(e) =
-                        run_query(&sql, &mut conn, &bpm, &lock_manager, &catalog, &mut tx)
+                        run_query(&sql, &mut conn, &bpm, &lock_manager, &wal, &catalog, &mut tx)
                     {
                         eprintln!("query error: {e}");
                         conn.send_error(&e.to_string())?;
@@ -135,6 +145,7 @@ fn run_query(
     conn: &mut Connection<TcpStream>,
     bpm: &BufferPool,
     lm: &LockManager,
+    wal: &WalManager,
     catalog: &Catalog,
     tx: &mut Transaction,
 ) -> Result<()> {
@@ -144,7 +155,7 @@ fn run_query(
     match &analyzed {
         AnalyzedStatement::Select(s) => {
             let columns: Vec<ColumnDesc> = s.select_items.iter().map(column_desc_for).collect();
-            let out = execute(bpm, lm, catalog, &analyzed, tx)?;
+            let out = execute(bpm, lm, wal, catalog, &analyzed, tx)?;
             let rows = match out {
                 Output::Rows(r) => r,
                 other => bail!("SELECT yielded non-Rows output: {other:?}"),
@@ -157,27 +168,27 @@ fn run_query(
             conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
         }
         AnalyzedStatement::Insert(_) => {
-            let n = expect_affected(execute(bpm, lm, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, wal, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("INSERT 0 {n}"))?;
         }
         AnalyzedStatement::Delete(_) => {
-            let n = expect_affected(execute(bpm, lm, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, wal, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("DELETE {n}"))?;
         }
         AnalyzedStatement::Update(_) => {
-            let n = expect_affected(execute(bpm, lm, catalog, &analyzed, tx)?)?;
+            let n = expect_affected(execute(bpm, lm, wal, catalog, &analyzed, tx)?)?;
             conn.send_command_complete(&format!("UPDATE {n}"))?;
         }
         AnalyzedStatement::Begin => {
-            execute(bpm, lm, catalog, &analyzed, tx)?;
+            execute(bpm, lm, wal, catalog, &analyzed, tx)?;
             conn.send_command_complete("BEGIN")?;
         }
         AnalyzedStatement::Commit => {
-            execute(bpm, lm, catalog, &analyzed, tx)?;
+            execute(bpm, lm, wal, catalog, &analyzed, tx)?;
             conn.send_command_complete("COMMIT")?;
         }
         AnalyzedStatement::Rollback => {
-            execute(bpm, lm, catalog, &analyzed, tx)?;
+            execute(bpm, lm, wal, catalog, &analyzed, tx)?;
             conn.send_command_complete("ROLLBACK")?;
         }
         AnalyzedStatement::CreateTable(_) => {

@@ -20,6 +20,7 @@ use indexmap::IndexSet;
 
 use crate::disk::DiskManager;
 use crate::page::{PAGE_SIZE, Page, PageId};
+use crate::wal::WalManager;
 
 const ORDER: Ordering = Ordering::SeqCst;
 
@@ -82,6 +83,7 @@ struct Inner {
     disk: DiskManager,
     replacer: LruReplacer,
     capacity: usize,
+    wal: Arc<WalManager>,
 }
 
 #[derive(Clone)]
@@ -90,7 +92,7 @@ pub struct BufferPool {
 }
 
 impl BufferPool {
-    pub fn new(disk: DiskManager, capacity: usize) -> Self {
+    pub fn new(disk: DiskManager, capacity: usize, wal: Arc<WalManager>) -> Self {
         let frames = (0..capacity).map(|_| Frame::empty()).collect();
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -99,6 +101,7 @@ impl BufferPool {
                 disk,
                 replacer: LruReplacer::new(capacity),
                 capacity,
+                wal,
             })),
         }
     }
@@ -152,6 +155,9 @@ impl Inner {
         if let Some(pid) = frame.page_id {
             if frame.dirty {
                 let page_guard = frame.page.read().unwrap();
+                // WAL invariant: log records describing this page must be on
+                // disk *before* we write the page itself.
+                self.wal.flush_to(page_guard.page_lsn())?;
                 self.disk.write_page(pid, page_guard.as_bytes())?;
             }
             self.page_table.remove(&pid);
@@ -222,6 +228,9 @@ impl Inner {
     }
 
     fn flush_all_locked(&mut self) -> Result<()> {
+        // Flush the entire WAL first — every page we're about to write is
+        // covered by `flushed_lsn >= page.page_lsn` after this.
+        self.wal.flush()?;
         for fid in 0..self.frames.len() {
             let f = &mut self.frames[fid];
             if let Some(pid) = f.page_id {
@@ -303,7 +312,9 @@ mod tests {
 
     fn fresh_pool(capacity: usize, path: &std::path::Path) -> BufferPool {
         let disk = DiskManager::open(path).unwrap();
-        BufferPool::new(disk, capacity)
+        let wal_path = path.with_extension("wal");
+        let wal = Arc::new(WalManager::open(&wal_path).unwrap());
+        BufferPool::new(disk, capacity, wal)
     }
 
     #[test]

@@ -16,12 +16,17 @@ mod parser;
 mod protocol;
 mod transaction;
 mod tuple;
+mod wal;
 
 use anyhow::Result;
 
 use instance::Instance;
 
 fn main() -> Result<()> {
-    let instance = Instance::new()?;
+    // `--init` clears table.db and wal.log so a fresh server starts from
+    // empty state. Without it, on-disk data and WAL persist across runs
+    // (recovery handling lands in the next day).
+    let init = std::env::args().any(|a| a == "--init");
+    let instance = Instance::new(init)?;
     instance.start()
 }

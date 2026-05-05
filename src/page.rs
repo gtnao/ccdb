@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 
+use crate::wal::Lsn;
+
 pub const PAGE_SIZE: usize = 4096;
 
 pub type PageId = u32;
@@ -9,18 +11,19 @@ pub type Rid = (PageId, SlotId);
 
 // Slotted page layout (all little-endian):
 //
-//   header (8 bytes):
-//     [0..4)  page_id          : u32
-//     [4..6)  tuple_count       : u16
-//     [6..8)  free_space_offset : u16   // points to start of tuple data region
+//   header (16 bytes):
+//     [0..4)   page_id           : u32
+//     [4..6)   tuple_count        : u16
+//     [6..8)   free_space_offset  : u16   // points to start of tuple data
+//     [8..16)  page_lsn           : u64   // LSN of last modification (WAL)
 //
-//   slot array (grows forward from byte 8):
+//   slot array (grows forward from byte 16):
 //     each slot is 4 bytes: u16 offset || u16 length
 //
 //   tuple data (grows backward from PAGE_SIZE):
 //     newest tuple sits at free_space_offset
 
-const HEADER_SIZE: usize = 8;
+const HEADER_SIZE: usize = 16;
 const SLOT_SIZE: usize = 4;
 
 pub struct Page {
@@ -69,6 +72,14 @@ impl Page {
 
     fn set_free_space_offset(&mut self, off: u16) {
         self.data[6..8].copy_from_slice(&off.to_le_bytes());
+    }
+
+    pub fn page_lsn(&self) -> Lsn {
+        u64::from_le_bytes(self.data[8..16].try_into().unwrap())
+    }
+
+    pub fn set_page_lsn(&mut self, lsn: Lsn) {
+        self.data[8..16].copy_from_slice(&lsn.to_le_bytes());
     }
 
     pub fn free_space(&self) -> usize {

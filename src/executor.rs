@@ -18,6 +18,7 @@ use crate::lock_manager::{LockManager, LockMode};
 use crate::page::{PageId, Rid, SlotId};
 use crate::transaction::{Transaction, UndoLogEntry};
 use crate::tuple::{Schema, Value, deserialize_tuple, serialize_tuple};
+use crate::wal::{WalManager, WalRecordType};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Tuple {
@@ -298,6 +299,7 @@ fn evaluate_unary(op: UnaryOperator, v: &Value) -> Result<Value> {
 fn perform_insert(
     bpm: &BufferPool,
     lm: &LockManager,
+    wal: &WalManager,
     stmt: &AnalyzedInsertStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
@@ -309,7 +311,8 @@ fn perform_insert(
             _ => bail!("INSERT VALUES must be literals (no exprs yet)"),
         })
         .collect::<Result<_>>()?;
-    let rid = insert_bytes(bpm, &serialize_tuple(&values))?;
+    let bytes = serialize_tuple(&values);
+    let rid = insert_bytes(bpm, wal, tx.id(), &bytes)?;
     lm.lock(tx.id(), rid, LockMode::Exclusive)
         .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
     tx.add_lock(rid);
@@ -360,12 +363,12 @@ fn matches(predicate: Option<&AnalyzedExpr>, tuple: &Tuple) -> Result<bool> {
 fn perform_delete(
     bpm: &BufferPool,
     lm: &LockManager,
+    wal: &WalManager,
     catalog: &Catalog,
     stmt: &AnalyzedDeleteStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
     let (_schema, rows) = snapshot_table(bpm, catalog, stmt.table_id)?;
-    // Collect (rid, original-bytes) so we can both tombstone and record undo.
     let mut victims: Vec<(Rid, Vec<u8>)> = Vec::new();
     for (pid, slot, values) in rows {
         let t = Tuple::new(values);
@@ -381,7 +384,16 @@ fn perform_delete(
         tx.add_lock((pid, slot));
         {
             let g = bpm.fetch_page(pid)?;
-            g.write().delete(slot)?;
+            let mut p = g.write();
+            p.delete(slot)?;
+            let lsn = wal.append(
+                tx.id(),
+                WalRecordType::Delete {
+                    rid: (pid, slot),
+                    data: bytes.clone(),
+                },
+            )?;
+            p.set_page_lsn(lsn);
         }
         if tx.is_active() {
             tx.record(UndoLogEntry::Delete {
@@ -396,6 +408,7 @@ fn perform_delete(
 fn perform_update(
     bpm: &BufferPool,
     lm: &LockManager,
+    wal: &WalManager,
     catalog: &Catalog,
     stmt: &AnalyzedUpdateStatement,
     tx: &mut Transaction,
@@ -422,13 +435,21 @@ fn perform_update(
 
     let count = work.len();
     for (pid, slot, old_bytes, new_bytes) in work {
-        // X-lock the old slot, tombstone it.
         lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
         tx.add_lock((pid, slot));
         {
             let g = bpm.fetch_page(pid)?;
-            g.write().delete(slot)?;
+            let mut p = g.write();
+            p.delete(slot)?;
+            let lsn = wal.append(
+                tx.id(),
+                WalRecordType::Delete {
+                    rid: (pid, slot),
+                    data: old_bytes.clone(),
+                },
+            )?;
+            p.set_page_lsn(lsn);
         }
         if tx.is_active() {
             tx.record(UndoLogEntry::Delete {
@@ -436,8 +457,7 @@ fn perform_update(
                 data: old_bytes,
             });
         }
-        // Insert the new version, X-lock that too.
-        let new_rid = insert_bytes(bpm, &new_bytes)?;
+        let new_rid = insert_bytes(bpm, wal, tx.id(), &new_bytes)?;
         lm.lock(tx.id(), new_rid, LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
         tx.add_lock(new_rid);
@@ -448,24 +468,45 @@ fn perform_update(
     Ok(count)
 }
 
-// Shared insertion helper. Returns the rid where the tuple landed.
-fn insert_bytes(bpm: &BufferPool, bytes: &[u8]) -> Result<Rid> {
+// Shared insertion helper. Writes the tuple, records WAL Insert, and stamps
+// the page with the resulting LSN.
+fn insert_bytes(bpm: &BufferPool, wal: &WalManager, tx_id: u64, bytes: &[u8]) -> Result<Rid> {
     let n = bpm.page_count();
     if n > 0 {
         let last = n - 1;
         let g = bpm.fetch_page(last)?;
-        if let Ok(slot) = g.write().insert(bytes) {
-            return Ok((last, slot));
+        let mut p = g.write();
+        if let Ok(slot) = p.insert(bytes) {
+            let rid = (last, slot);
+            let lsn = wal.append(
+                tx_id,
+                WalRecordType::Insert {
+                    rid,
+                    data: bytes.to_vec(),
+                },
+            )?;
+            p.set_page_lsn(lsn);
+            return Ok(rid);
         }
+        drop(p);
         drop(g);
     }
     let g = bpm.new_page()?;
     let pid = g.page_id();
-    let slot = g
-        .write()
+    let mut p = g.write();
+    let slot = p
         .insert(bytes)
         .map_err(|e| anyhow::anyhow!("tuple does not fit on a fresh page: {e}"))?;
-    Ok((pid, slot))
+    let rid = (pid, slot);
+    let lsn = wal.append(
+        tx_id,
+        WalRecordType::Insert {
+            rid,
+            data: bytes.to_vec(),
+        },
+    )?;
+    p.set_page_lsn(lsn);
+    Ok(rid)
 }
 
 /// Apply undo entries in reverse order. Used by ROLLBACK and by the
@@ -495,15 +536,29 @@ pub fn rollback(bpm: &BufferPool, tx: &mut Transaction) -> Result<()> {
 pub fn execute(
     bpm: &BufferPool,
     lm: &LockManager,
+    wal: &WalManager,
     catalog: &Catalog,
     stmt: &AnalyzedStatement,
     tx: &mut Transaction,
 ) -> Result<Output> {
     // Auto-commit boundary: a fresh tx_id per implicit-tx statement so the
-    // LockManager can distinguish concurrent auto-commit statements.
+    // LockManager and WAL can distinguish concurrent auto-commit statements.
     let was_inactive_at_start = !tx.is_active();
     if was_inactive_at_start {
         tx.refresh_autocommit();
+    }
+
+    // For DML running under auto-commit, bracket the records with Begin/Commit
+    // (or Abort on error) so the WAL is self-describing for recovery.
+    let needs_dml_brackets = was_inactive_at_start
+        && matches!(
+            stmt,
+            AnalyzedStatement::Insert(_)
+                | AnalyzedStatement::Delete(_)
+                | AnalyzedStatement::Update(_)
+        );
+    if needs_dml_brackets {
+        wal.append(tx.id(), WalRecordType::Begin)?;
     }
 
     let result: Result<Output> = (|| match stmt {
@@ -533,25 +588,29 @@ pub fn execute(
             }
             Ok(Output::Rows(rows))
         }
-        AnalyzedStatement::Insert(s) => Ok(Output::Affected(perform_insert(bpm, lm, s, tx)?)),
-        AnalyzedStatement::Delete(s) => {
-            Ok(Output::Affected(perform_delete(bpm, lm, catalog, s, tx)?))
+        AnalyzedStatement::Insert(s) => {
+            Ok(Output::Affected(perform_insert(bpm, lm, wal, s, tx)?))
         }
-        AnalyzedStatement::Update(s) => {
-            Ok(Output::Affected(perform_update(bpm, lm, catalog, s, tx)?))
-        }
+        AnalyzedStatement::Delete(s) => Ok(Output::Affected(perform_delete(
+            bpm, lm, wal, catalog, s, tx,
+        )?)),
+        AnalyzedStatement::Update(s) => Ok(Output::Affected(perform_update(
+            bpm, lm, wal, catalog, s, tx,
+        )?)),
         AnalyzedStatement::Begin => {
             if tx.is_active() {
                 bail!("there is already a transaction in progress");
             }
             tx.begin();
+            wal.append(tx.id(), WalRecordType::Begin)?;
             Ok(Output::Begin)
         }
         AnalyzedStatement::Commit => {
             if !tx.is_active() {
                 bail!("there is no transaction in progress");
             }
-            // Release all locks before clearing tx state.
+            wal.append(tx.id(), WalRecordType::Commit)?;
+            wal.flush()?;
             let held = tx.take_held_locks();
             lm.unlock_all(tx.id(), &held);
             tx.commit();
@@ -562,6 +621,8 @@ pub fn execute(
                 bail!("there is no transaction in progress");
             }
             rollback(bpm, tx)?;
+            wal.append(tx.id(), WalRecordType::Abort)?;
+            wal.flush()?;
             let held = tx.take_held_locks();
             lm.unlock_all(tx.id(), &held);
             Ok(Output::Rollback)
@@ -571,7 +632,20 @@ pub fn execute(
         }
     })();
 
-    // Auto-commit: release any locks the statement acquired.
+    // Bracket the auto-commit DML records with Commit (or Abort on error).
+    if needs_dml_brackets {
+        let bracket = if result.is_ok() {
+            WalRecordType::Commit
+        } else {
+            WalRecordType::Abort
+        };
+        // Best effort: if WAL append fails here we still propagate the
+        // original result. The page may already be modified, which is the
+        // recovery code's problem to handle.
+        let _ = wal.append(tx.id(), bracket);
+        let _ = wal.flush();
+    }
+
     if was_inactive_at_start && !tx.is_active() {
         let held = tx.take_held_locks();
         lm.unlock_all(tx.id(), &held);
@@ -628,20 +702,38 @@ mod tests {
         p
     }
 
-    fn run(sql: &str, cat: &Catalog, bpm: &BufferPool) -> Output {
+    /// Tests share a single ephemeral WAL file path per executor — recovery
+    /// isn't yet implemented so contents don't matter, but `BufferPool::new`
+    /// requires a real file.
+    fn ephemeral_wal() -> std::sync::Arc<crate::wal::WalManager> {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "ccdb-exec-wal-{}-{}.log",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&p);
+        std::sync::Arc::new(crate::wal::WalManager::open(&p).unwrap())
+    }
+
+    fn run(sql: &str, cat: &Catalog, bpm: &BufferPool, wal: &WalManager) -> Output {
         let mut tx = Transaction::new();
         let lm = LockManager::new();
-        run_full(sql, cat, bpm, &lm, &mut tx)
+        run_full(sql, cat, bpm, &lm, wal, &mut tx)
     }
 
     fn run_tx(
         sql: &str,
         cat: &Catalog,
         bpm: &BufferPool,
+        wal: &WalManager,
         tx: &mut Transaction,
     ) -> Output {
         let lm = LockManager::new();
-        run_full(sql, cat, bpm, &lm, tx)
+        run_full(sql, cat, bpm, &lm, wal, tx)
     }
 
     fn run_full(
@@ -649,18 +741,19 @@ mod tests {
         cat: &Catalog,
         bpm: &BufferPool,
         lm: &LockManager,
+        wal: &WalManager,
         tx: &mut Transaction,
     ) -> Output {
         let stmt = parse(sql).unwrap();
         let analyzed = analyze(cat, &stmt).unwrap();
-        execute(bpm, lm, cat, &analyzed, tx).unwrap()
+        execute(bpm, lm, wal, cat, &analyzed, tx).unwrap()
     }
 
     #[test]
     fn insert_then_select_star() {
         let path = temp_path("insert-select");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
 
         for sql in [
@@ -668,9 +761,9 @@ mod tests {
             "INSERT INTO users VALUES (2, 'Bob')",
             "INSERT INTO users VALUES (3, NULL)",
         ] {
-            assert!(matches!(run(sql, &cat, &bpm), Output::Affected(1)));
+            assert!(matches!(run(sql, &cat, &bpm, &wal), Output::Affected(1)));
         }
-        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &bpm) else {
+        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &bpm, &wal) else {
             panic!()
         };
         assert_eq!(rows.len(), 3);
@@ -683,16 +776,15 @@ mod tests {
     fn where_filters_rows() {
         let path = temp_path("where");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         for i in 1..=5 {
             run(
                 &format!("INSERT INTO users VALUES ({i}, 'x')"),
                 &cat,
-                &bpm,
-            );
+                &bpm, &wal);
         }
-        let Output::Rows(rows) = run("SELECT id FROM users WHERE id > 2", &cat, &bpm) else {
+        let Output::Rows(rows) = run("SELECT id FROM users WHERE id > 2", &cat, &bpm, &wal) else {
             panic!()
         };
         assert_eq!(rows.len(), 3);
@@ -704,10 +796,10 @@ mod tests {
     fn projection_evaluates_arithmetic() {
         let path = temp_path("proj");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (10, 'a')", &cat, &bpm);
-        let Output::Rows(rows) = run("SELECT id + 1 FROM users", &cat, &bpm) else {
+        run("INSERT INTO users VALUES (10, 'a')", &cat, &bpm, &wal);
+        let Output::Rows(rows) = run("SELECT id + 1 FROM users", &cat, &bpm, &wal) else {
             panic!()
         };
         assert_eq!(rows[0].values[0], Value::Int(11));
@@ -718,16 +810,15 @@ mod tests {
     fn null_predicate_excludes_row() {
         let path = temp_path("null-pred");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm);
-        run("INSERT INTO users VALUES (2, NULL)", &cat, &bpm);
+        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &wal);
+        run("INSERT INTO users VALUES (2, NULL)", &cat, &bpm, &wal);
         // name = 'Alice' on the NULL row evaluates to NULL → row excluded.
         let Output::Rows(rows) = run(
             "SELECT id FROM users WHERE name = 'Alice'",
             &cat,
-            &bpm,
-        ) else {
+            &bpm, &wal) else {
             panic!()
         };
         assert_eq!(rows.len(), 1);
@@ -739,20 +830,19 @@ mod tests {
     fn delete_with_predicate() {
         let path = temp_path("delete-pred");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         for i in 1..=4 {
             run(
                 &format!("INSERT INTO users VALUES ({i}, 'x')"),
                 &cat,
-                &bpm,
-            );
+                &bpm, &wal);
         }
         assert!(matches!(
-            run("DELETE FROM users WHERE id > 2", &cat, &bpm),
+            run("DELETE FROM users WHERE id > 2", &cat, &bpm, &wal),
             Output::Affected(2)
         ));
-        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &bpm) else {
+        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &bpm, &wal) else {
             panic!()
         };
         assert_eq!(rows.len(), 2);
@@ -765,20 +855,19 @@ mod tests {
     fn delete_all_rows() {
         let path = temp_path("delete-all");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         for i in 1..=3 {
             run(
                 &format!("INSERT INTO users VALUES ({i}, 'x')"),
                 &cat,
-                &bpm,
-            );
+                &bpm, &wal);
         }
         assert!(matches!(
-            run("DELETE FROM users", &cat, &bpm),
+            run("DELETE FROM users", &cat, &bpm, &wal),
             Output::Affected(3)
         ));
-        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &bpm) else {
+        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &bpm, &wal) else {
             panic!()
         };
         assert!(rows.is_empty());
@@ -789,19 +878,18 @@ mod tests {
     fn update_changes_matching_rows() {
         let path = temp_path("update");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm);
-        run("INSERT INTO users VALUES (2, 'Bob')", &cat, &bpm);
+        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &wal);
+        run("INSERT INTO users VALUES (2, 'Bob')", &cat, &bpm, &wal);
         assert!(matches!(
             run(
                 "UPDATE users SET name = 'A2' WHERE id = 1",
                 &cat,
-                &bpm
-            ),
+                &bpm, &wal),
             Output::Affected(1)
         ));
-        let Output::Rows(rows) = run("SELECT id, name FROM users", &cat, &bpm) else {
+        let Output::Rows(rows) = run("SELECT id, name FROM users", &cat, &bpm, &wal) else {
             panic!()
         };
         // Order may shift because UPDATE = delete + insert; check by id.
@@ -821,19 +909,18 @@ mod tests {
         // Snapshot-then-apply guarantees we don't see our own writes.
         let path = temp_path("update-stable");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm);
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal);
         // SET name = 'a' WHERE name = 'a' affects exactly one row, not infinite.
         assert!(matches!(
             run(
                 "UPDATE users SET name = 'a' WHERE name = 'a'",
                 &cat,
-                &bpm
-            ),
+                &bpm, &wal),
             Output::Affected(1)
         ));
-        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &bpm) else {
+        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &bpm, &wal) else {
             panic!()
         };
         assert_eq!(rows.len(), 1);
@@ -844,12 +931,12 @@ mod tests {
     fn null_propagates_in_arithmetic() {
         let path = temp_path("null-arith");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
-        run("INSERT INTO users VALUES (1, NULL)", &cat, &bpm);
+        run("INSERT INTO users VALUES (1, NULL)", &cat, &bpm, &wal);
         // SELECT name (which is NULL) projects through; arithmetic on NULL would
         // also produce NULL — exercised via id (non-null) for the all-OK row.
-        let Output::Rows(rows) = run("SELECT name FROM users", &cat, &bpm) else {
+        let Output::Rows(rows) = run("SELECT name FROM users", &cat, &bpm, &wal) else {
             panic!()
         };
         assert_eq!(rows[0].values[0], Value::Null);
@@ -860,22 +947,22 @@ mod tests {
     fn rollback_undoes_insert() {
         let path = temp_path("tx-insert");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &mut tx);
-        run_tx("BEGIN", &cat, &bpm, &mut tx);
-        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &mut tx);
+        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
+        run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
+        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &wal, &mut tx);
         // Inside tx: 2 rows visible.
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &wal, &mut tx)
         else {
             panic!()
         };
         assert_eq!(rows.len(), 2);
-        run_tx("ROLLBACK", &cat, &bpm, &mut tx);
+        run_tx("ROLLBACK", &cat, &bpm, &wal, &mut tx);
         // After rollback: just 1.
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &wal, &mut tx)
         else {
             panic!()
         };
@@ -887,16 +974,16 @@ mod tests {
     fn rollback_undoes_delete() {
         let path = temp_path("tx-delete");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &mut tx);
-        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &mut tx);
-        run_tx("BEGIN", &cat, &bpm, &mut tx);
-        run_tx("DELETE FROM users WHERE id = 1", &cat, &bpm, &mut tx);
-        run_tx("ROLLBACK", &cat, &bpm, &mut tx);
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
+        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
+        run_tx("INSERT INTO users VALUES (2, 'b')", &cat, &bpm, &wal, &mut tx);
+        run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
+        run_tx("DELETE FROM users WHERE id = 1", &cat, &bpm, &wal, &mut tx);
+        run_tx("ROLLBACK", &cat, &bpm, &wal, &mut tx);
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &wal, &mut tx)
         else {
             panic!()
         };
@@ -909,26 +996,27 @@ mod tests {
         // UPDATE = delete + insert, so the undo log holds two entries per row.
         let path = temp_path("tx-update");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &mut tx);
-        run_tx("BEGIN", &cat, &bpm, &mut tx);
+        run_tx("INSERT INTO users VALUES (1, 'Alice')", &cat, &bpm, &wal, &mut tx);
+        run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
         run_tx(
             "UPDATE users SET name = 'A2' WHERE id = 1",
             &cat,
             &bpm,
+            &wal,
             &mut tx,
         );
         // Mid-tx the new value is visible.
-        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &bpm, &mut tx)
+        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &bpm, &wal, &mut tx)
         else {
             panic!()
         };
         assert_eq!(rows[0].values[0], Value::Varchar("A2".into()));
-        run_tx("ROLLBACK", &cat, &bpm, &mut tx);
-        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &bpm, &mut tx)
+        run_tx("ROLLBACK", &cat, &bpm, &wal, &mut tx);
+        let Output::Rows(rows) = run_tx("SELECT name FROM users", &cat, &bpm, &wal, &mut tx)
         else {
             panic!()
         };
@@ -941,14 +1029,14 @@ mod tests {
     fn commit_persists_changes() {
         let path = temp_path("tx-commit");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
-        run_tx("BEGIN", &cat, &bpm, &mut tx);
-        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &mut tx);
-        run_tx("COMMIT", &cat, &bpm, &mut tx);
-        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &mut tx)
+        run_tx("BEGIN", &cat, &bpm, &wal, &mut tx);
+        run_tx("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &mut tx);
+        run_tx("COMMIT", &cat, &bpm, &wal, &mut tx);
+        let Output::Rows(rows) = run_tx("SELECT id FROM users", &cat, &bpm, &wal, &mut tx)
         else {
             panic!()
         };
@@ -960,15 +1048,15 @@ mod tests {
     fn nested_begin_errors() {
         let path = temp_path("tx-nested");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let cat = Catalog::new();
         let mut tx = Transaction::new();
 
         let stmt = parse("BEGIN").unwrap();
         let analyzed = analyze(&cat, &stmt).unwrap();
         let lm = LockManager::new();
-        execute(&bpm, &lm, &cat, &analyzed, &mut tx).unwrap();
-        let err = execute(&bpm, &lm, &cat, &analyzed, &mut tx);
+        execute(&bpm, &lm, &wal, &cat, &analyzed, &mut tx).unwrap();
+        let err = execute(&bpm, &lm, &wal, &cat, &analyzed, &mut tx);
         assert!(err.is_err());
         std::fs::remove_file(&path).ok();
     }
@@ -987,7 +1075,7 @@ mod tests {
 
         let path = temp_path("concurrent-update");
         let disk = DiskManager::open(&path).unwrap();
-        let bpm = BufferPool::new(disk, 4);
+        let wal = std::sync::Arc::new(crate::wal::WalManager::open(&path.with_extension("wal")).unwrap()); let bpm = BufferPool::new(disk, 4, wal.clone());
         let lm = Arc::new(LockManager::new());
         let cat = Arc::new(Catalog::new());
 
@@ -999,6 +1087,7 @@ mod tests {
                 &cat,
                 &bpm,
                 &lm,
+                &wal,
                 &mut tx,
             );
         }
@@ -1009,43 +1098,45 @@ mod tests {
         let bpm_a = bpm.clone();
         let lm_a = Arc::clone(&lm);
         let cat_a = Arc::clone(&cat);
+        let wal_a = Arc::clone(&wal);
         let bar_a = Arc::clone(&barrier);
         let h_a = thread::spawn(move || {
             bar_a.wait();
             let mut tx = Transaction::new();
-            run_full("BEGIN", &cat_a, &bpm_a, &lm_a, &mut tx);
+            run_full("BEGIN", &cat_a, &bpm_a, &lm_a, &wal_a, &mut tx);
             run_full(
                 "UPDATE users SET name = 'A' WHERE id = 1",
                 &cat_a,
                 &bpm_a,
                 &lm_a,
+                &wal_a,
                 &mut tx,
             );
             // Signal B to start; hold the lock briefly.
             a_started.send(()).unwrap();
             thread::sleep(Duration::from_millis(100));
-            run_full("COMMIT", &cat_a, &bpm_a, &lm_a, &mut tx);
+            run_full("COMMIT", &cat_a, &bpm_a, &lm_a, &wal_a, &mut tx);
         });
 
         let bpm_b = bpm.clone();
         let lm_b = Arc::clone(&lm);
         let cat_b = Arc::clone(&cat);
+        let wal_b = Arc::clone(&wal);
         let bar_b = Arc::clone(&barrier);
         let h_b = thread::spawn(move || {
             bar_b.wait();
-            // Wait until A is mid-tx so we know A is holding the X-lock.
             b_can_proceed.recv().unwrap();
             let mut tx = Transaction::new();
-            run_full("BEGIN", &cat_b, &bpm_b, &lm_b, &mut tx);
-            // This blocks until A commits.
+            run_full("BEGIN", &cat_b, &bpm_b, &lm_b, &wal_b, &mut tx);
             run_full(
                 "UPDATE users SET name = 'B' WHERE id = 1",
                 &cat_b,
                 &bpm_b,
                 &lm_b,
+                &wal_b,
                 &mut tx,
             );
-            run_full("COMMIT", &cat_b, &bpm_b, &lm_b, &mut tx);
+            run_full("COMMIT", &cat_b, &bpm_b, &lm_b, &wal_b, &mut tx);
         });
 
         h_a.join().unwrap();
@@ -1058,6 +1149,7 @@ mod tests {
             &cat,
             &bpm,
             &lm,
+            &wal,
             &mut tx,
         ) else {
             panic!()
