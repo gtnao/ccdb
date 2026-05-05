@@ -98,7 +98,11 @@ pub struct LockManager {
 
 impl LockManager {
     pub fn new() -> Self {
-        Self::with_timeout(Duration::from_secs(30))
+        // Default 3s — short enough that genuine deadlocks unblock workloads
+        // promptly, long enough that healthy contention doesn't spuriously
+        // abort. sysbench at 8 threads on a 1000-row table will hit waits in
+        // the tens of ms range; a multi-second wait is almost always a cycle.
+        Self::with_timeout(Duration::from_secs(3))
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {

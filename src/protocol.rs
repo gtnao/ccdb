@@ -234,11 +234,37 @@ impl<S: Read + Write> Connection<S> {
     }
 
     pub fn send_error(&mut self, message: &str) -> Result<()> {
+        // SQLSTATE: pick a code that hints at the error class so clients can
+        // make a smart retry decision. `40P01` (deadlock_detected) works for
+        // lock-timeout aborts since sysbench/libpq treat that as retriable.
+        // Anything else gets the generic `XX000` (internal_error).
+        let sqlstate = if message.contains("lock acquisition timeout")
+            || message.contains("deadlock")
+        {
+            "40P01"
+        } else if message.contains("not found") || message.contains("not in catalog") {
+            "42P01" // undefined_table
+        } else if message.contains("nullable") {
+            "23502" // not_null_violation
+        } else {
+            "XX000"
+        };
+        self.send_error_with_code(sqlstate, message)
+    }
+
+    pub fn send_error_with_code(&mut self, sqlstate: &str, message: &str) -> Result<()> {
         let mut buf = Vec::new();
-        buf.push(b'S'); // severity field
+        buf.push(b'S');
         buf.extend_from_slice(b"ERROR");
         buf.push(0);
-        buf.push(b'M'); // message field
+        // V (severity, non-localized). libpq accepts the same values as S.
+        buf.push(b'V');
+        buf.extend_from_slice(b"ERROR");
+        buf.push(0);
+        buf.push(b'C'); // SQLSTATE code
+        buf.extend_from_slice(sqlstate.as_bytes());
+        buf.push(0);
+        buf.push(b'M');
         buf.extend_from_slice(message.as_bytes());
         buf.push(0);
         buf.push(0); // fields terminator
