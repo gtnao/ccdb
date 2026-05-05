@@ -101,8 +101,13 @@ impl Parser {
                 break;
             }
         }
-        self.expect(&Token::From)?;
-        let from = self.parse_from_clause()?;
+        // FROM is optional: `SELECT 1+1;` produces a single row.
+        let from = if matches!(self.peek(), Some(Token::From)) {
+            self.bump();
+            self.parse_from_clause()?
+        } else {
+            FromClause::Empty
+        };
         let where_clause = if matches!(self.peek(), Some(Token::Where)) {
             self.bump();
             Some(self.parse_expr()?)

@@ -168,6 +168,8 @@ impl AggKind {
 /// resolved `rte_index` references and analyzed ON predicates.
 #[derive(Debug, Clone)]
 pub enum AnalyzedFrom {
+    /// `SELECT expr;` with no FROM — yields a single all-empty input row.
+    Empty,
     Table {
         rte_index: usize,
     },
@@ -464,6 +466,7 @@ impl<'a> Analyzer<'a> {
         offset: usize,
     ) -> Result<(AnalyzedFrom, usize)> {
         match from {
+            FromClause::Empty => Ok((AnalyzedFrom::Empty, offset)),
             FromClause::Table(t) => {
                 let rte_index = self.intro_table(t, offset)?;
                 let width = self.range_table[rte_index].output_columns.len();
@@ -1203,16 +1206,31 @@ fn infer_binary_type(
     right: Option<DataType>,
 ) -> DataType {
     use BinaryOperator::*;
+    use DataType::*;
     match op {
-        Eq | Ne | Lt | Le | Gt | Ge | And | Or => DataType::Bool,
+        Eq | Ne | Lt | Le | Gt | Ge | And | Or => Bool,
         Add | Sub | Mul | Div => {
-            // Numeric promotion: any DOUBLE in → DOUBLE out; otherwise INT.
-            if matches!(left, Some(DataType::Double))
-                || matches!(right, Some(DataType::Double))
-            {
-                DataType::Double
-            } else {
-                DataType::Int
+            match (left, right, op) {
+                // Date arithmetic.
+                (Some(Date), Some(Interval), Add | Sub) => Timestamp, // PG: date+interval is timestamp
+                (Some(Interval), Some(Date), Add) => Timestamp,
+                (Some(Date), Some(Int), Add | Sub) => Date,
+                (Some(Int), Some(Date), Add) => Date,
+                (Some(Date), Some(Date), Sub) => Int, // days
+                // Timestamp arithmetic.
+                (Some(Timestamp), Some(Interval), Add | Sub) => Timestamp,
+                (Some(Interval), Some(Timestamp), Add) => Timestamp,
+                (Some(Timestamp), Some(Timestamp), Sub) => Interval,
+                // Interval arithmetic.
+                (Some(Interval), Some(Interval), Add | Sub) => Interval,
+                (Some(Interval), Some(Int | Double), Mul | Div) => Interval,
+                (Some(Int | Double), Some(Interval), Mul) => Interval,
+                // Time + Interval → Time (modulo 24h).
+                (Some(Time), Some(Interval), Add | Sub) => Time,
+                (Some(Interval), Some(Time), Add) => Time,
+                // Numeric default.
+                _ if matches!(left, Some(Double)) || matches!(right, Some(Double)) => Double,
+                _ => Int,
             }
         }
     }

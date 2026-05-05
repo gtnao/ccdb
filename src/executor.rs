@@ -137,6 +137,36 @@ impl Executor for SeqScan<'_> {
     }
 }
 
+// -- OneRowRelation ----------------------------------------------------------
+
+/// `SELECT expr;` (no FROM) needs an executor that yields exactly one empty
+/// tuple so the SELECT list is evaluated once. Postgres calls this the
+/// "Result" node; we keep the descriptive name.
+pub struct OneRowRelation {
+    emitted: bool,
+}
+
+impl OneRowRelation {
+    pub fn new() -> Self {
+        Self { emitted: false }
+    }
+}
+
+impl Executor for OneRowRelation {
+    fn open(&mut self) -> Result<()> {
+        self.emitted = false;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        if self.emitted {
+            return Ok(None);
+        }
+        self.emitted = true;
+        Ok(Some(Tuple::new(Vec::new())))
+    }
+}
+
 // -- IndexScan ---------------------------------------------------------------
 
 /// Range over which `IndexScan` walks the leaf chain. `Eq` is just a special
@@ -597,6 +627,60 @@ impl AggState {
     }
 }
 
+/// Apply a calendar interval to a TIMESTAMP (μs since PG epoch). Order:
+/// (1) months — calendar advance, day clamped to month length
+/// (2) days   — flat day count
+/// (3) micros — flat duration
+/// PG applies in this order; combining months and days separately is the
+/// whole point of a 3-field interval.
+fn apply_interval_to_timestamp(
+    ts_micros: i64,
+    months: i32,
+    days: i32,
+    micros: i64,
+) -> Result<i64> {
+    use chrono::{Datelike, Duration, NaiveDate};
+    let pg_epoch = NaiveDate::from_ymd_opt(2000, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    let mut dt = pg_epoch + Duration::microseconds(ts_micros);
+    if months != 0 {
+        // Compute target year/month and clamp the day to the month's length.
+        let total_months = dt.year() as i64 * 12 + (dt.month() as i64 - 1) + months as i64;
+        let new_year = total_months.div_euclid(12) as i32;
+        let new_month = (total_months.rem_euclid(12) + 1) as u32;
+        let max_day = days_in_month(new_year, new_month);
+        let new_day = dt.day().min(max_day);
+        let new_date = NaiveDate::from_ymd_opt(new_year, new_month, new_day)
+            .ok_or_else(|| anyhow::anyhow!("date out of range"))?;
+        dt = new_date.and_time(dt.time());
+    }
+    if days != 0 {
+        dt += Duration::days(days as i64);
+    }
+    if micros != 0 {
+        dt += Duration::microseconds(micros);
+    }
+    let delta = dt.signed_duration_since(pg_epoch);
+    delta
+        .num_microseconds()
+        .ok_or_else(|| anyhow::anyhow!("timestamp out of range"))
+}
+
+fn days_in_month(year: i32, month: u32) -> u32 {
+    use chrono::{Datelike, NaiveDate};
+    // Find the first of the *next* month, then back up one day.
+    let (ny, nm) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let next = NaiveDate::from_ymd_opt(ny, nm, 1).expect("valid first-of-month");
+    let last = next - chrono::Duration::days(1);
+    last.day()
+}
+
 fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
     match (a, b) {
         (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
@@ -1018,7 +1102,11 @@ fn evaluate_binary(op: BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
             Le => Value::Bool(a <= b),
             Gt => Value::Bool(a > b),
             Ge => Value::Bool(a >= b),
-            // INTERVAL arithmetic comes in Phase 1-3.
+            Sub => Value::Interval {
+                months: 0,
+                days: 0,
+                micros: a - b,
+            },
             _ => bail!("unsupported op {op:?} on TIMESTAMP"),
         }),
         (Value::Date(a), Value::Date(b)) => Ok(match op {
@@ -1028,6 +1116,7 @@ fn evaluate_binary(op: BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
             Le => Value::Bool(a <= b),
             Gt => Value::Bool(a > b),
             Ge => Value::Bool(a >= b),
+            Sub => Value::Int(a - b),
             _ => bail!("unsupported op {op:?} on DATE"),
         }),
         (Value::Time(a), Value::Time(b)) => Ok(match op {
@@ -1039,6 +1128,92 @@ fn evaluate_binary(op: BinaryOperator, l: &Value, r: &Value) -> Result<Value> {
             Ge => Value::Bool(a >= b),
             _ => bail!("unsupported op {op:?} on TIME"),
         }),
+        // -- Date arithmetic --------------------------------------------------
+        (Value::Date(d), Value::Int(n)) if matches!(op, Add | Sub) => {
+            let delta = if matches!(op, Add) { *n } else { -*n };
+            Ok(Value::Date(d.saturating_add(delta)))
+        }
+        (Value::Int(n), Value::Date(d)) if matches!(op, Add) => {
+            Ok(Value::Date(d.saturating_add(*n)))
+        }
+        (Value::Date(d), Value::Interval { months, days, micros })
+            if matches!(op, Add | Sub) =>
+        {
+            // PG: date + interval → timestamp (because interval may carry
+            // a sub-day component). Convert date to timestamp at midnight,
+            // then apply.
+            let ts = (*d as i64) * 86_400_000_000;
+            let sign = if matches!(op, Add) { 1 } else { -1 };
+            apply_interval_to_timestamp(ts, sign * months, sign * days, sign as i64 * micros)
+                .map(Value::Timestamp)
+        }
+        (Value::Interval { months, days, micros }, Value::Date(d))
+            if matches!(op, Add) =>
+        {
+            let ts = (*d as i64) * 86_400_000_000;
+            apply_interval_to_timestamp(ts, *months, *days, *micros).map(Value::Timestamp)
+        }
+        // -- Timestamp arithmetic ---------------------------------------------
+        (Value::Timestamp(ts), Value::Interval { months, days, micros })
+            if matches!(op, Add | Sub) =>
+        {
+            let sign = if matches!(op, Add) { 1 } else { -1 };
+            apply_interval_to_timestamp(*ts, sign * months, sign * days, sign as i64 * micros)
+                .map(Value::Timestamp)
+        }
+        (Value::Interval { months, days, micros }, Value::Timestamp(ts))
+            if matches!(op, Add) =>
+        {
+            apply_interval_to_timestamp(*ts, *months, *days, *micros).map(Value::Timestamp)
+        }
+        // -- Interval arithmetic ----------------------------------------------
+        (
+            Value::Interval { months: m1, days: d1, micros: u1 },
+            Value::Interval { months: m2, days: d2, micros: u2 },
+        ) if matches!(op, Add | Sub) => {
+            let sign: i64 = if matches!(op, Add) { 1 } else { -1 };
+            Ok(Value::Interval {
+                months: m1 + sign as i32 * m2,
+                days: d1 + sign as i32 * d2,
+                micros: u1 + sign * u2,
+            })
+        }
+        (Value::Interval { months, days, micros }, Value::Int(n)) if matches!(op, Mul) => {
+            Ok(Value::Interval {
+                months: months * n,
+                days: days * n,
+                micros: micros * (*n as i64),
+            })
+        }
+        (Value::Int(n), Value::Interval { months, days, micros }) if matches!(op, Mul) => {
+            Ok(Value::Interval {
+                months: months * n,
+                days: days * n,
+                micros: micros * (*n as i64),
+            })
+        }
+        (Value::Interval { months, days, micros }, Value::Int(n)) if matches!(op, Div) => {
+            if *n == 0 {
+                bail!("division by zero");
+            }
+            Ok(Value::Interval {
+                months: months / n,
+                days: days / n,
+                micros: micros / (*n as i64),
+            })
+        }
+        // -- Time + Interval --------------------------------------------------
+        (Value::Time(t), Value::Interval { micros, .. }) if matches!(op, Add | Sub) => {
+            // PG: TIME + INTERVAL ignores the months/days components.
+            let sign: i64 = if matches!(op, Add) { 1 } else { -1 };
+            const DAY_US: i64 = 86_400_000_000;
+            let new_t = (*t + sign * *micros).rem_euclid(DAY_US);
+            Ok(Value::Time(new_t))
+        }
+        (Value::Interval { micros, .. }, Value::Time(t)) if matches!(op, Add) => {
+            const DAY_US: i64 = 86_400_000_000;
+            Ok(Value::Time((*t + *micros).rem_euclid(DAY_US)))
+        }
         _ => bail!("type mismatch in binary op {op:?}"),
     }
 }
@@ -1939,6 +2114,7 @@ fn build_from_pipeline<'a>(
     tm: &'a TransactionManager,
 ) -> Result<Box<dyn Executor + 'a>> {
     match from {
+        AnalyzedFrom::Empty => Ok(Box::new(OneRowRelation::new())),
         AnalyzedFrom::Table { rte_index } => {
             let rte = &range_table[*rte_index];
             let TableSource::BaseTable { table_id, .. } = &rte.source;

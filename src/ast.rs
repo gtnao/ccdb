@@ -70,6 +70,9 @@ pub struct TableRef {
 /// `A JOIN B JOIN C` parses as `Join(Join(Table(A), B), C)`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FromClause {
+    /// No FROM at all (e.g. `SELECT 1 + 1;`). Yields one empty input row
+    /// so the SELECT list is evaluated once.
+    Empty,
     Table(TableRef),
     Join {
         left: Box<FromClause>,
