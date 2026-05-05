@@ -1948,6 +1948,41 @@ fn rewrite_catalog_row(
     Ok(())
 }
 
+/// Insert one COPY row. Caller has already turned the wire-format text into a
+/// per-table-column `Value` vector (NULL-padded for unmapped columns). Mirrors
+/// perform_insert's per-row work: heap insert + lock + index maintenance.
+///
+/// `tail_hint` is a page id believed to be at or near the end of the heap
+/// chain — bulk callers (`run_copy_in`) thread the hint forward so we don't
+/// rescan the whole chain on every row. Returns the Rid plus an updated hint.
+pub fn perform_copy_row(
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    catalog: &Catalog,
+    table_id: usize,
+    values: Vec<Value>,
+    tx: &mut Transaction,
+    tail_hint: Option<PageId>,
+) -> Result<(Rid, PageId)> {
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table id {table_id} not in catalog"))?;
+    let coerced: Vec<Value> = values
+        .into_iter()
+        .zip(table.columns.iter())
+        .map(|(v, c)| coerce_for_storage(v, c.data_type))
+        .collect::<Result<_>>()?;
+    let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &coerced);
+    let (rid, _lsn, new_tail) =
+        insert_bytes_hinted(bpm, wal, tx, table.first_page_id, &bytes, tail_hint)?;
+    lm.lock(tx.id(), rid, LockMode::Exclusive)
+        .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
+    tx.add_lock(rid);
+    index_insert_for_row(bpm, wal, catalog, tx, table_id, &coerced, rid)?;
+    Ok((rid, new_tail))
+}
+
 fn perform_insert(
     bpm: &BufferPool,
     lm: &LockManager,
@@ -2291,8 +2326,25 @@ fn insert_bytes(
     first_page: PageId,
     bytes: &[u8],
 ) -> Result<(Rid, Lsn)> {
-    // 1. Find the last page in the chain.
-    let mut last = first_page;
+    let (rid, lsn, _tail) = insert_bytes_hinted(bpm, wal, tx, first_page, bytes, None)?;
+    Ok((rid, lsn))
+}
+
+/// Same as `insert_bytes` but accepts a "tail hint" — a page id believed to
+/// be at or near the end of the chain. Walking from the hint avoids the
+/// O(n) scan from `first_page` that turns bulk inserts (COPY, multi-row
+/// INSERT) into O(rows²). Returns the page that actually received the
+/// tuple so callers can thread the hint forward.
+fn insert_bytes_hinted(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tx: &mut Transaction,
+    first_page: PageId,
+    bytes: &[u8],
+    hint: Option<PageId>,
+) -> Result<(Rid, Lsn, PageId)> {
+    let start = hint.unwrap_or(first_page);
+    let mut last = start;
     loop {
         let g = bpm.fetch_page(last)?;
         let next = g.read().next_page_id();
@@ -2302,7 +2354,6 @@ fn insert_bytes(
         last = next;
     }
 
-    // 2. Try to insert into the last page.
     {
         let g = bpm.fetch_page(last)?;
         let mut p = g.write();
@@ -2317,11 +2368,10 @@ fn insert_bytes(
                 },
             )?;
             p.set_page_lsn(lsn);
-            return Ok((rid, lsn));
+            return Ok((rid, lsn, last));
         }
     }
 
-    // 3. Allocate a fresh page and link it after `last`.
     let new_g = bpm.new_page()?;
     let new_pid = new_g.page_id();
     {
@@ -2340,10 +2390,9 @@ fn insert_bytes(
         )?;
         p.set_page_lsn(lsn);
         drop(p);
-        // Now link the previous tail to the new page.
         let prev_g = bpm.fetch_page(last)?;
         prev_g.write().set_next_page_id(new_pid);
-        return Ok((rid, lsn));
+        return Ok((rid, lsn, new_pid));
     }
 }
 
@@ -2507,6 +2556,12 @@ pub fn execute(
         AnalyzedStatement::AnalyzeNoop => {
             // Phase 9 will collect real statistics; for now it's parse-and-accept.
             Ok(Output::Affected(0))
+        }
+        AnalyzedStatement::Copy(_) => {
+            // COPY is driven from the connection layer (instance.rs) so it
+            // can shuttle CopyData messages off the wire — the executor
+            // doesn't see the data stream itself.
+            bail!("COPY must be handled outside the executor")
         }
         AnalyzedStatement::Checkpoint => {
             // Handled at the connection layer (instance.rs) — has access to

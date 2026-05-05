@@ -127,6 +127,12 @@ pub enum FrontendMessage {
     Sync,
     /// `H` — flush; we already flush after every send, so it's a no-op.
     Flush,
+    /// `d` — one COPY data row (text format: tab-separated, newline-terminated).
+    CopyData(Vec<u8>),
+    /// `c` — client signals end of COPY data.
+    CopyDone,
+    /// `f` — client aborts the COPY with a reason string.
+    CopyFail(String),
     Terminate,
     Unknown(u8),
 }
@@ -195,6 +201,13 @@ impl<S: Read + Write> Connection<S> {
             b'C' => parse_close(&buf)?,
             b'S' => FrontendMessage::Sync,
             b'H' => FrontendMessage::Flush,
+            b'd' => FrontendMessage::CopyData(buf),
+            b'c' => FrontendMessage::CopyDone,
+            b'f' => {
+                let mut i = 0;
+                let reason = read_cstr(&buf, &mut i).unwrap_or_default();
+                FrontendMessage::CopyFail(reason)
+            }
             b'X' => FrontendMessage::Terminate,
             other => FrontendMessage::Unknown(other),
         }))
@@ -335,6 +348,19 @@ impl<S: Read + Write> Connection<S> {
     /// `3` — Close complete.
     pub fn send_close_complete(&mut self) -> Result<()> {
         self.write_message(b'3', &[])
+    }
+
+    /// `G` — CopyInResponse. Tells the client to start streaming CopyData.
+    /// Format byte: 0=text, 1=binary. Per-column format codes are all 0
+    /// (text) for our text-format COPY.
+    pub fn send_copy_in_response(&mut self, columns: usize) -> Result<()> {
+        let mut buf = Vec::with_capacity(3 + 2 * columns);
+        buf.push(0u8); // overall format = text
+        buf.extend_from_slice(&(columns as i16).to_be_bytes());
+        for _ in 0..columns {
+            buf.extend_from_slice(&0i16.to_be_bytes());
+        }
+        self.write_message(b'G', &buf)
     }
 
     // --- low level ---

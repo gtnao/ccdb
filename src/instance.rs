@@ -363,6 +363,14 @@ fn handle_client(
                 Some(FrontendMessage::Flush) => {
                     // We already flush after every send.
                 }
+                Some(FrontendMessage::CopyData(_))
+                | Some(FrontendMessage::CopyDone)
+                | Some(FrontendMessage::CopyFail(_)) => {
+                    // These belong inside `run_copy_in`'s inner loop. Seeing
+                    // one out here means the client is sending COPY data
+                    // without an active COPY — protocol violation, drop it.
+                    eprintln!("stray COPY message outside of an active COPY");
+                }
             }
         }
     })();
@@ -497,6 +505,10 @@ fn run_query_with_options(
             execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
             conn.send_command_complete("ANALYZE")?;
         }
+        AnalyzedStatement::Copy(s) => {
+            let n = run_copy_in(s, conn, bpm, lm, wal, tm, catalog, tx)?;
+            conn.send_command_complete(&format!("COPY {n}"))?;
+        }
     }
     Ok(())
 }
@@ -507,6 +519,237 @@ fn expect_affected(out: Output) -> Result<usize> {
         other => bail!("expected affected-row count, got {other:?}"),
     }
 }
+
+/// Drive a `COPY t FROM STDIN` over the wire. Sends CopyInResponse, reads
+/// CopyData/CopyDone (or CopyFail), inserts each line, then returns the
+/// row count. Wraps everything in an auto-commit-style WAL bracket so a
+/// crash mid-COPY rolls back cleanly.
+fn run_copy_in(
+    stmt: &crate::analyzer::AnalyzedCopyStatement,
+    conn: &mut Connection<TcpStream>,
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    tx: &mut Transaction,
+) -> Result<usize> {
+    conn.send_copy_in_response(stmt.field_count)?;
+
+    let was_inactive = !tx.is_active();
+    if was_inactive {
+        tx.refresh_autocommit();
+        let lsn = wal.append(tx.id(), tx.last_lsn(), WalRecordType::Begin)?;
+        tx.set_last_lsn(lsn);
+    }
+
+    let mut leftover: Vec<u8> = Vec::new();
+    let mut rows_inserted: usize = 0;
+    let mut tail_hint: Option<crate::page::PageId> = None;
+    let result: Result<()> = (|| {
+        loop {
+            match conn.read_message()? {
+                Some(FrontendMessage::CopyData(bytes)) => {
+                    leftover.extend_from_slice(&bytes);
+                    while let Some(nl) = leftover.iter().position(|&b| b == b'\n') {
+                        let line: Vec<u8> = leftover.drain(..=nl).take(nl).collect();
+                        rows_inserted += copy_apply_line(
+                            &line, stmt, bpm, lm, wal, catalog, tx, &mut tail_hint,
+                        )?;
+                    }
+                }
+                Some(FrontendMessage::CopyDone) => {
+                    if !leftover.is_empty() {
+                        rows_inserted += copy_apply_line(
+                            &leftover, stmt, bpm, lm, wal, catalog, tx, &mut tail_hint,
+                        )?;
+                        leftover.clear();
+                    }
+                    break;
+                }
+                Some(FrontendMessage::CopyFail(reason)) => {
+                    bail!("client cancelled COPY: {reason}");
+                }
+                Some(FrontendMessage::Terminate) | None => {
+                    bail!("connection closed during COPY");
+                }
+                Some(other) => bail!("unexpected message during COPY: {other:?}"),
+            }
+        }
+        Ok(())
+    })();
+
+    if was_inactive {
+        let bracket = if result.is_ok() {
+            WalRecordType::Commit
+        } else {
+            WalRecordType::Abort
+        };
+        let lsn = wal.append(tx.id(), tx.last_lsn(), bracket)?;
+        tx.set_last_lsn(lsn);
+        wal.flush()?;
+        let held = tx.take_held_locks();
+        lm.unlock_all(tx.id(), &held);
+        if result.is_ok() {
+            tm.commit(tx.id());
+        } else {
+            tm.abort(tx.id());
+        }
+    }
+
+    result.map(|_| rows_inserted)
+}
+
+/// Decode one CopyData text-format line, build the row's per-table-column
+/// `Value` vector (NULL-padding columns the client didn't list), and hand
+/// it to the executor. Strips a single trailing CR if present (psql sends
+/// CRLF on Windows; libpq strips it but we don't depend on that).
+fn copy_apply_line(
+    line: &[u8],
+    stmt: &crate::analyzer::AnalyzedCopyStatement,
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    catalog: &Catalog,
+    tx: &mut Transaction,
+    tail_hint: &mut Option<crate::page::PageId>,
+) -> Result<usize> {
+    let line = if line.last() == Some(&b'\r') {
+        &line[..line.len() - 1]
+    } else {
+        line
+    };
+    // The text format end-of-data sentinel is a line that's exactly `\.`. PG's
+    // libpq strips it before sending CopyDone, but tolerate it just in case.
+    if line == b"\\." {
+        return Ok(0);
+    }
+    let raw_fields = split_copy_fields(line);
+    if raw_fields.len() != stmt.field_count {
+        bail!(
+            "COPY line has {} fields, expected {}",
+            raw_fields.len(),
+            stmt.field_count,
+        );
+    }
+    // Decode each field once into a Value, then reorder by table-column order.
+    let decoded: Vec<Value> = raw_fields
+        .iter()
+        .enumerate()
+        .map(|(i, raw)| {
+            // The data type for this *field* depends on which table column
+            // it maps to — find the column whose column_to_field == Some(i).
+            let col_idx = stmt
+                .column_to_field
+                .iter()
+                .position(|m| *m == Some(i))
+                .ok_or_else(|| anyhow::anyhow!("internal: COPY field {i} maps to no column"))?;
+            decode_copy_field(raw, stmt.column_types[col_idx], stmt.column_nullable[col_idx])
+        })
+        .collect::<Result<_>>()?;
+    let row: Vec<Value> = stmt
+        .column_to_field
+        .iter()
+        .map(|m| match m {
+            Some(i) => decoded[*i].clone(),
+            None => Value::Null,
+        })
+        .collect();
+    let (_rid, new_tail) = crate::executor::perform_copy_row(
+        bpm, lm, wal, catalog, stmt.table_id, row, tx, *tail_hint,
+    )?;
+    *tail_hint = Some(new_tail);
+    Ok(1)
+}
+
+/// Split a COPY text-format line on raw (un-escaped) tab bytes. Backslash
+/// escapes don't change tab semantics in PG's COPY: only an unescaped tab
+/// separates fields. Empty fields (back-to-back tabs) are preserved.
+fn split_copy_fields(line: &[u8]) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut cur = Vec::new();
+    let mut i = 0;
+    while i < line.len() {
+        let b = line[i];
+        if b == b'\\' && i + 1 < line.len() {
+            // Pass the escape through; field decoding handles \\ etc.
+            cur.push(b);
+            cur.push(line[i + 1]);
+            i += 2;
+            continue;
+        }
+        if b == b'\t' {
+            out.push(std::mem::take(&mut cur));
+            i += 1;
+            continue;
+        }
+        cur.push(b);
+        i += 1;
+    }
+    out.push(cur);
+    out
+}
+
+/// Decode one COPY text-format field. `\N` ⇒ NULL; otherwise apply backslash
+/// unescaping (`\\`, `\t`, `\n`, `\r` and a few others) then parse against
+/// `dt`.
+fn decode_copy_field(raw: &[u8], dt: DataType, nullable: bool) -> Result<Value> {
+    if raw == b"\\N" {
+        if !nullable {
+            bail!("NULL value in non-nullable COPY column");
+        }
+        return Ok(Value::Null);
+    }
+    let mut s = String::with_capacity(raw.len());
+    let mut i = 0;
+    while i < raw.len() {
+        let b = raw[i];
+        if b == b'\\' && i + 1 < raw.len() {
+            let next = raw[i + 1];
+            let mapped = match next {
+                b'b' => 0x08,
+                b'f' => 0x0C,
+                b'n' => b'\n',
+                b'r' => b'\r',
+                b't' => b'\t',
+                b'v' => 0x0B,
+                b'\\' => b'\\',
+                _ => {
+                    s.push(b as char);
+                    i += 1;
+                    continue;
+                }
+            };
+            s.push(mapped as char);
+            i += 2;
+            continue;
+        }
+        s.push(b as char);
+        i += 1;
+    }
+    match dt {
+        DataType::Int => s
+            .parse::<i64>()
+            .map(|n| Value::Int(n as i32))
+            .map_err(|e| anyhow::anyhow!("COPY: invalid int '{s}': {e}")),
+        DataType::Double => s
+            .parse::<f64>()
+            .map(Value::Double)
+            .map_err(|e| anyhow::anyhow!("COPY: invalid double '{s}': {e}")),
+        DataType::Varchar => Ok(Value::Varchar(s)),
+        DataType::Bool => match s.to_ascii_lowercase().as_str() {
+            "t" | "true" | "1" => Ok(Value::Bool(true)),
+            "f" | "false" | "0" => Ok(Value::Bool(false)),
+            _ => bail!("COPY: invalid bool '{s}'"),
+        },
+        DataType::Timestamp | DataType::Date | DataType::Time | DataType::Interval => {
+            // Defer temporal decoding until pgbench actually exercises it —
+            // history.mtime is populated via INSERT, not COPY.
+            bail!("COPY of {:?} not yet supported", dt);
+        }
+    }
+}
+
 
 /// Replace `$N` placeholders in `sql` with the textual form of the
 /// corresponding `params` entry. Numeric values are inlined raw; everything

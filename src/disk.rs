@@ -40,6 +40,16 @@ impl DiskManager {
         self.file
             .seek(SeekFrom::Start(page_id as u64 * PAGE_SIZE as u64))?;
         self.file.write_all(data)?;
+        Ok(())
+    }
+
+    /// Force every preceding write to durable storage. Caller invokes this at
+    /// safe points (checkpoint, shutdown). Per-page writes are no longer
+    /// fsynced individually — that was making bulk insert (COPY, CREATE INDEX
+    /// scan) hundreds of times slower than necessary. Crash safety still
+    /// holds because every page write is preceded by a WAL flush of records
+    /// covering it, and recovery's redo pass replays those records.
+    pub fn sync(&mut self) -> Result<()> {
         self.file.sync_all()?;
         Ok(())
     }

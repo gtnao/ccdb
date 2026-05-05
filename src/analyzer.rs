@@ -15,10 +15,11 @@ use anyhow::{Result, bail};
 
 use crate::ast::{
     self, AlterTableAction, AlterTableStatement, AnalyzeStatement, BinaryOperator,
-    CreateIndexStatement, CreateSequenceStatement, CreateTableStatement, DeleteStatement,
-    DropIndexStatement, DropSequenceStatement, DropTableStatement, Expr, FromClause, FuncArgs,
-    InsertStatement, JoinType, Literal, OrderDir, SelectColumn, SelectStatement, Statement,
-    TableRef, TruncateStatement, UnaryOperator, UpdateStatement, VacuumStatement,
+    CopyStatement, CreateIndexStatement, CreateSequenceStatement, CreateTableStatement,
+    DeleteStatement, DropIndexStatement, DropSequenceStatement, DropTableStatement, Expr,
+    FromClause, FuncArgs, InsertStatement, JoinType, Literal, OrderDir, SelectColumn,
+    SelectStatement, Statement, TableRef, TruncateStatement, UnaryOperator, UpdateStatement,
+    VacuumStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -66,6 +67,7 @@ pub enum AnalyzedStatement {
     /// ANALYZE on its own — parse it, no-op execute (real stats arrive
     /// in Phase 9).
     AnalyzeNoop,
+    Copy(AnalyzedCopyStatement),
     Begin,
     Commit,
     Rollback,
@@ -260,6 +262,22 @@ pub struct AnalyzedDropSequenceStatement {
 pub struct AnalyzedVacuumStatement {
     /// Resolved (table_id, name). Empty source means "all user tables".
     pub tables: Vec<(usize, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedCopyStatement {
+    pub table_id: usize,
+    pub table_name: String,
+    /// One entry per *table* column. `Some(i)` means this column receives
+    /// the i-th field of each COPY data line; `None` means it gets NULL.
+    /// (Same shape as INSERT's column-list mapping.)
+    pub column_to_field: Vec<Option<usize>>,
+    /// Number of fields each CopyData line must contain.
+    pub field_count: usize,
+    /// Per-table-column data type, used by the executor to decode each
+    /// text-format field into a `Value`.
+    pub column_types: Vec<DataType>,
+    pub column_nullable: Vec<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -1106,6 +1124,57 @@ impl<'a> Analyzer<'a> {
         Ok(AnalyzedVacuumStatement { tables })
     }
 
+    fn analyze_copy(&self, s: &CopyStatement) -> Result<AnalyzedCopyStatement> {
+        let (table_id, table) = self
+            .catalog
+            .find_table(&s.table)?
+            .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
+
+        let column_to_field: Vec<Option<usize>> = match &s.columns {
+            None => (0..table.columns.len()).map(Some).collect(),
+            Some(names) => {
+                let mut indexed: Vec<Option<usize>> = vec![None; table.columns.len()];
+                for (fi, want) in names.iter().enumerate() {
+                    let (col_idx, _) = table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.name == *want)
+                        .ok_or_else(|| anyhow::anyhow!("column '{want}' not found"))?;
+                    if indexed[col_idx].is_some() {
+                        bail!("column '{want}' specified more than once");
+                    }
+                    indexed[col_idx] = Some(fi);
+                }
+                indexed
+            }
+        };
+        let field_count = match &s.columns {
+            None => table.columns.len(),
+            Some(c) => c.len(),
+        };
+        // Reject targets where a NOT NULL column would receive nothing —
+        // matches INSERT's column-list rule.
+        for (i, col) in table.columns.iter().enumerate() {
+            if column_to_field[i].is_none() && !col.nullable {
+                bail!(
+                    "column '{}' is not nullable and was not given a value",
+                    col.name
+                );
+            }
+        }
+        let column_types: Vec<DataType> = table.columns.iter().map(|c| c.data_type).collect();
+        let column_nullable: Vec<bool> = table.columns.iter().map(|c| c.nullable).collect();
+        Ok(AnalyzedCopyStatement {
+            table_id,
+            table_name: s.table.clone(),
+            column_to_field,
+            field_count,
+            column_types,
+            column_nullable,
+        })
+    }
+
     fn analyze_analyze_noop(&self, s: &AnalyzeStatement) -> Result<()> {
         for name in &s.tables {
             if self.catalog.find_table(name)?.is_none() {
@@ -1674,6 +1743,7 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
             a.analyze_analyze_noop(s)?;
             AnalyzedStatement::AnalyzeNoop
         }
+        Statement::Copy(s) => AnalyzedStatement::Copy(a.analyze_copy(s)?),
         Statement::Begin => AnalyzedStatement::Begin,
         Statement::Commit => AnalyzedStatement::Commit,
         Statement::Rollback => AnalyzedStatement::Rollback,

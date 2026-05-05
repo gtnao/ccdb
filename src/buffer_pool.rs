@@ -267,6 +267,11 @@ impl Inner {
         drop(pg);
         f.dirty = false;
         self.dpt.remove(&page_id);
+        // This entry point exists specifically so callers (CREATE INDEX,
+        // CREATE SEQUENCE) can guarantee a structural change is durable
+        // before they continue, since no WAL record reconstructs page_kind
+        // changes today. Force the fsync here.
+        self.disk.sync()?;
         Ok(())
     }
 
@@ -286,6 +291,10 @@ impl Inner {
                 }
             }
         }
+        // One fsync for the whole sweep instead of one per page. Crash safety
+        // still holds: per-page writes after WAL flush + recovery redo cover
+        // any pages that don't make it to disk before a crash.
+        self.disk.sync()?;
         Ok(())
     }
 }

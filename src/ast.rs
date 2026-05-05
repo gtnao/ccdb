@@ -16,6 +16,10 @@ pub enum Statement {
     DropSequence(DropSequenceStatement),
     Vacuum(VacuumStatement),
     Analyze(AnalyzeStatement),
+    /// `COPY t [(cols)] FROM STDIN`. Only the FROM STDIN form is supported;
+    /// the data itself arrives as CopyData messages on the wire, not in the
+    /// statement body.
+    Copy(CopyStatement),
     Begin,
     Commit,
     Rollback,
@@ -185,6 +189,14 @@ pub struct VacuumStatement {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnalyzeStatement {
     pub tables: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CopyStatement {
+    pub table: String,
+    /// `None` ⇒ every column in declaration order. Otherwise the listed
+    /// columns receive the COPY data; unlisted columns get NULL.
+    pub columns: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -43,6 +43,7 @@ impl Parser {
             Some(Token::Alter) => self.parse_alter()?,
             Some(Token::Vacuum) => self.parse_vacuum()?,
             Some(Token::Analyze) => self.parse_analyze()?,
+            Some(Token::Copy) => self.parse_copy()?,
             Some(Token::Begin) => {
                 self.bump();
                 Statement::Begin
@@ -565,6 +566,49 @@ impl Parser {
             }
         }
         Ok(Statement::Analyze(AnalyzeStatement { tables }))
+    }
+
+    /// `COPY t [(col, ...)] FROM STDIN [WITH (...)]`. The data itself
+    /// arrives as separate CopyData wire messages, not via this parser.
+    fn parse_copy(&mut self) -> Result<Statement> {
+        self.expect(&Token::Copy)?;
+        let table = self.parse_ident()?;
+        let columns = if matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.parse_ident()?);
+                match self.peek() {
+                    Some(Token::Comma) => {
+                        self.bump();
+                    }
+                    Some(Token::RParen) => break,
+                    other => bail!("expected ',' or ')' in COPY column list, got {other:?}"),
+                }
+            }
+            self.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        self.expect(&Token::From)?;
+        self.expect(&Token::Stdin)?;
+        // Optional `WITH (...)` storage parameters — consumed and discarded.
+        if matches!(self.peek(), Some(Token::Ident(s)) if s.eq_ignore_ascii_case("with")) {
+            self.bump();
+            self.expect(&Token::LParen)?;
+            let mut depth = 1;
+            while depth > 0 {
+                match self.peek() {
+                    Some(Token::LParen) => depth += 1,
+                    Some(Token::RParen) => depth -= 1,
+                    None => bail!("unterminated WITH (...) on COPY"),
+                    _ => {}
+                }
+                self.bump();
+            }
+        }
+        Ok(Statement::Copy(CopyStatement { table, columns }))
     }
 
     /// `TRUNCATE [TABLE] name [, name, ...]`.
