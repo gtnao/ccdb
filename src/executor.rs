@@ -8,8 +8,9 @@
 use anyhow::{Result, bail};
 
 use crate::analyzer::{
-    AnalyzedDeleteStatement, AnalyzedExpr, AnalyzedFrom, AnalyzedInsertStatement, AnalyzedLiteral,
-    AnalyzedSelectStatement, AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue, TableSource,
+    AggArg, AggKind, AnalyzedAggregate, AnalyzedDeleteStatement,
+    AnalyzedExpr, AnalyzedFrom, AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedSelectStatement,
+    AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue, TableSource,
 };
 use crate::ast::{BinaryOperator, JoinType, UnaryOperator};
 use crate::buffer_pool::BufferPool;
@@ -315,6 +316,225 @@ impl Executor for NestedLoopJoin<'_> {
                 }
             }
         }
+    }
+}
+
+// -- HashAggregate -----------------------------------------------------------
+
+/// Per-aggregate accumulator state.
+#[derive(Debug, Clone)]
+enum AggState {
+    Count(i64),
+    /// (sum, saw_any) — saw_any distinguishes "all NULL" → NULL from sum=0.
+    Sum(i64, bool),
+    /// (sum, count) for AVG. count=0 → NULL.
+    Avg(i64, i64),
+    Min(Option<Value>),
+    Max(Option<Value>),
+}
+
+impl AggState {
+    fn init(kind: AggKind) -> Self {
+        match kind {
+            AggKind::Count => AggState::Count(0),
+            AggKind::Sum => AggState::Sum(0, false),
+            AggKind::Avg => AggState::Avg(0, 0),
+            AggKind::Min => AggState::Min(None),
+            AggKind::Max => AggState::Max(None),
+        }
+    }
+
+    /// Update with one input row's evaluated argument value. `arg` is `None`
+    /// for COUNT(*) — every row counts regardless of any column being NULL.
+    fn update(&mut self, arg: Option<&Value>) -> Result<()> {
+        match self {
+            AggState::Count(n) => {
+                // COUNT(*) increments unconditionally. COUNT(expr) skips NULL.
+                match arg {
+                    None => *n += 1, // COUNT(*)
+                    Some(Value::Null) => {}
+                    Some(_) => *n += 1,
+                }
+            }
+            AggState::Sum(sum, any) => {
+                if let Some(v) = arg {
+                    match v {
+                        Value::Null => {}
+                        Value::Int(i) => {
+                            *sum += *i as i64;
+                            *any = true;
+                        }
+                        other => bail!("SUM not supported on {other:?}"),
+                    }
+                }
+            }
+            AggState::Avg(sum, count) => {
+                if let Some(v) = arg {
+                    match v {
+                        Value::Null => {}
+                        Value::Int(i) => {
+                            *sum += *i as i64;
+                            *count += 1;
+                        }
+                        other => bail!("AVG not supported on {other:?}"),
+                    }
+                }
+            }
+            AggState::Min(cur) => {
+                if let Some(v) = arg {
+                    if !matches!(v, Value::Null)
+                        && (cur.is_none() || compare_values(v, cur.as_ref().unwrap())?
+                            == std::cmp::Ordering::Less)
+                    {
+                        *cur = Some(v.clone());
+                    }
+                }
+            }
+            AggState::Max(cur) => {
+                if let Some(v) = arg {
+                    if !matches!(v, Value::Null)
+                        && (cur.is_none() || compare_values(v, cur.as_ref().unwrap())?
+                            == std::cmp::Ordering::Greater)
+                    {
+                        *cur = Some(v.clone());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Convert finalized state into the output Value. INT-only AVG truncates.
+    fn finalize(self) -> Value {
+        match self {
+            AggState::Count(n) => Value::Int(n as i32),
+            AggState::Sum(sum, any) => {
+                if any {
+                    Value::Int(sum as i32)
+                } else {
+                    Value::Null
+                }
+            }
+            AggState::Avg(sum, count) => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Int((sum / count) as i32)
+                }
+            }
+            AggState::Min(v) | AggState::Max(v) => v.unwrap_or(Value::Null),
+        }
+    }
+}
+
+fn compare_values(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
+        (Value::Varchar(x), Value::Varchar(y)) => Ok(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Ok(x.cmp(y)),
+        _ => bail!("cannot compare {a:?} and {b:?}"),
+    }
+}
+
+/// Volcano-style hash aggregator. Blocking: drains the child on `open()`,
+/// builds groups in a HashMap keyed by the group-key tuple, and emits one
+/// row per group on `next()`. Output tuple shape is `[group_keys...,
+/// agg_results...]`.
+pub struct HashAggregate<'a> {
+    child: Box<dyn Executor + 'a>,
+    group_keys: Vec<AnalyzedExpr>,
+    aggregates: Vec<AnalyzedAggregate>,
+    /// After open(), contains finalized output rows in iteration order.
+    rows: Vec<Tuple>,
+    cursor: usize,
+    initialized: bool,
+}
+
+impl<'a> HashAggregate<'a> {
+    pub fn new(
+        child: Box<dyn Executor + 'a>,
+        group_keys: Vec<AnalyzedExpr>,
+        aggregates: Vec<AnalyzedAggregate>,
+    ) -> Self {
+        Self {
+            child,
+            group_keys,
+            aggregates,
+            rows: Vec::new(),
+            cursor: 0,
+            initialized: false,
+        }
+    }
+
+    fn build(&mut self) -> Result<()> {
+        // Group order is preserved by remembering insertion order — using a
+        // Vec as the table because group keys are Vec<Value> (no Hash impl
+        // yet for Value, and small N is fine for now).
+        let mut keys: Vec<Vec<Value>> = Vec::new();
+        let mut states: Vec<Vec<AggState>> = Vec::new();
+
+        self.child.open()?;
+        let mut saw_any_input = false;
+        while let Some(t) = self.child.next()? {
+            saw_any_input = true;
+            let key: Vec<Value> = self
+                .group_keys
+                .iter()
+                .map(|gk| evaluate_expr(gk, &t))
+                .collect::<Result<_>>()?;
+            let group_idx = match keys.iter().position(|k| k == &key) {
+                Some(i) => i,
+                None => {
+                    keys.push(key);
+                    states.push(
+                        self.aggregates.iter().map(|a| AggState::init(a.kind)).collect(),
+                    );
+                    keys.len() - 1
+                }
+            };
+            for (i, agg) in self.aggregates.iter().enumerate() {
+                let arg_val = match &agg.arg {
+                    AggArg::Star => None,
+                    AggArg::Expr(e) => Some(evaluate_expr(e, &t)?),
+                };
+                states[group_idx][i].update(arg_val.as_ref())?;
+            }
+        }
+
+        // SQL: a SELECT with aggregates and *no* GROUP BY produces exactly
+        // one output row even on empty input. With GROUP BY, empty input
+        // produces zero rows.
+        if !saw_any_input && self.group_keys.is_empty() && !self.aggregates.is_empty() {
+            keys.push(Vec::new());
+            states.push(self.aggregates.iter().map(|a| AggState::init(a.kind)).collect());
+        }
+
+        for (k, s) in keys.into_iter().zip(states.into_iter()) {
+            let mut row: Vec<Value> = k;
+            row.extend(s.into_iter().map(AggState::finalize));
+            self.rows.push(Tuple::new(row));
+        }
+        Ok(())
+    }
+}
+
+impl Executor for HashAggregate<'_> {
+    fn open(&mut self) -> Result<()> {
+        if !self.initialized {
+            self.build()?;
+            self.initialized = true;
+        }
+        self.cursor = 0;
+        Ok(())
+    }
+
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        if self.cursor >= self.rows.len() {
+            return Ok(None);
+        }
+        let t = self.rows[self.cursor].clone();
+        self.cursor += 1;
+        Ok(Some(t))
     }
 }
 
@@ -868,12 +1088,27 @@ fn build_select_pipeline<'a>(
         Some(p) => Box::new(Filter::new(from_exec, p.clone())),
         None => from_exec,
     };
+    // HashAggregate goes in if and only if the analyzer decided aggregation
+    // was needed. After it, expressions reference post-agg positions.
+    let post_agg: Box<dyn Executor + 'a> = match &stmt.aggregation {
+        Some(agg) => Box::new(HashAggregate::new(
+            filtered,
+            agg.group_keys.clone(),
+            agg.aggregates.clone(),
+        )),
+        None => filtered,
+    };
+    // HAVING is a post-agg filter.
+    let post_having: Box<dyn Executor + 'a> = match &stmt.having {
+        Some(p) => Box::new(Filter::new(post_agg, p.clone())),
+        None => post_agg,
+    };
     let exprs: Vec<AnalyzedExpr> = stmt
         .select_items
         .iter()
         .map(|i| i.expr.clone())
         .collect();
-    Ok(Box::new(Project::new(filtered, exprs)))
+    Ok(Box::new(Project::new(post_having, exprs)))
 }
 
 fn build_from_pipeline<'a>(
@@ -1512,6 +1747,146 @@ mod tests {
             .find(|r| matches!(&r.values[1], Value::Varchar(s) if s == "Bob"))
             .expect("Bob row");
         assert_eq!(bob.values[2], Value::Null);
+    }
+
+    /// Build a fresh DB with `sales(region, product, quantity, price)` and
+    /// the canonical day18 fixture data already loaded.
+    fn setup_sales() -> (
+        Catalog,
+        BufferPool,
+        std::sync::Arc<crate::wal::WalManager>,
+        std::sync::Arc<crate::transaction_manager::TransactionManager>,
+    ) {
+        let path = temp_path("sales");
+        let disk = DiskManager::open(&path).unwrap();
+        let wal = std::sync::Arc::new(
+            crate::wal::WalManager::open(&path.with_extension("wal")).unwrap(),
+        );
+        let bpm = BufferPool::new(disk, 8, wal.clone());
+        let clog = std::sync::Arc::new(crate::clog::Clog::in_memory());
+        let tm = std::sync::Arc::new(
+            crate::transaction_manager::TransactionManager::new(clog),
+        );
+        crate::bootstrap::bootstrap(&bpm, &tm).unwrap();
+        let cat = Catalog::new(bpm.clone(), std::sync::Arc::clone(&tm));
+        run(
+            "CREATE TABLE sales (region VARCHAR, product VARCHAR, quantity INT, price INT)",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        );
+        for sql in [
+            "INSERT INTO sales VALUES ('east', 'apple', 10, 100)",
+            "INSERT INTO sales VALUES ('east', 'apple', 5, 100)",
+            "INSERT INTO sales VALUES ('east', 'banana', 8, 50)",
+            "INSERT INTO sales VALUES ('west', 'apple', 3, 100)",
+            "INSERT INTO sales VALUES ('west', 'banana', 12, 50)",
+            "INSERT INTO sales VALUES ('west', 'banana', 7, 50)",
+        ] {
+            run(sql, &cat, &bpm, &wal, &tm);
+        }
+        (cat, bpm, wal, tm)
+    }
+
+    #[test]
+    fn count_star_no_group() {
+        let (cat, bpm, wal, tm) = setup_sales();
+        let Output::Rows(rows) = run("SELECT COUNT(*) FROM sales", &cat, &bpm, &wal, &tm) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(6));
+    }
+
+    #[test]
+    fn count_star_on_empty_returns_zero() {
+        let (cat, bpm, wal, tm) = setup_users(); // empty users table
+        let Output::Rows(rows) = run("SELECT COUNT(*) FROM users", &cat, &bpm, &wal, &tm) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(0));
+    }
+
+    #[test]
+    fn sum_avg_min_max_no_group() {
+        let (cat, bpm, wal, tm) = setup_sales();
+        let Output::Rows(rows) = run(
+            "SELECT SUM(quantity), AVG(quantity), MIN(quantity), MAX(quantity) FROM sales",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(45)); // SUM = 10+5+8+3+12+7
+        assert_eq!(rows[0].values[1], Value::Int(7)); // AVG = 45/6 = 7 (truncated)
+        assert_eq!(rows[0].values[2], Value::Int(3)); // MIN
+        assert_eq!(rows[0].values[3], Value::Int(12)); // MAX
+    }
+
+    #[test]
+    fn group_by_single_column() {
+        let (cat, bpm, wal, tm) = setup_sales();
+        let Output::Rows(rows) = run(
+            "SELECT product, COUNT(*), SUM(quantity) FROM sales GROUP BY product",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 2);
+        // Build a {product → (count, sum)} map.
+        let mut got = std::collections::HashMap::new();
+        for r in &rows {
+            let Value::Varchar(p) = &r.values[0] else { panic!() };
+            let Value::Int(c) = &r.values[1] else { panic!() };
+            let Value::Int(s) = &r.values[2] else { panic!() };
+            got.insert(p.clone(), (*c, *s));
+        }
+        assert_eq!(got["apple"], (3, 18));
+        assert_eq!(got["banana"], (3, 27));
+    }
+
+    #[test]
+    fn group_by_having() {
+        let (cat, bpm, wal, tm) = setup_sales();
+        let Output::Rows(rows) = run(
+            "SELECT product, SUM(quantity) FROM sales GROUP BY product HAVING SUM(quantity) > 20",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 1);
+        let Value::Varchar(p) = &rows[0].values[0] else { panic!() };
+        assert_eq!(p, "banana");
+        assert_eq!(rows[0].values[1], Value::Int(27));
+    }
+
+    #[test]
+    fn ungrouped_column_in_select_errors() {
+        let (cat, _bpm, _wal, tm) = setup_sales();
+        let stmt = parse("SELECT region, COUNT(*) FROM sales GROUP BY product").unwrap();
+        let err = analyze(&cat, &stmt).unwrap_err().to_string();
+        assert!(err.contains("GROUP BY"), "got: {err}");
+        let _ = tm;
+    }
+
+    #[test]
+    fn aggregate_in_where_errors() {
+        let (cat, _bpm, _wal, tm) = setup_sales();
+        let stmt = parse("SELECT product FROM sales WHERE SUM(quantity) > 10").unwrap();
+        let err = analyze(&cat, &stmt).unwrap_err().to_string();
+        assert!(err.contains("aggregate"), "got: {err}");
+        let _ = tm;
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub struct SelectStatement {
     pub columns: Vec<SelectColumn>,
     pub from: FromClause,
     pub where_clause: Option<Expr>,
+    pub group_by: Vec<Expr>,
+    pub having: Option<Expr>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -113,6 +115,19 @@ pub enum Expr {
         op: UnaryOperator,
         expr: Box<Expr>,
     },
+    /// `name(args)` — function or aggregate call. Aggregate detection is
+    /// the analyzer's job; the parser just records the syntactic shape.
+    /// `COUNT(*)` is represented with `args = FuncArgs::Star`.
+    FuncCall {
+        name: String,
+        args: FuncArgs,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum FuncArgs {
+    Star,
+    Exprs(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -31,6 +31,9 @@ pub enum Token {
     Left,
     On,
     As,
+    Group,
+    By,
+    Having,
 
     // Identifiers and literals
     Ident(String),
@@ -224,6 +227,9 @@ impl Lexer {
             "LEFT" => Token::Left,
             "ON" => Token::On,
             "AS" => Token::As,
+            "GROUP" => Token::Group,
+            "BY" => Token::By,
+            "HAVING" => Token::Having,
             _ => Token::Ident(s),
         }
     }

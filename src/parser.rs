@@ -91,10 +91,30 @@ impl Parser {
         } else {
             None
         };
+        let group_by = if matches!(self.peek(), Some(Token::Group)) {
+            self.bump();
+            self.expect(&Token::By)?;
+            let mut exprs = vec![self.parse_expr()?];
+            while matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+                exprs.push(self.parse_expr()?);
+            }
+            exprs
+        } else {
+            Vec::new()
+        };
+        let having = if matches!(self.peek(), Some(Token::Having)) {
+            self.bump();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
         Ok(Statement::Select(SelectStatement {
             columns,
             from,
             where_clause,
+            group_by,
+            having,
         }))
     }
 
@@ -390,6 +410,25 @@ impl Parser {
             Some(Token::Ident(s)) => {
                 let s = s.clone();
                 self.bump();
+                // Function call: ident immediately followed by `(`.
+                if matches!(self.peek(), Some(Token::LParen)) {
+                    self.bump();
+                    let args = if matches!(self.peek(), Some(Token::Asterisk)) {
+                        self.bump();
+                        FuncArgs::Star
+                    } else if matches!(self.peek(), Some(Token::RParen)) {
+                        FuncArgs::Exprs(Vec::new())
+                    } else {
+                        let mut exprs = vec![self.parse_expr()?];
+                        while matches!(self.peek(), Some(Token::Comma)) {
+                            self.bump();
+                            exprs.push(self.parse_expr()?);
+                        }
+                        FuncArgs::Exprs(exprs)
+                    };
+                    self.expect(&Token::RParen)?;
+                    return Ok(Expr::FuncCall { name: s, args });
+                }
                 // Optional `.ident` for qualified column references.
                 if matches!(self.peek(), Some(Token::Dot)) {
                     self.bump();
@@ -455,8 +494,31 @@ mod tests {
                     alias: None
                 }),
                 where_clause: None,
+                group_by: Vec::new(),
+                having: None,
             })
         );
+    }
+
+    #[test]
+    fn parse_count_star() {
+        let s = parse("SELECT COUNT(*) FROM t").unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        let SelectColumn::Expr(Expr::FuncCall { name, args }) = &sel.columns[0] else {
+            panic!()
+        };
+        assert_eq!(name.to_uppercase(), "COUNT");
+        assert!(matches!(args, FuncArgs::Star));
+    }
+
+    #[test]
+    fn parse_group_by_having() {
+        let s =
+            parse("SELECT product, SUM(quantity) FROM sales GROUP BY product HAVING SUM(quantity) > 10")
+                .unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        assert_eq!(sel.group_by.len(), 1);
+        assert!(sel.having.is_some());
     }
 
     #[test]

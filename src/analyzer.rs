@@ -14,7 +14,7 @@ use std::mem;
 use anyhow::{Result, bail};
 
 use crate::ast::{
-    self, BinaryOperator, CreateTableStatement, DeleteStatement, Expr, FromClause,
+    self, BinaryOperator, CreateTableStatement, DeleteStatement, Expr, FromClause, FuncArgs,
     InsertStatement, JoinType, Literal, SelectColumn, SelectStatement, Statement, TableRef,
     UnaryOperator, UpdateStatement,
 };
@@ -85,8 +85,72 @@ pub struct AnalyzedAssignment {
 pub struct AnalyzedSelectStatement {
     pub range_table: Vec<RangeTableEntry>,
     pub from: AnalyzedFrom,
-    pub select_items: Vec<AnalyzedSelectItem>,
+    /// Pre-aggregate filter (evaluated against input tuples).
     pub where_clause: Option<AnalyzedExpr>,
+    /// Set when the SELECT has GROUP BY or any aggregate function in
+    /// SELECT/HAVING. The pipeline becomes ... → HashAggregate → HAVING → Project.
+    pub aggregation: Option<AnalyzedAggregation>,
+    /// Evaluated against:
+    ///   - input tuples if `aggregation` is None
+    ///   - post-aggregate tuples ([keys..., agg_results...]) otherwise.
+    pub select_items: Vec<AnalyzedSelectItem>,
+    /// Same evaluation context as `select_items` (only meaningful with aggregation).
+    pub having: Option<AnalyzedExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedAggregation {
+    /// GROUP BY keys, evaluated against input tuples.
+    pub group_keys: Vec<AnalyzedExpr>,
+    /// Aggregate functions in invocation order; their args reference input tuples.
+    pub aggregates: Vec<AnalyzedAggregate>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedAggregate {
+    pub kind: AggKind,
+    pub arg: AggArg,
+    pub result_type: DataType,
+}
+
+#[derive(Debug, Clone)]
+pub enum AggArg {
+    /// COUNT(*) — count every input row.
+    Star,
+    /// Aggregate over a per-row expression (`SUM(quantity)` etc).
+    Expr(Box<AnalyzedExpr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggKind {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+impl AggKind {
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name.to_ascii_uppercase().as_str() {
+            "COUNT" => Some(Self::Count),
+            "SUM" => Some(Self::Sum),
+            "AVG" => Some(Self::Avg),
+            "MIN" => Some(Self::Min),
+            "MAX" => Some(Self::Max),
+            _ => None,
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Count => "COUNT",
+            Self::Sum => "SUM",
+            Self::Avg => "AVG",
+            Self::Min => "MIN",
+            Self::Max => "MAX",
+        }
+    }
 }
 
 /// Tree of joined sources. Mirrors the AST `FromClause` but carries
@@ -278,6 +342,9 @@ impl<'a> Analyzer<'a> {
         hit.ok_or_else(|| anyhow::anyhow!("column '{name}' not found"))
     }
 
+    /// Analyze an expression that runs against per-row input tuples (WHERE,
+    /// GROUP BY exprs, aggregate-function arguments). Aggregate calls are
+    /// rejected here — they'd be nonsensical on a single row.
     fn analyze_expr(&self, e: &Expr) -> Result<AnalyzedExpr> {
         match e {
             Expr::Literal(l) => Ok(AnalyzedExpr::Literal(literal_to_analyzed(l))),
@@ -301,6 +368,12 @@ impl<'a> Analyzer<'a> {
                     expr: Box::new(inner),
                     result_type: infer_unary_type(*op),
                 })
+            }
+            Expr::FuncCall { name, .. } => {
+                if AggKind::from_name(name).is_some() {
+                    bail!("aggregate '{name}' not allowed here");
+                }
+                bail!("unknown function '{name}'")
             }
         }
     }
@@ -386,40 +459,103 @@ impl<'a> Analyzer<'a> {
         self.scopes.push(Vec::new());
         let (from_a, _total_width) = self.analyze_from(&s.from, 0)?;
 
-        let mut select_items = Vec::new();
-        for c in &s.columns {
-            match c {
-                SelectColumn::Asterisk => {
-                    // Expand to every column from every RTE in declaration order.
-                    let scope = self.scopes.last().expect("scope pushed").clone();
-                    for entry in scope {
-                        let rte = &self.range_table[entry.rte_index];
-                        let off = rte.flat_offset;
-                        for (i, oc) in rte.output_columns.iter().enumerate() {
-                            select_items.push(AnalyzedSelectItem {
-                                expr: AnalyzedExpr::ColumnRef(AnalyzedColumnRef {
-                                    rte_index: entry.rte_index,
-                                    column_index: off + i,
-                                    column_name: oc.name.clone(),
-                                    data_type: oc.data_type,
-                                }),
-                                alias: None,
-                            });
-                        }
+        // WHERE: pre-aggregate, no aggregates allowed.
+        let where_clause = match &s.where_clause {
+            Some(e) => {
+                let a = self.analyze_expr(e)?;
+                if !matches!(a.data_type(), Some(DataType::Bool) | None) {
+                    bail!("WHERE clause must be boolean, got {:?}", a.data_type());
+                }
+                Some(a)
+            }
+            None => None,
+        };
+
+        // GROUP BY: each expression analyzed against input tuples.
+        let group_keys: Vec<AnalyzedExpr> = s
+            .group_by
+            .iter()
+            .map(|e| self.analyze_expr(e))
+            .collect::<Result<_>>()?;
+
+        // Detect whether aggregation is needed: GROUP BY present OR any
+        // aggregate function found in SELECT/HAVING.
+        let has_aggregate_call = s.columns.iter().any(|c| match c {
+            SelectColumn::Asterisk => false,
+            SelectColumn::Expr(e) => contains_aggregate(e),
+        }) || s.having.as_ref().map(contains_aggregate).unwrap_or(false);
+        let needs_aggregation = !group_keys.is_empty() || has_aggregate_call;
+
+        let (select_items, having, aggregation) = if needs_aggregation {
+            let mut aggs: Vec<AnalyzedAggregate> = Vec::new();
+            let mut select_items = Vec::new();
+            for c in &s.columns {
+                match c {
+                    SelectColumn::Asterisk => {
+                        bail!("`SELECT *` with GROUP BY/aggregates is not supported");
+                    }
+                    SelectColumn::Expr(e) => {
+                        let rewritten = self.analyze_post_agg(e, &group_keys, &mut aggs)?;
+                        select_items.push(AnalyzedSelectItem {
+                            expr: rewritten,
+                            alias: None,
+                        });
                     }
                 }
-                SelectColumn::Expr(e) => {
-                    select_items.push(AnalyzedSelectItem {
-                        expr: self.analyze_expr(e)?,
-                        alias: None,
-                    });
+            }
+            let having = match &s.having {
+                Some(e) => {
+                    let a = self.analyze_post_agg(e, &group_keys, &mut aggs)?;
+                    if !matches!(a.data_type(), Some(DataType::Bool) | None) {
+                        bail!("HAVING clause must be boolean, got {:?}", a.data_type());
+                    }
+                    Some(a)
+                }
+                None => None,
+            };
+            (
+                select_items,
+                having,
+                Some(AnalyzedAggregation {
+                    group_keys,
+                    aggregates: aggs,
+                }),
+            )
+        } else {
+            // No aggregation: SELECT operates on input tuples directly.
+            if s.having.is_some() {
+                bail!("HAVING requires GROUP BY or an aggregate function");
+            }
+            let mut select_items = Vec::new();
+            for c in &s.columns {
+                match c {
+                    SelectColumn::Asterisk => {
+                        let scope = self.scopes.last().expect("scope pushed").clone();
+                        for entry in scope {
+                            let rte = &self.range_table[entry.rte_index];
+                            let off = rte.flat_offset;
+                            for (i, oc) in rte.output_columns.iter().enumerate() {
+                                select_items.push(AnalyzedSelectItem {
+                                    expr: AnalyzedExpr::ColumnRef(AnalyzedColumnRef {
+                                        rte_index: entry.rte_index,
+                                        column_index: off + i,
+                                        column_name: oc.name.clone(),
+                                        data_type: oc.data_type,
+                                    }),
+                                    alias: None,
+                                });
+                            }
+                        }
+                    }
+                    SelectColumn::Expr(e) => {
+                        select_items.push(AnalyzedSelectItem {
+                            expr: self.analyze_expr(e)?,
+                            alias: None,
+                        });
+                    }
                 }
             }
-        }
-
-        let where_clause = match &s.where_clause {
-            Some(e) => Some(self.analyze_expr(e)?),
-            None => None,
+            (select_items, None, None)
         };
 
         self.scopes.pop();
@@ -427,9 +563,97 @@ impl<'a> Analyzer<'a> {
         Ok(AnalyzedSelectStatement {
             range_table: mem::take(&mut self.range_table),
             from: from_a,
-            select_items,
             where_clause,
+            aggregation,
+            select_items,
+            having,
         })
+    }
+
+    /// Analyze an expression that runs against post-aggregate tuples
+    /// `[group_keys..., agg_results...]`. Aggregate calls are extracted into
+    /// `aggs` and replaced with ColumnRefs into the post-agg position.
+    /// Bare column refs must match a `group_keys` entry — anything else is
+    /// rejected as not grouped.
+    fn analyze_post_agg(
+        &self,
+        e: &Expr,
+        group_keys: &[AnalyzedExpr],
+        aggs: &mut Vec<AnalyzedAggregate>,
+    ) -> Result<AnalyzedExpr> {
+        match e {
+            Expr::Literal(l) => Ok(AnalyzedExpr::Literal(literal_to_analyzed(l))),
+            Expr::Column { qualifier, name } => {
+                let resolved = self.resolve_column(qualifier.as_deref(), name)?;
+                let resolved_expr = AnalyzedExpr::ColumnRef(resolved.clone());
+                let pos = group_keys
+                    .iter()
+                    .position(|gk| same_expr(gk, &resolved_expr))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "column '{name}' must appear in GROUP BY or in an aggregate function"
+                        )
+                    })?;
+                Ok(AnalyzedExpr::ColumnRef(AnalyzedColumnRef {
+                    rte_index: usize::MAX,
+                    column_index: pos,
+                    column_name: name.clone(),
+                    data_type: resolved.data_type,
+                }))
+            }
+            Expr::BinaryOp { left, op, right } => {
+                let l = self.analyze_post_agg(left, group_keys, aggs)?;
+                let r = self.analyze_post_agg(right, group_keys, aggs)?;
+                Ok(AnalyzedExpr::BinaryOp {
+                    left: Box::new(l),
+                    op: *op,
+                    right: Box::new(r),
+                    result_type: infer_binary_type(*op),
+                })
+            }
+            Expr::UnaryOp { op, expr } => {
+                let inner = self.analyze_post_agg(expr, group_keys, aggs)?;
+                Ok(AnalyzedExpr::UnaryOp {
+                    op: *op,
+                    expr: Box::new(inner),
+                    result_type: infer_unary_type(*op),
+                })
+            }
+            Expr::FuncCall { name, args } => {
+                let kind = AggKind::from_name(name)
+                    .ok_or_else(|| anyhow::anyhow!("unknown function '{name}'"))?;
+                let (analyzed_arg, arg_type) = match (kind, args) {
+                    (AggKind::Count, FuncArgs::Star) => (AggArg::Star, None),
+                    (_, FuncArgs::Star) => bail!("only COUNT supports `*`"),
+                    (_, FuncArgs::Exprs(es)) => {
+                        if es.len() != 1 {
+                            bail!("aggregate '{name}' takes exactly one argument");
+                        }
+                        // Aggregate-arg cannot itself contain an aggregate.
+                        if contains_aggregate(&es[0]) {
+                            bail!("nested aggregate in '{name}' not allowed");
+                        }
+                        let a = self.analyze_expr(&es[0])?;
+                        let t = a.data_type();
+                        (AggArg::Expr(Box::new(a)), t)
+                    }
+                };
+                let result_type = infer_aggregate_type(kind, arg_type)?;
+                let agg_index = aggs.len();
+                aggs.push(AnalyzedAggregate {
+                    kind,
+                    arg: analyzed_arg,
+                    result_type,
+                });
+                // Post-agg position is group_keys.len() + agg_index.
+                Ok(AnalyzedExpr::ColumnRef(AnalyzedColumnRef {
+                    rte_index: usize::MAX,
+                    column_index: group_keys.len() + agg_index,
+                    column_name: kind.name().to_string(),
+                    data_type: result_type,
+                }))
+            }
+        }
     }
 
     fn analyze_insert(&self, s: &InsertStatement) -> Result<AnalyzedInsertStatement> {
@@ -622,6 +846,85 @@ impl<'a> Analyzer<'a> {
             columns,
         })
     }
+}
+
+/// Walk an AST expression to see whether it contains any aggregate-named
+/// function call. Used to decide whether a SELECT needs an aggregation
+/// pipeline even without a GROUP BY clause.
+fn contains_aggregate(e: &Expr) -> bool {
+    match e {
+        Expr::Literal(_) | Expr::Column { .. } => false,
+        Expr::BinaryOp { left, right, .. } => {
+            contains_aggregate(left) || contains_aggregate(right)
+        }
+        Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
+        Expr::FuncCall { name, args } => {
+            if AggKind::from_name(name).is_some() {
+                return true;
+            }
+            match args {
+                FuncArgs::Star => false,
+                FuncArgs::Exprs(es) => es.iter().any(contains_aggregate),
+            }
+        }
+    }
+}
+
+/// Structural equality of analyzed expressions. Used to match SELECT/HAVING
+/// column refs against GROUP BY entries.
+fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
+    match (a, b) {
+        (AnalyzedExpr::Literal(la), AnalyzedExpr::Literal(lb)) => match (&la.value, &lb.value) {
+            (LiteralValue::Integer(x), LiteralValue::Integer(y)) => x == y,
+            (LiteralValue::String(x), LiteralValue::String(y)) => x == y,
+            (LiteralValue::Boolean(x), LiteralValue::Boolean(y)) => x == y,
+            (LiteralValue::Null, LiteralValue::Null) => true,
+            _ => false,
+        },
+        (AnalyzedExpr::ColumnRef(x), AnalyzedExpr::ColumnRef(y)) => {
+            x.rte_index == y.rte_index && x.column_index == y.column_index
+        }
+        (
+            AnalyzedExpr::BinaryOp {
+                left: l1,
+                op: o1,
+                right: r1,
+                ..
+            },
+            AnalyzedExpr::BinaryOp {
+                left: l2,
+                op: o2,
+                right: r2,
+                ..
+            },
+        ) => o1 == o2 && same_expr(l1, l2) && same_expr(r1, r2),
+        (
+            AnalyzedExpr::UnaryOp {
+                op: o1, expr: e1, ..
+            },
+            AnalyzedExpr::UnaryOp {
+                op: o2, expr: e2, ..
+            },
+        ) => o1 == o2 && same_expr(e1, e2),
+        _ => false,
+    }
+}
+
+/// Type of an aggregate's result given its argument type. INT-only world
+/// for now: SUM/AVG/MIN/MAX of INT → INT; MIN/MAX of VARCHAR → VARCHAR;
+/// COUNT → INT regardless. AVG truncates to INT (no NUMERIC type yet).
+fn infer_aggregate_type(kind: AggKind, arg_type: Option<DataType>) -> Result<DataType> {
+    Ok(match kind {
+        AggKind::Count => DataType::Int,
+        AggKind::Sum | AggKind::Avg => match arg_type {
+            Some(DataType::Int) | None => DataType::Int,
+            Some(t) => bail!("{:?} is not numeric for {:?}", t, kind),
+        },
+        AggKind::Min | AggKind::Max => match arg_type {
+            Some(t) => t,
+            None => bail!("argument type required for {:?}", kind),
+        },
+    })
 }
 
 fn literal_to_analyzed(lit: &Literal) -> AnalyzedLiteral {
