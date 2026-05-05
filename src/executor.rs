@@ -693,6 +693,13 @@ fn evaluate_expr(expr: &AnalyzedExpr, tuple: &Tuple) -> Result<Value> {
             let v = evaluate_expr(expr, tuple)?;
             evaluate_unary(*op, &v)
         }
+        // IS NULL is the one predicate that returns a *definite* bool when
+        // its operand is NULL — that's the whole point.
+        AnalyzedExpr::IsNull { expr, negated } => {
+            let v = evaluate_expr(expr, tuple)?;
+            let is_null = matches!(v, Value::Null);
+            Ok(Value::Bool(if *negated { !is_null } else { is_null }))
+        }
     }
 }
 
@@ -2110,6 +2117,45 @@ mod tests {
         assert_eq!(rows.len(), 2);
         let Value::Varchar(p0) = &rows[0].values[0] else { panic!() };
         assert_eq!(p0, "banana"); // SUM=27 > 18
+    }
+
+    #[test]
+    fn is_null_filters_to_null_rows() {
+        let (cat, bpm, wal, tm) = setup_users();
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (2, NULL)", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (3, 'b')", &cat, &bpm, &wal, &tm);
+        let Output::Rows(rows) = run(
+            "SELECT id FROM users WHERE name IS NULL",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int(2));
+    }
+
+    #[test]
+    fn is_not_null_filters_out_null_rows() {
+        let (cat, bpm, wal, tm) = setup_users();
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (2, NULL)", &cat, &bpm, &wal, &tm);
+        run("INSERT INTO users VALUES (3, 'b')", &cat, &bpm, &wal, &tm);
+        let Output::Rows(rows) = run(
+            "SELECT id FROM users WHERE name IS NOT NULL ORDER BY id",
+            &cat,
+            &bpm,
+            &wal,
+            &tm,
+        ) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], Value::Int(1));
+        assert_eq!(rows[1].values[0], Value::Int(3));
     }
 
     #[test]

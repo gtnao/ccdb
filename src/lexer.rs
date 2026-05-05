@@ -38,6 +38,7 @@ pub enum Token {
     Asc,
     Desc,
     Limit,
+    Is,
 
     // Identifiers and literals
     Ident(String),
@@ -238,6 +239,7 @@ impl Lexer {
             "ASC" => Token::Asc,
             "DESC" => Token::Desc,
             "LIMIT" => Token::Limit,
+            "IS" => Token::Is,
             _ => Token::Ident(s),
         }
     }

@@ -219,6 +219,11 @@ pub enum AnalyzedExpr {
         expr: Box<AnalyzedExpr>,
         result_type: DataType,
     },
+    /// `expr IS [NOT] NULL`. Always returns Bool, even on NULL operand.
+    IsNull {
+        expr: Box<AnalyzedExpr>,
+        negated: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -251,6 +256,7 @@ impl AnalyzedExpr {
             AnalyzedExpr::ColumnRef(c) => Some(c.data_type),
             AnalyzedExpr::BinaryOp { result_type, .. }
             | AnalyzedExpr::UnaryOp { result_type, .. } => Some(*result_type),
+            AnalyzedExpr::IsNull { .. } => Some(DataType::Bool),
         }
     }
 }
@@ -377,6 +383,13 @@ impl<'a> Analyzer<'a> {
                     op: *op,
                     expr: Box::new(inner),
                     result_type: infer_unary_type(*op),
+                })
+            }
+            Expr::IsNull { expr, negated } => {
+                let inner = self.analyze_expr(expr)?;
+                Ok(AnalyzedExpr::IsNull {
+                    expr: Box::new(inner),
+                    negated: *negated,
                 })
             }
             Expr::FuncCall { name, .. } => {
@@ -646,6 +659,13 @@ impl<'a> Analyzer<'a> {
                     result_type: infer_unary_type(*op),
                 })
             }
+            Expr::IsNull { expr, negated } => {
+                let inner = self.analyze_post_agg(expr, group_keys, aggs)?;
+                Ok(AnalyzedExpr::IsNull {
+                    expr: Box::new(inner),
+                    negated: *negated,
+                })
+            }
             Expr::FuncCall { name, args } => {
                 let kind = AggKind::from_name(name)
                     .ok_or_else(|| anyhow::anyhow!("unknown function '{name}'"))?;
@@ -885,6 +905,7 @@ fn contains_aggregate(e: &Expr) -> bool {
             contains_aggregate(left) || contains_aggregate(right)
         }
         Expr::UnaryOp { expr, .. } => contains_aggregate(expr),
+        Expr::IsNull { expr, .. } => contains_aggregate(expr),
         Expr::FuncCall { name, args } => {
             if AggKind::from_name(name).is_some() {
                 return true;
@@ -933,6 +954,16 @@ fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
                 op: o2, expr: e2, ..
             },
         ) => o1 == o2 && same_expr(e1, e2),
+        (
+            AnalyzedExpr::IsNull {
+                expr: e1,
+                negated: n1,
+            },
+            AnalyzedExpr::IsNull {
+                expr: e2,
+                negated: n2,
+            },
+        ) => n1 == n2 && same_expr(e1, e2),
         _ => false,
     }
 }

@@ -364,6 +364,22 @@ impl Parser {
 
     fn parse_comparison(&mut self) -> Result<Expr> {
         let left = self.parse_additive()?;
+        // `expr IS [NOT] NULL` postfix. Lives at comparison precedence; no
+        // chaining (e.g. `x IS NULL = TRUE` is rejected by the grammar).
+        if matches!(self.peek(), Some(Token::Is)) {
+            self.bump();
+            let negated = if matches!(self.peek(), Some(Token::Not)) {
+                self.bump();
+                true
+            } else {
+                false
+            };
+            self.expect(&Token::Null)?;
+            return Ok(Expr::IsNull {
+                expr: Box::new(left),
+                negated,
+            });
+        }
         let op = match self.peek() {
             Some(Token::Eq) => BinaryOperator::Eq,
             Some(Token::Ne) => BinaryOperator::Ne,
@@ -543,6 +559,20 @@ mod tests {
                 limit: None,
             })
         );
+    }
+
+    #[test]
+    fn parse_is_null_and_is_not_null() {
+        let s = parse("SELECT id FROM t WHERE name IS NULL").unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        let w = sel.where_clause.unwrap();
+        let Expr::IsNull { negated, .. } = w else { panic!("expected IsNull") };
+        assert!(!negated);
+
+        let s = parse("SELECT id FROM t WHERE name IS NOT NULL").unwrap();
+        let Statement::Select(sel) = s else { panic!() };
+        let Expr::IsNull { negated, .. } = sel.where_clause.unwrap() else { panic!() };
+        assert!(negated);
     }
 
     #[test]

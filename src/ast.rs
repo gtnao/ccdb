@@ -130,6 +130,13 @@ pub enum Expr {
         op: UnaryOperator,
         expr: Box<Expr>,
     },
+    /// `expr IS NULL` / `expr IS NOT NULL`. Distinct from `= NULL` because
+    /// IS NULL is the only predicate that returns a definite bool when its
+    /// operand is NULL; equality propagates NULL into NULL (3VL).
+    IsNull {
+        expr: Box<Expr>,
+        negated: bool,
+    },
     /// `name(args)` — function or aggregate call. Aggregate detection is
     /// the analyzer's job; the parser just records the syntactic shape.
     /// `COUNT(*)` is represented with `args = FuncArgs::Star`.
