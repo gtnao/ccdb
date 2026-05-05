@@ -1832,8 +1832,54 @@ fn perform_vacuum(
         }
     }
 
+    // Sweep each index's leaf chain for empty leaves and unlink them from
+    // their left neighbour. Internal nodes still point at the empty leaf,
+    // but a search that descends to it just sees zero entries — correct
+    // behaviour, only minor wasted space until a future merge pass takes
+    // care of the parent. Range scans (which use the leaf chain) skip
+    // the empty leaves entirely.
+    for (table_id, _name) in &stmt.tables {
+        for idx in catalog.indexes_for_table(*table_id)? {
+            sweep_empty_leaves(bpm, idx.root_page_id, stamp_lsn)?;
+        }
+    }
+
     log_record(wal, tx, WalRecordType::Commit)?;
     wal.flush()?;
+    Ok(())
+}
+
+/// Walk the leaf chain from the leftmost leaf, dropping every empty
+/// (Page::is_empty) leaf out of the chain by patching the previous leaf's
+/// next-pointer. The first leaf is always kept — its position is reachable
+/// from the root's leftmost-child pointer, which we don't rewrite here.
+fn sweep_empty_leaves(bpm: &BufferPool, root: PageId, stamp_lsn: Lsn) -> Result<()> {
+    let first = crate::btree::leftmost_leaf(bpm, root)?;
+    let mut prev = first;
+    let mut cur = {
+        let g = bpm.fetch_page(first)?;
+        g.read().next_page_id()
+    };
+    while cur != crate::page::NO_NEXT_PAGE {
+        let g = bpm.fetch_page(cur)?;
+        let (next, empty) = {
+            let p = g.read();
+            (p.next_page_id(), p.is_empty())
+        };
+        drop(g);
+        if empty {
+            let g2 = bpm.fetch_page(prev)?;
+            let mut pp = g2.write();
+            pp.set_next_page_id(next);
+            if pp.page_lsn() < stamp_lsn {
+                pp.set_page_lsn(stamp_lsn);
+            }
+            // prev stays — the empty leaf is gone from the chain.
+        } else {
+            prev = cur;
+        }
+        cur = next;
+    }
     Ok(())
 }
 

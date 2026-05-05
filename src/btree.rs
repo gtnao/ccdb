@@ -756,6 +756,26 @@ pub fn delete(
 
 // ---- bootstrap helpers ----------------------------------------------------
 
+/// Walk from the root down to the leftmost leaf. Used by VACUUM to start a
+/// leaf-chain sweep without bothering with a search key.
+pub fn leftmost_leaf(bpm: &BufferPool, root: PageId) -> Result<PageId> {
+    let mut cur = root;
+    loop {
+        let g = bpm.fetch_page(cur)?;
+        let p = g.read();
+        match p.page_kind() {
+            PageKind::BTreeLeaf => return Ok(cur),
+            // For an internal node the leftmost-child pointer is stored
+            // in the `next_page_id` slot — that's how internal nodes are
+            // laid out (see file header).
+            PageKind::BTreeInternal => {
+                cur = p.next_page_id();
+            }
+            other => bail!("leftmost_leaf: not a btree page ({:?})", other),
+        }
+    }
+}
+
 /// Allocate a fresh empty leaf and return its page id. Used by CREATE INDEX
 /// before any rows exist. Force-flushes so the BTreeLeaf page_kind is on disk
 /// before any crash — there is no WAL record that would let recovery
