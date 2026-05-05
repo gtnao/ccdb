@@ -1813,9 +1813,9 @@ fn perform_vacuum(
                 }
             }
 
-            // Unlink fully-empty pages from the chain (except the head).
-            // The page's bytes are abandoned for now; FSM (B3) will pick
-            // them up for reuse later.
+            // Unlink fully-empty pages from the chain (except the head)
+            // and hand them back to the buffer pool's free list so the
+            // next `new_page` reuses them instead of extending the file.
             if became_empty && prev.is_some() {
                 let prev_pid = prev.unwrap();
                 let g2 = bpm.fetch_page(prev_pid)?;
@@ -1824,6 +1824,9 @@ fn perform_vacuum(
                 if pp.page_lsn() < stamp_lsn {
                     pp.set_page_lsn(stamp_lsn);
                 }
+                drop(pp);
+                drop(g2);
+                bpm.recycle_page(cur);
                 // prev stays the same — the page we just dropped is gone.
             } else {
                 prev = Some(cur);
@@ -1874,6 +1877,15 @@ fn sweep_empty_leaves(bpm: &BufferPool, root: PageId, stamp_lsn: Lsn) -> Result<
             if pp.page_lsn() < stamp_lsn {
                 pp.set_page_lsn(stamp_lsn);
             }
+            drop(pp);
+            drop(g2);
+            // The leaf is unreachable from the chain. Internal nodes still
+            // point at it, but a search descending there now lands on a
+            // newly-Heap page and bails on the page_kind mismatch — so
+            // only recycle leaves that no internal node points at. We
+            // can't cheaply prove that here without parent tracking, so
+            // leave btree leaf bytes in place for now (B2 already saved
+            // the chain-traversal cost).
             // prev stays — the empty leaf is gone from the chain.
         } else {
             prev = cur;

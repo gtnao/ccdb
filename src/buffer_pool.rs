@@ -88,6 +88,11 @@ struct Inner {
     /// which the page first became dirty since its last flush. Used by
     /// fuzzy checkpoint to bound recovery's redo phase.
     dpt: HashMap<PageId, Lsn>,
+    /// In-memory free list of page ids handed back by VACUUM (or any
+    /// future caller via `recycle_page`). `new_page` pulls from here
+    /// before extending the file. Lost on restart — recovery doesn't
+    /// rebuild it; the next VACUUM repopulates.
+    free_list: Vec<PageId>,
 }
 
 #[derive(Clone)]
@@ -107,8 +112,16 @@ impl BufferPool {
                 capacity,
                 wal,
                 dpt: HashMap::new(),
+                free_list: Vec::new(),
             })),
         }
+    }
+
+    /// Hand a page back to the free list so the next `new_page` reuses it
+    /// instead of extending the file. Caller (currently only VACUUM) must
+    /// have removed every reachable reference to the page first.
+    pub fn recycle_page(&self, page_id: PageId) {
+        self.inner.lock().unwrap().free_list.push(page_id);
     }
 
     /// Snapshot of the current DPT for inclusion in a Checkpoint record.
@@ -214,6 +227,27 @@ impl Inner {
     }
 
     fn new_page_locked(&mut self) -> Result<(PageId, Arc<RwLock<Page>>)> {
+        // Reuse a recycled page id if VACUUM left one for us.
+        if let Some(page_id) = self.free_list.pop() {
+            // The recycled page may still be pinned in a frame from before
+            // it was freed — evict it first so the buffered (stale) image
+            // doesn't survive into the new occupant.
+            if let Some(&fid) = self.page_table.get(&page_id) {
+                self.evict(fid)?;
+            }
+            let fid = self.pick_or_evict()?;
+            {
+                let mut p = self.frames[fid].page.write().unwrap();
+                *p = Page::new(page_id);
+            }
+            let f = &mut self.frames[fid];
+            f.page_id = Some(page_id);
+            f.pin_count = 1;
+            f.dirty = true; // disk image is whatever VACUUM left there
+            self.page_table.insert(page_id, fid);
+            self.replacer.pin(fid);
+            return Ok((page_id, Arc::clone(&f.page)));
+        }
         let fid = self.pick_or_evict()?;
         let page_id = self.disk.allocate_page()?;
         {
