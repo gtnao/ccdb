@@ -258,6 +258,20 @@ impl Page {
         self.set_free_space_offset(free_off);
     }
 
+    /// True iff the page holds no live tuples — every slot is either
+    /// tombstoned (length=0) or there are no slots at all. Used by VACUUM
+    /// to decide whether to unlink the page from its heap chain.
+    pub fn is_empty(&self) -> bool {
+        let n = self.tuple_count();
+        for slot in 0..n {
+            let (_, len) = self.read_slot(slot);
+            if len != 0 {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Reverse of `delete`: revives a tombstoned slot by writing the saved
     /// bytes back at the original offset and restoring the slot length.
     /// Relies on the invariant that `delete` does not reclaim space, so the

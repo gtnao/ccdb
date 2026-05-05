@@ -1748,17 +1748,26 @@ fn perform_vacuum(
             })
             .collect();
 
+        // `prev` is the last page we kept in the chain; it owns the
+        // next-pointer that's currently pointing at `cur`. We never unlink
+        // the table's first page (`prev == None`) — pg_class.first_page_id
+        // would have to be rewritten, and an always-present empty head is
+        // harmless.
+        let mut prev: Option<PageId> = None;
         let mut cur = table.first_page_id;
         while cur != crate::page::NO_NEXT_PAGE && cur < bpm.page_count() {
             let g = bpm.fetch_page(cur)?;
             let next;
+            let page_is_heap;
             let mut dead: Vec<(SlotId, Vec<Value>)> = Vec::new();
             {
                 let p = g.read();
                 next = p.next_page_id();
-                if !matches!(p.page_kind(), crate::page::PageKind::Heap) {
+                page_is_heap = matches!(p.page_kind(), crate::page::PageKind::Heap);
+                if !page_is_heap {
                     drop(p);
                     drop(g);
+                    prev = Some(cur);
                     cur = next;
                     continue;
                 }
@@ -1774,6 +1783,7 @@ fn perform_vacuum(
                     }
                 }
             }
+            let became_empty;
             if !dead.is_empty() {
                 let mut p = g.write();
                 for (slot, _) in &dead {
@@ -1783,22 +1793,40 @@ fn perform_vacuum(
                 if p.page_lsn() < stamp_lsn {
                     p.set_page_lsn(stamp_lsn);
                 }
+                became_empty = p.is_empty();
+            } else {
+                became_empty = g.read().is_empty();
             }
             drop(g);
 
-            // Index cleanup: drop (key, rid) entries for every reclaimed heap
-            // tuple. Done after releasing the heap page guard so the btree
-            // can take its own latches without deadlock.
+            // Index cleanup: drop (key, rid) entries for every reclaimed
+            // heap tuple. Done after releasing the heap page guard so the
+            // btree can take its own latches without deadlock.
             for (root, col_idx, dt) in &index_meta {
                 for (slot, values) in &dead {
                     let key_value = &values[*col_idx];
                     if matches!(key_value, Value::Null) {
-                        // NULL keys are not indexed (matches CREATE INDEX).
                         continue;
                     }
                     let key = crate::btree::encode_key(key_value);
                     let _ = crate::btree::delete(bpm, *root, &key, (cur, *slot), *dt)?;
                 }
+            }
+
+            // Unlink fully-empty pages from the chain (except the head).
+            // The page's bytes are abandoned for now; FSM (B3) will pick
+            // them up for reuse later.
+            if became_empty && prev.is_some() {
+                let prev_pid = prev.unwrap();
+                let g2 = bpm.fetch_page(prev_pid)?;
+                let mut pp = g2.write();
+                pp.set_next_page_id(next);
+                if pp.page_lsn() < stamp_lsn {
+                    pp.set_page_lsn(stamp_lsn);
+                }
+                // prev stays the same — the page we just dropped is gone.
+            } else {
+                prev = Some(cur);
             }
             cur = next;
         }
