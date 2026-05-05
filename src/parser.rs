@@ -126,7 +126,19 @@ impl Parser {
         loop {
             let name = self.parse_ident()?;
             let data_type = self.parse_data_type()?;
-            columns.push(ColumnDef { name, data_type });
+            // Optional `NOT NULL`. Default is nullable.
+            let nullable = if matches!(self.peek(), Some(Token::Not)) {
+                self.bump();
+                self.expect(&Token::Null)?;
+                false
+            } else {
+                true
+            };
+            columns.push(ColumnDef {
+                name,
+                data_type,
+                nullable,
+            });
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.bump();
             } else {
@@ -479,14 +491,26 @@ mod tests {
             vec![
                 ColumnDef {
                     name: "id".into(),
-                    data_type: DataType::Int
+                    data_type: DataType::Int,
+                    nullable: true,
                 },
                 ColumnDef {
                     name: "name".into(),
-                    data_type: DataType::Varchar
+                    data_type: DataType::Varchar,
+                    nullable: true,
                 },
             ]
         );
+    }
+
+    #[test]
+    fn create_table_not_null() {
+        let s = parse("CREATE TABLE users (id INT NOT NULL, name VARCHAR)").unwrap();
+        let Statement::CreateTable(c) = s else {
+            panic!()
+        };
+        assert!(!c.columns[0].nullable);
+        assert!(c.columns[1].nullable);
     }
 
     #[test]

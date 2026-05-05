@@ -11,20 +11,22 @@ pub type Rid = (PageId, SlotId);
 
 // Slotted page layout (all little-endian):
 //
-//   header (16 bytes):
-//     [0..4)   page_id           : u32
-//     [4..6)   tuple_count        : u16
-//     [6..8)   free_space_offset  : u16   // points to start of tuple data
-//     [8..16)  page_lsn           : u64   // LSN of last modification (WAL)
+//   header (20 bytes):
+//     [0..4)   page_id            : u32
+//     [4..8)   next_page_id       : u32   // NO_NEXT_PAGE means end of chain
+//     [8..10)  tuple_count        : u16
+//     [10..12) free_space_offset  : u16
+//     [12..20) page_lsn           : u64
 //
-//   slot array (grows forward from byte 16):
+//   slot array (grows forward from byte 20):
 //     each slot is 4 bytes: u16 offset || u16 length
 //
 //   tuple data (grows backward from PAGE_SIZE):
 //     newest tuple sits at free_space_offset
 
-const HEADER_SIZE: usize = 16;
+const HEADER_SIZE: usize = 20;
 const SLOT_SIZE: usize = 4;
+pub const NO_NEXT_PAGE: PageId = u32::MAX;
 
 pub struct Page {
     data: [u8; PAGE_SIZE],
@@ -36,6 +38,7 @@ impl Page {
             data: [0u8; PAGE_SIZE],
         };
         p.set_page_id(page_id);
+        p.set_next_page_id(NO_NEXT_PAGE);
         p.set_tuple_count(0);
         p.set_free_space_offset(PAGE_SIZE as u16);
         p
@@ -58,28 +61,36 @@ impl Page {
         self.data[0..4].copy_from_slice(&id.to_le_bytes());
     }
 
+    pub fn next_page_id(&self) -> PageId {
+        u32::from_le_bytes(self.data[4..8].try_into().unwrap())
+    }
+
+    pub fn set_next_page_id(&mut self, next: PageId) {
+        self.data[4..8].copy_from_slice(&next.to_le_bytes());
+    }
+
     pub fn tuple_count(&self) -> SlotId {
-        u16::from_le_bytes(self.data[4..6].try_into().unwrap())
+        u16::from_le_bytes(self.data[8..10].try_into().unwrap())
     }
 
     fn set_tuple_count(&mut self, n: SlotId) {
-        self.data[4..6].copy_from_slice(&n.to_le_bytes());
+        self.data[8..10].copy_from_slice(&n.to_le_bytes());
     }
 
     pub fn free_space_offset(&self) -> u16 {
-        u16::from_le_bytes(self.data[6..8].try_into().unwrap())
+        u16::from_le_bytes(self.data[10..12].try_into().unwrap())
     }
 
     fn set_free_space_offset(&mut self, off: u16) {
-        self.data[6..8].copy_from_slice(&off.to_le_bytes());
+        self.data[10..12].copy_from_slice(&off.to_le_bytes());
     }
 
     pub fn page_lsn(&self) -> Lsn {
-        u64::from_le_bytes(self.data[8..16].try_into().unwrap())
+        u64::from_le_bytes(self.data[12..20].try_into().unwrap())
     }
 
     pub fn set_page_lsn(&mut self, lsn: Lsn) {
-        self.data[8..16].copy_from_slice(&lsn.to_le_bytes());
+        self.data[12..20].copy_from_slice(&lsn.to_le_bytes());
     }
 
     pub fn free_space(&self) -> usize {

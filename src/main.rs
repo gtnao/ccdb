@@ -4,6 +4,7 @@
 
 mod analyzer;
 mod ast;
+mod bootstrap;
 mod buffer_pool;
 mod catalog;
 mod checkpoint;

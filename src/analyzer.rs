@@ -108,6 +108,7 @@ pub struct AnalyzedCreateTableStatement {
 pub struct AnalyzedColumnDef {
     pub name: String,
     pub data_type: DataType,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -243,7 +244,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_select(&mut self, s: &SelectStatement) -> Result<AnalyzedSelectStatement> {
         let (table_id, table) = self
             .catalog
-            .find_table(&s.from.name)
+            .find_table(&s.from.name)?
             .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.from.name))?;
         let output_columns: Vec<OutputColumn> = table
             .columns
@@ -312,7 +313,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_insert(&self, s: &InsertStatement) -> Result<AnalyzedInsertStatement> {
         let (table_id, table) = self
             .catalog
-            .find_table(&s.table)
+            .find_table(&s.table)?
             .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
         if s.values.len() != table.columns.len() {
             bail!(
@@ -353,7 +354,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_delete(&mut self, s: &DeleteStatement) -> Result<AnalyzedDeleteStatement> {
         let (table_id, table) = self
             .catalog
-            .find_table(&s.table)
+            .find_table(&s.table)?
             .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
 
         // Build a scope so WHERE expressions can reference columns.
@@ -401,7 +402,7 @@ impl<'a> Analyzer<'a> {
     fn analyze_update(&mut self, s: &UpdateStatement) -> Result<AnalyzedUpdateStatement> {
         let (table_id, table) = self
             .catalog
-            .find_table(&s.table)
+            .find_table(&s.table)?
             .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
 
         let output_columns: Vec<OutputColumn> = table
@@ -480,7 +481,7 @@ impl<'a> Analyzer<'a> {
         &self,
         s: &CreateTableStatement,
     ) -> Result<AnalyzedCreateTableStatement> {
-        if self.catalog.find_table(&s.table).is_some() {
+        if self.catalog.find_table(&s.table)?.is_some() {
             bail!("table '{}' already exists", s.table);
         }
         let columns = s
@@ -489,6 +490,7 @@ impl<'a> Analyzer<'a> {
             .map(|c| AnalyzedColumnDef {
                 name: c.name.clone(),
                 data_type: ast_to_runtime(c.data_type),
+                nullable: c.nullable,
             })
             .collect();
         Ok(AnalyzedCreateTableStatement {
@@ -561,9 +563,53 @@ mod tests {
     use super::*;
     use crate::parser::parse;
 
+    /// Build a fresh Catalog over a temp DB with `users(id INT NOT NULL, name
+    /// VARCHAR)` already created. Each call uses a unique path so tests don't
+    /// share state.
+    fn setup() -> Catalog {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "ccdb_an_{}_{n}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("wal"));
+        let disk = crate::disk::DiskManager::open(&path).unwrap();
+        let wal = std::sync::Arc::new(
+            crate::wal::WalManager::open(&path.with_extension("wal")).unwrap(),
+        );
+        let bpm = crate::buffer_pool::BufferPool::new(disk, 8, wal.clone());
+        let clog = std::sync::Arc::new(crate::clog::Clog::in_memory());
+        let tm = std::sync::Arc::new(
+            crate::transaction_manager::TransactionManager::new(clog),
+        );
+        crate::bootstrap::bootstrap(&bpm, &tm).unwrap();
+        let cat = Catalog::new(bpm.clone(), std::sync::Arc::clone(&tm));
+        // CREATE TABLE users (id INT NOT NULL, name VARCHAR).
+        {
+            let mut tx = crate::transaction::Transaction::new(
+                std::sync::Arc::clone(&tm),
+            );
+            let lm = crate::lock_manager::LockManager::new();
+            let stmt = parse(
+                "CREATE TABLE users (id INT NOT NULL, name VARCHAR)",
+            )
+            .unwrap();
+            let analyzed = analyze(&cat, &stmt).unwrap();
+            crate::executor::execute(
+                &bpm, &lm, &wal, &tm, &cat, &analyzed, &mut tx,
+            )
+            .unwrap();
+        }
+        cat
+    }
+
     fn an(sql: &str) -> Result<AnalyzedStatement> {
+        let cat = setup();
         let stmt = parse(sql)?;
-        let cat = Catalog::new();
         analyze(&cat, &stmt)
     }
 

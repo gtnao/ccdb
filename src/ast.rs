@@ -67,6 +67,7 @@ pub struct CreateTableStatement {
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
+    pub nullable: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

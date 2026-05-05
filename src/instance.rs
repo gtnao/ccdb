@@ -65,6 +65,11 @@ impl Instance {
             }
         }
 
+        if init {
+            // Lay down pg_class / pg_attribute on the fresh storage.
+            crate::bootstrap::bootstrap(&bpm, &tm)?;
+        }
+
         if !wal_records.is_empty() {
             let max_lsn = wal_records.iter().map(|r| r.lsn).max().unwrap_or(0);
             wal.set_next_lsn(max_lsn + 1);
@@ -79,13 +84,12 @@ impl Instance {
                 stats.redo_applied,
                 stats.undo_applied,
             );
-            // After recovery, advance counter past anything observed.
             let max_id = stats.max_txn_id.max(meta.map(|m| m.next_txn_id).unwrap_or(0));
             tm.set_next_txn_id(max_id + 1);
         }
 
         Ok(Self {
-            catalog: Arc::new(Catalog::new()),
+            catalog: Arc::new(Catalog::new(bpm.clone(), Arc::clone(&tm))),
             bpm,
             lock_manager: Arc::new(LockManager::new()),
             wal,
@@ -311,7 +315,8 @@ fn run_query(
             conn.send_command_complete("CHECKPOINT")?;
         }
         AnalyzedStatement::CreateTable(_) => {
-            bail!("CREATE TABLE is not yet wired up (catalog is read-only)")
+            execute(bpm, lm, wal, tm, catalog, &analyzed, tx)?;
+            conn.send_command_complete("CREATE TABLE")?;
         }
     }
     Ok(())
