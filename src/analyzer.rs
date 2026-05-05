@@ -482,6 +482,20 @@ impl<'a> Analyzer<'a> {
         self.scopes.push(Vec::new());
         let (from_a, _total_width) = self.analyze_from(&s.from, 0)?;
 
+        // Build (alias, expr) map for ORDER BY alias resolution. Built from
+        // the AST so it's usable before we analyze the SELECT items.
+        let select_alias_map: Vec<(String, Expr)> = s
+            .columns
+            .iter()
+            .filter_map(|c| match c {
+                SelectColumn::Expr {
+                    expr,
+                    alias: Some(a),
+                } => Some((a.clone(), expr.clone())),
+                _ => None,
+            })
+            .collect();
+
         // WHERE: pre-aggregate, no aggregates allowed.
         let where_clause = match &s.where_clause {
             Some(e) => {
@@ -505,7 +519,7 @@ impl<'a> Analyzer<'a> {
         // aggregate function found in SELECT/HAVING.
         let has_aggregate_call = s.columns.iter().any(|c| match c {
             SelectColumn::Asterisk => false,
-            SelectColumn::Expr(e) => contains_aggregate(e),
+            SelectColumn::Expr { expr: e, .. } => contains_aggregate(e),
         }) || s.having.as_ref().map(contains_aggregate).unwrap_or(false);
         let needs_aggregation = !group_keys.is_empty() || has_aggregate_call;
 
@@ -517,11 +531,11 @@ impl<'a> Analyzer<'a> {
                     SelectColumn::Asterisk => {
                         bail!("`SELECT *` with GROUP BY/aggregates is not supported");
                     }
-                    SelectColumn::Expr(e) => {
+                    SelectColumn::Expr { expr: e, alias } => {
                         let rewritten = self.analyze_post_agg(e, &group_keys, &mut aggs)?;
                         select_items.push(AnalyzedSelectItem {
                             expr: rewritten,
-                            alias: None,
+                            alias: alias.clone(),
                         });
                     }
                 }
@@ -536,10 +550,12 @@ impl<'a> Analyzer<'a> {
                 }
                 None => None,
             };
-            // ORDER BY uses the same post-aggregate context.
+            // ORDER BY uses the same post-aggregate context, but bare
+            // column refs may reference SELECT aliases.
             let mut order_by = Vec::new();
             for ob in &s.order_by {
-                let expr = self.analyze_post_agg(&ob.expr, &group_keys, &mut aggs)?;
+                let substituted = substitute_aliases(&ob.expr, &select_alias_map);
+                let expr = self.analyze_post_agg(&substituted, &group_keys, &mut aggs)?;
                 order_by.push(AnalyzedOrderBy { expr, dir: ob.dir });
             }
             (
@@ -577,19 +593,20 @@ impl<'a> Analyzer<'a> {
                             }
                         }
                     }
-                    SelectColumn::Expr(e) => {
+                    SelectColumn::Expr { expr: e, alias } => {
                         select_items.push(AnalyzedSelectItem {
                             expr: self.analyze_expr(e)?,
-                            alias: None,
+                            alias: alias.clone(),
                         });
                     }
                 }
             }
-            // ORDER BY against per-row tuples.
+            // ORDER BY against per-row tuples, with SELECT alias substitution.
             let mut order_by = Vec::new();
             for ob in &s.order_by {
+                let substituted = substitute_aliases(&ob.expr, &select_alias_map);
                 order_by.push(AnalyzedOrderBy {
-                    expr: self.analyze_expr(&ob.expr)?,
+                    expr: self.analyze_expr(&substituted)?,
                     dir: ob.dir,
                 });
             }
@@ -892,6 +909,46 @@ impl<'a> Analyzer<'a> {
             table_name: s.table.clone(),
             columns,
         })
+    }
+}
+
+/// AST-level rewrite: replace bare (unqualified) column refs whose name
+/// matches one of `aliases` with the SELECT item's expression. Used to
+/// make ORDER BY see SELECT aliases — `ORDER BY r` resolves to whatever
+/// `region AS r` resolves to. Qualified refs like `t.r` are left alone.
+fn substitute_aliases(e: &Expr, aliases: &[(String, Expr)]) -> Expr {
+    match e {
+        Expr::Column { qualifier: None, name } => {
+            for (alias, expr) in aliases {
+                if alias == name {
+                    return expr.clone();
+                }
+            }
+            e.clone()
+        }
+        Expr::Column { .. } | Expr::Literal(_) => e.clone(),
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(substitute_aliases(left, aliases)),
+            op: *op,
+            right: Box::new(substitute_aliases(right, aliases)),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(substitute_aliases(expr, aliases)),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(substitute_aliases(expr, aliases)),
+            negated: *negated,
+        },
+        Expr::FuncCall { name, args } => Expr::FuncCall {
+            name: name.clone(),
+            args: match args {
+                FuncArgs::Star => FuncArgs::Star,
+                FuncArgs::Exprs(es) => FuncArgs::Exprs(
+                    es.iter().map(|e| substitute_aliases(e, aliases)).collect(),
+                ),
+            },
+        },
     }
 }
 

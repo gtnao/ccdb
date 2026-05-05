@@ -75,7 +75,19 @@ impl Parser {
                 self.bump();
                 columns.push(SelectColumn::Asterisk);
             } else {
-                columns.push(SelectColumn::Expr(self.parse_expr()?));
+                let expr = self.parse_expr()?;
+                // Optional `AS alias` or bare-ident alias. Stop short of FROM
+                // and other clauses so `SELECT id FROM t` doesn't try to
+                // alias `id` with `FROM`.
+                let alias = if matches!(self.peek(), Some(Token::As)) {
+                    self.bump();
+                    Some(self.parse_ident()?)
+                } else if matches!(self.peek(), Some(Token::Ident(_))) {
+                    Some(self.parse_ident()?)
+                } else {
+                    None
+                };
+                columns.push(SelectColumn::Expr { expr, alias });
             }
             if matches!(self.peek(), Some(Token::Comma)) {
                 self.bump();
@@ -589,7 +601,8 @@ mod tests {
     fn parse_count_star() {
         let s = parse("SELECT COUNT(*) FROM t").unwrap();
         let Statement::Select(sel) = s else { panic!() };
-        let SelectColumn::Expr(Expr::FuncCall { name, args }) = &sel.columns[0] else {
+        let SelectColumn::Expr { expr: Expr::FuncCall { name, args }, .. } = &sel.columns[0]
+        else {
             panic!()
         };
         assert_eq!(name.to_uppercase(), "COUNT");
@@ -656,7 +669,8 @@ mod tests {
     fn qualified_column_in_expression() {
         let s = parse("SELECT u.name FROM users u").unwrap();
         let Statement::Select(sel) = s else { panic!() };
-        let SelectColumn::Expr(Expr::Column { qualifier, name }) = &sel.columns[0] else {
+        let SelectColumn::Expr { expr: Expr::Column { qualifier, name }, .. } = &sel.columns[0]
+        else {
             panic!()
         };
         assert_eq!(qualifier.as_deref(), Some("u"));
@@ -670,7 +684,7 @@ mod tests {
         let Statement::Select(sel) = s else {
             panic!()
         };
-        let SelectColumn::Expr(e) = &sel.columns[0] else {
+        let SelectColumn::Expr { expr: e, .. } = &sel.columns[0] else {
             panic!()
         };
         let Expr::BinaryOp {

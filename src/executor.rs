@@ -2120,6 +2120,20 @@ mod tests {
     }
 
     #[test]
+    fn select_alias_carries_through() {
+        // The execution layer doesn't surface the alias by itself — it's
+        // attached to AnalyzedSelectItem. The instance.rs RowDescription
+        // path uses it for the column name. Here we just verify the
+        // analyzer wired it through.
+        let (cat, _bpm, _wal, _tm) = setup_users();
+        let stmt = parse("SELECT id AS user_id, name n FROM users").unwrap();
+        let analyzed = analyze(&cat, &stmt).unwrap();
+        let crate::analyzer::AnalyzedStatement::Select(s) = analyzed else { panic!() };
+        assert_eq!(s.select_items[0].alias.as_deref(), Some("user_id"));
+        assert_eq!(s.select_items[1].alias.as_deref(), Some("n"));
+    }
+
+    #[test]
     fn is_null_filters_to_null_rows() {
         let (cat, bpm, wal, tm) = setup_users();
         run("INSERT INTO users VALUES (1, 'a')", &cat, &bpm, &wal, &tm);

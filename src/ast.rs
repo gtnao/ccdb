@@ -84,7 +84,11 @@ pub enum JoinType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectColumn {
     Asterisk,
-    Expr(Expr),
+    /// `expr [AS alias]`. Bare alias (no `AS` keyword) is also accepted.
+    Expr {
+        expr: Expr,
+        alias: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
