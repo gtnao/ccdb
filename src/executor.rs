@@ -5,6 +5,8 @@
 //! and doesn't compose with row sources. The engine matches on statement
 //! shape and dispatches separately.
 
+use std::sync::Arc;
+
 use anyhow::{Result, bail};
 
 use crate::analyzer::{
@@ -1451,6 +1453,24 @@ fn perform_create_table(
         );
         insert_bytes(bpm, wal, tx, PG_ATTRIBUTE_PAGE_ID, &row)?;
     }
+
+    // PRIMARY KEY → auto-create a unique index named `<table>_pkey`. The
+    // table is empty at this point so the per-row scan in perform_create_index
+    // is a no-op; we still go through it so pg_index/the btree root are set
+    // up identically to an explicit CREATE UNIQUE INDEX.
+    if let Some(col_idx) = stmt.primary_key_column {
+        let col = &stmt.columns[col_idx];
+        let pk_stmt = AnalyzedCreateIndexStatement {
+            name: format!("{}_pkey", stmt.table_name),
+            table_id: new_table_id as usize,
+            table_name: stmt.table_name.clone(),
+            column_index: col_idx,
+            column_name: col.name.clone(),
+            data_type: col.data_type,
+            is_unique: true,
+        };
+        perform_create_index(bpm, wal, catalog, &pk_stmt, tx)?;
+    }
     Ok(())
 }
 
@@ -1532,6 +1552,7 @@ fn perform_create_index(
             Value::Int(stmt.table_id as i32),
             Value::Int(stmt.column_index as i32),
             Value::Int(current_root as i32),
+            Value::Bool(stmt.is_unique),
         ],
     );
     insert_bytes(bpm, wal, tx, PG_INDEX_PAGE_ID, &row)?;
@@ -2109,7 +2130,8 @@ pub fn perform_copy_row(
     lm.lock(tx.id(), rid, LockMode::Exclusive)
         .map_err(|e| anyhow::anyhow!("X-lock on {rid:?}: {e}"))?;
     tx.add_lock(rid);
-    index_insert_for_row(bpm, wal, catalog, tx, table_id, &coerced, rid)?;
+    let tm = Arc::clone(tx.tm());
+    index_insert_for_row_with_lm(bpm, Some(lm), wal, Some(&tm), catalog, tx, table_id, &coerced, rid)?;
     Ok((rid, new_tail))
 }
 
@@ -2155,7 +2177,10 @@ fn perform_insert(
         // and heap visibility check work together to keep aborts correct:
         // if this txn aborts, the index entry stays but the heap tuple has
         // an aborted xmin so visibility filters it out.
-        index_insert_for_row(bpm, wal, catalog, tx, stmt.table_id, &values, rid)?;
+        let tm = Arc::clone(tx.tm());
+        index_insert_for_row_with_lm(
+            bpm, Some(lm), wal, Some(&tm), catalog, tx, stmt.table_id, &values, rid,
+        )?;
         count += 1;
     }
     Ok(count)
@@ -2180,6 +2205,25 @@ fn index_insert_for_row(
     values: &[Value],
     rid: Rid,
 ) -> Result<()> {
+    index_insert_for_row_with_lm(bpm, None, wal, None, catalog, tx, table_id, values, rid)
+}
+
+/// Same as `index_insert_for_row` but accepts a LockManager + TransactionManager
+/// so unique indexes can wait for in-progress conflicting transactions before
+/// raising 23505. The non-LM variant is used by perform_create_index where the
+/// catalog rows are bootstrapped under SYSTEM_TXN_ID and uniqueness is by
+/// construction.
+fn index_insert_for_row_with_lm(
+    bpm: &BufferPool,
+    lm: Option<&LockManager>,
+    wal: &WalManager,
+    tm: Option<&TransactionManager>,
+    catalog: &Catalog,
+    tx: &mut Transaction,
+    table_id: usize,
+    values: &[Value],
+    rid: Rid,
+) -> Result<()> {
     let indexes = catalog.indexes_for_table(table_id)?;
     if indexes.is_empty() {
         return Ok(());
@@ -2187,6 +2231,7 @@ fn index_insert_for_row(
     let table = catalog
         .table_by_id(table_id)?
         .ok_or_else(|| anyhow::anyhow!("table {table_id} missing"))?;
+    let schema = table.to_schema();
     for idx in indexes {
         let key_value = &values[idx.column_index];
         if matches!(key_value, Value::Null) {
@@ -2194,13 +2239,19 @@ fn index_insert_for_row(
         }
         let key = crate::btree::encode_key(key_value);
         let dt = table.columns[idx.column_index].data_type;
+        if idx.is_unique {
+            // Speculative uniqueness check. We have the LM/TM only when
+            // called from a real INSERT; bootstrap (CREATE INDEX scan) hits
+            // the non-LM branch above and skips the check entirely — that
+            // path is system-txn data, no contention to resolve.
+            if let (Some(lm), Some(tm)) = (lm, tm) {
+                check_unique_or_wait(bpm, lm, tm, &idx, &key, dt, &schema, tx, rid)?;
+            }
+        }
         let new_root = crate::btree::insert(bpm, idx.root_page_id, &key, rid, dt)?;
         if new_root != idx.root_page_id {
             update_index_root(bpm, idx.index_id, new_root)?;
         }
-        // WAL the logical operation. On crash recovery's redo pass we'll
-        // re-issue this insert (idempotent thanks to the page-LSN check on
-        // each tree node — already-applied inserts are skipped).
         log_record(
             wal,
             tx,
@@ -2212,6 +2263,113 @@ fn index_insert_for_row(
         )?;
     }
     Ok(())
+}
+
+/// PG-style speculative uniqueness check. Looks up every existing entry for
+/// `key` in `idx`, fetches the corresponding heap tuple, and decides whether
+/// it represents a live row that would clash with our insert:
+///
+///   - heap tuple aborted-creation       → ignore
+///   - heap tuple deleted-by-committed   → ignore
+///   - heap tuple alive (xmax = 0)       → 23505
+///   - heap tuple xmin in-progress       → wait, then re-decide
+///   - heap tuple xmin == self           → ignore (our own previously-inserted row)
+fn check_unique_or_wait(
+    bpm: &BufferPool,
+    lm: &LockManager,
+    tm: &TransactionManager,
+    idx: &crate::catalog::IndexDef,
+    key: &[u8],
+    dt: DataType,
+    schema: &Schema,
+    tx: &mut Transaction,
+    own_rid: Rid,
+) -> Result<()> {
+    use crate::transaction_manager::TxnStatus;
+    loop {
+        let leaf_id = crate::btree::descend_to_leaf(bpm, idx.root_page_id, key, dt)?;
+        let candidates: Vec<Rid> = {
+            let g = bpm.fetch_page(leaf_id)?;
+            let p = g.read();
+            crate::btree::leaf_lookup_eq(&p, key, dt)?
+        };
+        let mut to_wait: Option<u64> = None;
+        for cand in candidates {
+            if cand == own_rid {
+                continue;
+            }
+            let g = bpm.fetch_page(cand.0)?;
+            let p = g.read();
+            let raw = match p.get_tuple(cand.1) {
+                Some(r) => r,
+                None => continue,
+            };
+            let (xmin, xmax, _) = deserialize_tuple_mvcc(raw, schema)?;
+            drop(p);
+            drop(g);
+
+            if xmin == tx.id() {
+                // Our own earlier insert in this txn. If we deleted it
+                // ourselves (xmax == self), no conflict. If still live to
+                // ourselves, that's an actual self-conflict the caller wants
+                // surfaced.
+                if xmax == tx.id() {
+                    continue;
+                }
+                if xmax == INVALID_TXN_ID {
+                    bail!(
+                        "duplicate key value violates unique constraint \"{}\" [SQLSTATE 23505]",
+                        idx.name
+                    );
+                }
+                continue;
+            }
+            // xmin not us. Decide based on creator status.
+            match tm.status(xmin) {
+                TxnStatus::Aborted => continue, // never visible
+                TxnStatus::InProgress => {
+                    to_wait = Some(xmin);
+                    break;
+                }
+                TxnStatus::Committed => {
+                    // Creator committed. Now look at the deleter.
+                    if xmax == INVALID_TXN_ID {
+                        bail!(
+                            "duplicate key value violates unique constraint \"{}\" [SQLSTATE 23505]",
+                            idx.name
+                        );
+                    }
+                    if xmax == tx.id() {
+                        // We deleted it earlier in this txn — taking its key
+                        // back is fine.
+                        continue;
+                    }
+                    match tm.status(xmax) {
+                        TxnStatus::Committed => continue, // row gone
+                        TxnStatus::Aborted => {
+                            bail!(
+                                "duplicate key value violates unique constraint \"{}\" [SQLSTATE 23505]",
+                                idx.name
+                            );
+                        }
+                        TxnStatus::InProgress => {
+                            to_wait = Some(xmax);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        match to_wait {
+            None => return Ok(()),
+            Some(other) => {
+                lm.wait_for_txn_completion(other, tm)
+                    .map_err(|e| anyhow::anyhow!("waiting for txn {other}: {e}"))?;
+                // Re-evaluate: that txn may have committed or aborted; the
+                // next loop iteration sees the new status.
+            }
+        }
+    }
 }
 
 /// Patch the `root_page_id` column in the `pg_index` row whose `index_id`
@@ -2514,7 +2672,10 @@ fn perform_update(
         lm.lock(tx.id(), new_rid, LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
         tx.add_lock(new_rid);
-        index_insert_for_row(bpm, wal, catalog, tx, stmt.table_id, &new_values, new_rid)?;
+        let tm_arc = Arc::clone(tx.tm());
+        index_insert_for_row_with_lm(
+            bpm, Some(lm), wal, Some(&tm_arc), catalog, tx, stmt.table_id, &new_values, new_rid,
+        )?;
     }
     Ok(count)
 }

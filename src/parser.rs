@@ -264,17 +264,29 @@ impl Parser {
         let table = self.parse_ident()?;
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
+        let mut primary_key: Vec<String> = Vec::new();
         loop {
-            // Table-level constraint: `PRIMARY KEY (col, ...)` — parse, ignore.
+            // Table-level constraint: `PRIMARY KEY (col, ...)`.
             if matches!(self.peek(), Some(Token::Primary)) {
                 self.bump();
                 self.expect(&Token::Key)?;
                 self.expect(&Token::LParen)?;
-                // Skip column list.
-                while !matches!(self.peek(), Some(Token::RParen)) {
-                    self.bump();
+                let mut cols = Vec::new();
+                loop {
+                    cols.push(self.parse_ident()?);
+                    match self.peek() {
+                        Some(Token::Comma) => {
+                            self.bump();
+                        }
+                        Some(Token::RParen) => break,
+                        other => bail!("expected ',' or ')' in PRIMARY KEY list, got {other:?}"),
+                    }
                 }
                 self.expect(&Token::RParen)?;
+                if !primary_key.is_empty() {
+                    bail!("multiple primary keys for table not allowed");
+                }
+                primary_key = cols;
                 if matches!(self.peek(), Some(Token::Comma)) {
                     self.bump();
                     continue;
@@ -327,11 +339,16 @@ impl Parser {
                         self.bump();
                         let _ = self.parse_expr()?;
                     }
-                    // `PRIMARY KEY` inline on a column — ignored (uniqueness
-                    // not enforced).
+                    // Column-level `PRIMARY KEY`. Records this column as
+                    // the table's PK; the executor will create the unique
+                    // index after the table itself is registered.
                     Some(Token::Primary) => {
                         self.bump();
                         self.expect(&Token::Key)?;
+                        if !primary_key.is_empty() {
+                            bail!("multiple primary keys for table not allowed");
+                        }
+                        primary_key = vec![name.clone()];
                     }
                     _ => break,
                 }
@@ -368,6 +385,7 @@ impl Parser {
         Ok(Statement::CreateTable(CreateTableStatement {
             table,
             columns,
+            primary_key,
         }))
     }
 

@@ -125,6 +125,11 @@ pub struct InsertStatement {
 pub struct CreateTableStatement {
     pub table: String,
     pub columns: Vec<ColumnDef>,
+    /// Column names appearing in a table-level `PRIMARY KEY (...)` clause
+    /// or in a single column-level `PRIMARY KEY` qualifier. Empty when the
+    /// table has no PK; multi-column PKs land here too but are not yet
+    /// supported by the index machinery (analyzer rejects).
+    pub primary_key: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

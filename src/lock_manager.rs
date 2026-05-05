@@ -18,6 +18,7 @@ use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::page::Rid;
+use crate::transaction_manager::{TransactionManager, TxnStatus};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockMode {
@@ -164,6 +165,32 @@ impl LockManager {
         // notify_all is over-broadcast, but each thread re-checks its own
         // predicate, and lock contention is the slow path anyway.
         self.cond.notify_all();
+    }
+
+    /// Block until `target_txn_id` finishes (commits or aborts), or the
+    /// configured timeout elapses. The shared `Condvar` is the same one
+    /// notified by `unlock_all`, so a writer's `unlock_all` at commit /
+    /// rollback wakes us up immediately.
+    ///
+    /// Returns the txn's final status. Used by speculative unique-index
+    /// insertion: when a colliding entry's xmin is in-progress, we wait
+    /// to see whether it commits (→ raise 23505) or aborts (→ proceed).
+    pub fn wait_for_txn_completion(
+        &self,
+        target_txn_id: u64,
+        tm: &TransactionManager,
+    ) -> Result<TxnStatus, LockError> {
+        let table = self.table.lock().unwrap();
+        let (_table, timed_out) = self
+            .cond
+            .wait_timeout_while(table, self.timeout, |_| {
+                matches!(tm.status(target_txn_id), TxnStatus::InProgress)
+            })
+            .expect("condvar poisoned");
+        if timed_out.timed_out() {
+            return Err(LockError::Timeout);
+        }
+        Ok(tm.status(target_txn_id))
     }
 
     #[cfg(test)]
@@ -352,6 +379,36 @@ mod tests {
                 || matches!(r2_res, Err(LockError::Timeout)),
             "expected at least one timeout, got {r1_res:?} and {r2_res:?}"
         );
+    }
+
+    #[test]
+    fn wait_for_txn_completion_unblocks_on_commit() {
+        use std::sync::Arc;
+        let clog = std::sync::Arc::new(crate::clog::Clog::in_memory());
+        let tm = Arc::new(crate::transaction_manager::TransactionManager::new(clog));
+        let lm = Arc::new(LockManager::with_timeout(Duration::from_secs(2)));
+
+        let writer = tm.begin();
+        // Hold a row lock so wait_for_txn_completion can be woken via
+        // unlock_all.
+        let r = rid(0, 0);
+        lm.lock(writer, r, LockMode::Exclusive).unwrap();
+
+        let lm2 = Arc::clone(&lm);
+        let tm2 = Arc::clone(&tm);
+        let waiter = thread::spawn(move || {
+            lm2.wait_for_txn_completion(writer, &tm2)
+        });
+
+        thread::sleep(Duration::from_millis(50));
+        // Commit and release: the waiter should now observe Committed.
+        tm.commit(writer);
+        let mut held = HashSet::new();
+        held.insert(r);
+        lm.unlock_all(writer, &held);
+
+        let status = waiter.join().unwrap().unwrap();
+        assert_eq!(status, crate::transaction_manager::TxnStatus::Committed);
     }
 
     #[test]

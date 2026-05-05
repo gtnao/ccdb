@@ -213,6 +213,10 @@ pub struct AnalyzedInsertStatement {
 pub struct AnalyzedCreateTableStatement {
     pub table_name: String,
     pub columns: Vec<AnalyzedColumnDef>,
+    /// Column index of the single-column PRIMARY KEY, if the CREATE TABLE
+    /// declared one. Multi-column PKs are rejected at the analyzer for now;
+    /// none ⇒ no automatic unique index.
+    pub primary_key_column: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +227,9 @@ pub struct AnalyzedCreateIndexStatement {
     pub column_index: usize,
     pub column_name: String,
     pub data_type: DataType,
+    /// Reject duplicate keys at insert time (PRIMARY KEY / UNIQUE / explicit
+    /// `CREATE UNIQUE INDEX`). Plain `CREATE INDEX` leaves this false.
+    pub is_unique: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1281,6 +1288,10 @@ impl<'a> Analyzer<'a> {
             column_index: col_idx,
             column_name: col.name.clone(),
             data_type: col.data_type,
+            // ALTER TABLE ADD PRIMARY KEY / UNIQUE both create unique
+            // indexes. The btree's insert_unique path enforces this
+            // (see 4-1c).
+            is_unique: true,
         })
     }
 
@@ -1308,6 +1319,9 @@ impl<'a> Analyzer<'a> {
             column_index: col_idx,
             column_name: col.name.clone(),
             data_type: col.data_type,
+            // Plain CREATE INDEX is non-unique. CREATE UNIQUE INDEX
+            // would set this true; the parser doesn't distinguish yet.
+            is_unique: false,
         })
     }
 
@@ -1318,7 +1332,7 @@ impl<'a> Analyzer<'a> {
         if self.catalog.find_table(&s.table)?.is_some() {
             bail!("table '{}' already exists", s.table);
         }
-        let columns = s
+        let columns: Vec<AnalyzedColumnDef> = s
             .columns
             .iter()
             .map(|c| AnalyzedColumnDef {
@@ -1327,9 +1341,22 @@ impl<'a> Analyzer<'a> {
                 nullable: c.nullable,
             })
             .collect();
+        let primary_key_column = match s.primary_key.len() {
+            0 => None,
+            1 => {
+                let name = &s.primary_key[0];
+                let idx = columns
+                    .iter()
+                    .position(|c| c.name == *name)
+                    .ok_or_else(|| anyhow::anyhow!("PRIMARY KEY references unknown column '{name}'"))?;
+                Some(idx)
+            }
+            _ => bail!("multi-column PRIMARY KEY not supported yet"),
+        };
         Ok(AnalyzedCreateTableStatement {
             table_name: s.table.clone(),
             columns,
+            primary_key_column,
         })
     }
 }

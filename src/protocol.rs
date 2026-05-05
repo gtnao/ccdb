@@ -283,7 +283,9 @@ impl<S: Read + Write> Connection<S> {
         // make a smart retry decision. `40P01` (deadlock_detected) works for
         // lock-timeout aborts since sysbench/libpq treat that as retriable.
         // Anything else gets the generic `XX000` (internal_error).
-        let sqlstate = if message.contains("lock acquisition timeout")
+        let sqlstate = if message.contains("SQLSTATE 23505") {
+            "23505" // unique_violation — set explicitly by the executor
+        } else if message.contains("lock acquisition timeout")
             || message.contains("deadlock")
         {
             "40P01"

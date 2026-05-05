@@ -42,6 +42,9 @@ pub struct IndexDef {
     /// Position of the indexed column inside the table's column list.
     pub column_index: usize,
     pub root_page_id: PageId,
+    /// Reject duplicate keys (PRIMARY KEY / UNIQUE). Plain CREATE INDEX
+    /// leaves this false.
+    pub is_unique: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -282,12 +285,20 @@ impl Catalog {
                 Value::Int(n) => *n as PageId,
                 _ => continue,
             };
+            // is_unique was added in Phase 4. Tolerate older rows missing
+            // the column (defaults to false) so the storage upgrade is
+            // backward-compatible.
+            let is_unique = match values.get(5) {
+                Some(Value::Bool(b)) => *b,
+                _ => false,
+            };
             out.push(IndexDef {
                 index_id,
                 name,
                 table_id,
                 column_index,
                 root_page_id,
+                is_unique,
             });
         }
         Ok(out)
@@ -432,6 +443,10 @@ pub fn pg_index_schema() -> Schema {
             Column {
                 name: "root_page_id".to_string(),
                 data_type: DataType::Int,
+            },
+            Column {
+                name: "is_unique".to_string(),
+                data_type: DataType::Bool,
             },
         ],
     }
