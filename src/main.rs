@@ -10,6 +10,7 @@ mod disk;
 mod executor;
 mod instance;
 mod lexer;
+mod lock_manager;
 mod page;
 mod parser;
 mod protocol;
