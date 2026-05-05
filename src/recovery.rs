@@ -62,7 +62,12 @@ pub fn recover(
         })
         .unwrap_or(0);
 
-    let redo_applied = redo_from(bpm, records, redo_start)?;
+    let mut redo_applied = redo_from(bpm, records, redo_start)?;
+    // Second redo pass: index operations. Heap pages (including pg_class /
+    // pg_attribute / pg_index) are now consistent, so we can resolve each
+    // IndexInsert's `index_id` to its current root page id and key type by
+    // reading the catalog tables directly from the buffer pool.
+    redo_applied += redo_index_inserts(bpm, tm, records, redo_start)?;
     let undo_applied = undo(bpm, wal, records, &analysis)?;
 
     // Seed CLOG with statuses observed in WAL so post-recovery visibility
@@ -120,7 +125,9 @@ fn analyze(records: &[WalRecord]) -> Analysis {
             WalRecordType::Abort => {
                 active.remove(&r.txn_id);
             }
-            WalRecordType::Insert { .. } | WalRecordType::Delete { .. } => {
+            WalRecordType::Insert { .. }
+            | WalRecordType::Delete { .. }
+            | WalRecordType::IndexInsert { .. } => {
                 wrote_dml.insert(r.txn_id);
             }
             WalRecordType::Clr { .. } => {
@@ -172,6 +179,71 @@ fn redo_from(bpm: &BufferPool, records: &[WalRecord], start_lsn: Lsn) -> Result<
             },
             _ => {}
         }
+    }
+    Ok(count)
+}
+
+/// Replay every IndexInsert in the WAL into the live B+Tree.
+///
+/// We build a Catalog over the just-redone heap pages so that each
+/// `index_id` in the WAL maps back to (root_page_id, indexed column,
+/// data type). If the index isn't in the catalog yet (e.g. its CREATE
+/// INDEX commit got truncated by the crash), we skip — the heap row in
+/// pg_index didn't survive either, and the inserted entries are
+/// orphaned. Re-running CREATE INDEX is the user's responsibility.
+fn redo_index_inserts(
+    bpm: &BufferPool,
+    tm: &TransactionManager,
+    records: &[WalRecord],
+    start_lsn: Lsn,
+) -> Result<usize> {
+    use crate::catalog::Catalog;
+    use std::sync::Arc;
+
+    // Catalog needs an Arc<TransactionManager>. The recovery driver passes a
+    // bare reference; safe to wrap a clone of the inner state because
+    // Catalog only reads.
+    let tm_arc = Arc::new(crate::transaction_manager::TransactionManager::new(
+        tm.clog().clone(),
+    ));
+    let catalog = Catalog::new(bpm.clone(), tm_arc);
+    let indexes = catalog.all_indexes()?;
+    if indexes.is_empty() {
+        return Ok(0);
+    }
+    // Build (index_id → (root, key_type)) and refresh root after each
+    // insert in case a split installs a new root.
+    let mut roots: HashMap<u64, crate::page::PageId> = HashMap::new();
+    let mut key_types: HashMap<u64, crate::tuple::DataType> = HashMap::new();
+    for idx in &indexes {
+        roots.insert(idx.index_id as u64, idx.root_page_id);
+        if let Some(table) = catalog.table_by_id(idx.table_id)? {
+            key_types.insert(
+                idx.index_id as u64,
+                table.columns[idx.column_index].data_type,
+            );
+        }
+    }
+
+    let mut count = 0;
+    for r in records {
+        if r.lsn < start_lsn {
+            continue;
+        }
+        let WalRecordType::IndexInsert { index_id, key, rid } = &r.record_type else {
+            continue;
+        };
+        let Some(&root) = roots.get(index_id) else {
+            continue;
+        };
+        let Some(&dt) = key_types.get(index_id) else {
+            continue;
+        };
+        let new_root = crate::btree::insert(bpm, root, key, *rid, dt)?;
+        if new_root != root {
+            roots.insert(*index_id, new_root);
+        }
+        count += 1;
     }
     Ok(count)
 }

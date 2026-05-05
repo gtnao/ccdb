@@ -1103,6 +1103,19 @@ fn perform_create_index(
         }
         let key = crate::btree::encode_key(key_value);
         current_root = crate::btree::insert(bpm, current_root, &key, (pid, slot), stmt.data_type)?;
+        // Log each entry so recovery can rebuild the tree if we crash before
+        // the pg_index row is durably written. The index_id is the one we
+        // just chose above; replay looks it up via the catalog row that
+        // gets logged via insert_bytes below.
+        log_record(
+            wal,
+            tx,
+            WalRecordType::IndexInsert {
+                index_id: new_index_id as u64,
+                key,
+                rid: (pid, slot),
+            },
+        )?;
     }
 
     // Register in pg_index.
@@ -1158,17 +1171,27 @@ fn perform_insert(
         // and heap visibility check work together to keep aborts correct:
         // if this txn aborts, the index entry stays but the heap tuple has
         // an aborted xmin so visibility filters it out.
-        index_insert_for_row(bpm, catalog, stmt.table_id, &values, rid)?;
+        index_insert_for_row(bpm, wal, catalog, tx, stmt.table_id, &values, rid)?;
         count += 1;
     }
     Ok(count)
 }
 
 /// Walk every index on `table_id` and add a `(key, rid)` entry for each.
-/// Treats NULL values as not-indexed (matches `perform_create_index`).
+/// Treats NULL values as not-indexed.
+///
+/// The index is *add-only*: DELETE/UPDATE don't touch it. Stale entries are
+/// fine because every IndexScan re-checks heap visibility — an aborted or
+/// deleted heap row is filtered there. This matches PostgreSQL's split
+/// between index lookup and heap visibility, and avoids the abort-correctness
+/// gap of physically removing entries on DELETE (a DELETE that aborts must
+/// leave the heap row visible; the corresponding index entry must therefore
+/// also still be there).
 fn index_insert_for_row(
     bpm: &BufferPool,
+    wal: &WalManager,
     catalog: &Catalog,
+    tx: &mut Transaction,
     table_id: usize,
     values: &[Value],
     rid: Rid,
@@ -1191,36 +1214,18 @@ fn index_insert_for_row(
         if new_root != idx.root_page_id {
             update_index_root(bpm, idx.index_id, new_root)?;
         }
-    }
-    Ok(())
-}
-
-/// Walk the indexes on `table_id` and remove `(key_for_each_index, rid)`.
-/// Used by DELETE and the delete-half of UPDATE.
-fn index_delete_for_row(
-    bpm: &BufferPool,
-    catalog: &Catalog,
-    table_id: usize,
-    values: &[Value],
-    rid: Rid,
-) -> Result<()> {
-    let indexes = catalog.indexes_for_table(table_id)?;
-    if indexes.is_empty() {
-        return Ok(());
-    }
-    let table = catalog
-        .table_by_id(table_id)?
-        .ok_or_else(|| anyhow::anyhow!("table {table_id} missing"))?;
-    for idx in indexes {
-        let key_value = &values[idx.column_index];
-        if matches!(key_value, Value::Null) {
-            continue;
-        }
-        let key = crate::btree::encode_key(key_value);
-        let dt = table.columns[idx.column_index].data_type;
-        let _removed = crate::btree::delete(bpm, idx.root_page_id, &key, rid, dt)?;
-        // It's OK if removed=false — the entry might already be gone (e.g.
-        // partial undo of a prior abort that skipped the heap).
+        // WAL the logical operation. On crash recovery's redo pass we'll
+        // re-issue this insert (idempotent thanks to the page-LSN check on
+        // each tree node — already-applied inserts are skipped).
+        log_record(
+            wal,
+            tx,
+            WalRecordType::IndexInsert {
+                index_id: idx.index_id as u64,
+                key,
+                rid,
+            },
+        )?;
     }
     Ok(())
 }
@@ -1385,9 +1390,9 @@ fn perform_delete(
             )?;
             p.set_page_lsn(lsn);
         }
-        // Drop the index pointer too. Aborts that re-revive the heap row by
-        // CLR also reinsert into indexes (handled in recovery).
-        index_delete_for_row(bpm, catalog, stmt.table_id, values, (*pid, *slot))?;
+        // No index op on DELETE: index is add-only. The heap xmax marker
+        // is the source of truth for visibility; IndexScan re-checks it.
+        let _ = values;
     }
     Ok(victims.len())
 }
@@ -1446,14 +1451,14 @@ fn perform_update(
             )?;
             p.set_page_lsn(lsn);
         }
-        // Index maintenance: remove the old version's entries, then add new
-        // ones once the new heap row has its rid.
-        index_delete_for_row(bpm, catalog, stmt.table_id, &old_values, (pid, slot))?;
+        // Index is add-only; the old entry stays and visibility filters it
+        // through the heap xmax. We just add the new version's entry.
+        let _ = old_values;
         let (new_rid, _) = insert_bytes(bpm, wal, tx, table.first_page_id, &new_bytes)?;
         lm.lock(tx.id(), new_rid, LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
         tx.add_lock(new_rid);
-        index_insert_for_row(bpm, catalog, stmt.table_id, &new_values, new_rid)?;
+        index_insert_for_row(bpm, wal, catalog, tx, stmt.table_id, &new_values, new_rid)?;
     }
     Ok(count)
 }

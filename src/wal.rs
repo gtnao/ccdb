@@ -52,6 +52,14 @@ pub enum WalRecordType {
         att: HashMap<u64, Lsn>,
         dpt: HashMap<PageId, Lsn>,
     },
+    /// Logical B+Tree insertion: `(key, rid)` was added to the index named
+    /// by `index_id`. Replayed during recovery's redo pass; never undone
+    /// (the index is add-only — heap visibility filters orphaned entries).
+    IndexInsert {
+        index_id: u64,
+        key: Vec<u8>,
+        rid: Rid,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,6 +76,7 @@ const TAG_INSERT: u8 = 3;
 const TAG_DELETE: u8 = 4;
 const TAG_CLR: u8 = 5;
 const TAG_CHECKPOINT: u8 = 6;
+const TAG_INDEX_INSERT: u8 = 7;
 
 const CLR_UNDO_INSERT: u8 = 0;
 const CLR_UNDO_DELETE: u8 = 1;
@@ -125,6 +134,15 @@ impl WalRecord {
                         buf.extend_from_slice(&old_xmax.to_le_bytes());
                     }
                 }
+            }
+            WalRecordType::IndexInsert { index_id, key, rid } => {
+                buf.push(TAG_INDEX_INSERT);
+                buf.extend_from_slice(&index_id.to_le_bytes());
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+                let (pid, slot) = *rid;
+                buf.extend_from_slice(&pid.to_le_bytes());
+                buf.extend_from_slice(&slot.to_le_bytes());
             }
             WalRecordType::Checkpoint { att, dpt } => {
                 buf.push(TAG_CHECKPOINT);
@@ -211,6 +229,27 @@ impl WalRecord {
                     other => bail!("unknown CLR redo tag: {other}"),
                 };
                 WalRecordType::Clr { undo_next_lsn, redo }
+            }
+            TAG_INDEX_INSERT => {
+                if rest.len() < 12 {
+                    bail!("IndexInsert record too short");
+                }
+                let index_id = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+                let klen = u32::from_le_bytes(rest[8..12].try_into().unwrap()) as usize;
+                if rest.len() < 12 + klen + 6 {
+                    bail!("IndexInsert payload truncated");
+                }
+                let key = rest[12..12 + klen].to_vec();
+                let rid_off = 12 + klen;
+                let pid = u32::from_le_bytes(rest[rid_off..rid_off + 4].try_into().unwrap());
+                let slot = u16::from_le_bytes(
+                    rest[rid_off + 4..rid_off + 6].try_into().unwrap(),
+                );
+                WalRecordType::IndexInsert {
+                    index_id,
+                    key,
+                    rid: (pid, slot),
+                }
             }
             TAG_CHECKPOINT => {
                 if rest.len() < 4 {

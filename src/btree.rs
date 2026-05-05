@@ -519,6 +519,17 @@ fn insert_recursive(
     let mut page = g.write();
     match page.page_kind() {
         PageKind::BTreeLeaf => {
+            // Idempotence: skip if `(key, rid)` is already in this leaf.
+            // Recovery's redo replays every IndexInsert, even those whose
+            // page modifications already made it to disk before the crash.
+            // Without this check we'd double-index those entries.
+            for slot in 0..page.tuple_count() {
+                let raw = page.get_tuple(slot).unwrap();
+                let (k, r) = decode_leaf_entry(raw);
+                if r == rid && compare_keys(&k, key, ty)? == std::cmp::Ordering::Equal {
+                    return Ok(InsertOutcome::Fit);
+                }
+            }
             let entry = encode_leaf_entry(key, rid);
             if fits(&page, entry.len()) {
                 insert_sorted(&mut page, key, entry, ty)?;
@@ -743,16 +754,33 @@ mod tests {
     fn insert_and_lookup_within_one_leaf() {
         let bpm = temp_bpm();
         let root = new_empty_root(&bpm).unwrap();
-        for i in [3, 1, 4, 1, 5, 9, 2, 6] {
-            let _ = insert(&bpm, root, &k(i), (i as PageId, 0), DataType::Int).unwrap();
+        // Pairs of (key, slot_within_distinguishing_page). Use distinct rids
+        // for the two key=1 entries so the (key, rid) idempotence check
+        // doesn't dedup them.
+        for (i, slot) in [(3, 0), (1, 0), (4, 0), (1, 1), (5, 0), (9, 0), (2, 0), (6, 0)] {
+            let _ = insert(&bpm, root, &k(i), (i as PageId, slot), DataType::Int).unwrap();
         }
-        // Lookup
         let g = bpm.fetch_page(root).unwrap();
         let p = g.read();
         let hits = leaf_lookup_eq(&p, &k(1), DataType::Int).unwrap();
-        assert_eq!(hits.len(), 2); // duplicate key 1
+        assert_eq!(hits.len(), 2); // two rids for key=1
         let miss = leaf_lookup_eq(&p, &k(7), DataType::Int).unwrap();
         assert!(miss.is_empty());
+    }
+
+    #[test]
+    fn insert_is_idempotent_on_same_key_rid() {
+        // Reinserting the same (key, rid) pair (as recovery's redo does)
+        // must not duplicate the entry.
+        let bpm = temp_bpm();
+        let root = new_empty_root(&bpm).unwrap();
+        for _ in 0..3 {
+            let _ = insert(&bpm, root, &k(42), (10, 5), DataType::Int).unwrap();
+        }
+        let g = bpm.fetch_page(root).unwrap();
+        let p = g.read();
+        let hits = leaf_lookup_eq(&p, &k(42), DataType::Int).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]
