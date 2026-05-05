@@ -119,6 +119,20 @@ pub struct InsertStatement {
     pub columns: Option<Vec<String>>,
     /// One Vec<Expr> per row. Multi-row form: VALUES (...), (...), ... .
     pub rows: Vec<Vec<Expr>>,
+    pub on_conflict: Option<OnConflict>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum OnConflict {
+    /// `ON CONFLICT [(col)] DO NOTHING` — silently skip the row when a
+    /// unique constraint would be violated.
+    DoNothing,
+    /// `ON CONFLICT [(col)] DO UPDATE SET ...`. The optional WHERE
+    /// further restricts which conflicting rows are updated.
+    DoUpdate {
+        assignments: Vec<Assignment>,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

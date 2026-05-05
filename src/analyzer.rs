@@ -207,6 +207,16 @@ pub struct AnalyzedInsertStatement {
     pub table_name: String,
     /// One Vec<AnalyzedExpr> per row.
     pub rows: Vec<Vec<AnalyzedExpr>>,
+    pub on_conflict: Option<AnalyzedOnConflict>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AnalyzedOnConflict {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<AnalyzedAssignment>,
+        where_clause: Option<AnalyzedExpr>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -876,7 +886,7 @@ impl<'a> Analyzer<'a> {
         }
     }
 
-    fn analyze_insert(&self, s: &InsertStatement) -> Result<AnalyzedInsertStatement> {
+    fn analyze_insert(&mut self, s: &InsertStatement) -> Result<AnalyzedInsertStatement> {
         let (table_id, table) = self
             .catalog
             .find_table(&s.table)?
@@ -962,10 +972,59 @@ impl<'a> Analyzer<'a> {
             analyzed_rows.push(values);
         }
 
+        let on_conflict = match &s.on_conflict {
+            None => None,
+            Some(ast::OnConflict::DoNothing) => Some(AnalyzedOnConflict::DoNothing),
+            Some(ast::OnConflict::DoUpdate { assignments, where_clause }) => {
+                // Bind the SET right-hand sides and WHERE in a scope that
+                // contains the table — so they can reference column names.
+                self.scopes.push(Vec::new());
+                self.intro_table(
+                    &TableRef {
+                        name: s.table.clone(),
+                        alias: None,
+                    },
+                    0,
+                )?;
+                let mut analyzed_assignments = Vec::with_capacity(assignments.len());
+                for a in assignments {
+                    let (col_idx, col) = table
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, c)| c.name == a.column)
+                        .ok_or_else(|| anyhow::anyhow!("column '{}' not found", a.column))?;
+                    let value = self.analyze_expr(&a.value)?;
+                    if !matches!(value.data_type(), Some(t) if assignable(t, col.data_type)) {
+                        if !matches!(value.data_type(), None) {
+                            bail!(
+                                "type mismatch in ON CONFLICT for column '{}'",
+                                col.name
+                            );
+                        }
+                    }
+                    analyzed_assignments.push(AnalyzedAssignment {
+                        column_index: col_idx,
+                        column_name: col.name.clone(),
+                        value,
+                    });
+                }
+                let where_a = match where_clause {
+                    Some(e) => Some(self.analyze_expr(e)?),
+                    None => None,
+                };
+                self.scopes.pop();
+                Some(AnalyzedOnConflict::DoUpdate {
+                    assignments: analyzed_assignments,
+                    where_clause: where_a,
+                })
+            }
+        };
         Ok(AnalyzedInsertStatement {
             table_id,
             table_name: s.table.clone(),
             rows: analyzed_rows,
+            on_conflict,
         })
     }
 

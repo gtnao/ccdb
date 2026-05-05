@@ -2240,6 +2240,37 @@ fn perform_insert(
             .zip(table.columns.iter())
             .map(|(v, c)| coerce_for_storage(v, c.data_type))
             .collect::<Result<_>>()?;
+
+        // ON CONFLICT pre-flight: detect a conflicting unique-index entry
+        // before any heap write. If one exists, branch to DO NOTHING / DO
+        // UPDATE; otherwise fall through to the normal INSERT path.
+        if let Some(on_conflict) = &stmt.on_conflict {
+            let tm = Arc::clone(tx.tm());
+            if let Some((_idx, conflict_rid)) = detect_unique_conflict(
+                bpm, lm, &tm, catalog, stmt.table_id, &values, tx,
+            )? {
+                match on_conflict {
+                    crate::analyzer::AnalyzedOnConflict::DoNothing => {
+                        // Skip — neither heap nor index touched.
+                        continue;
+                    }
+                    crate::analyzer::AnalyzedOnConflict::DoUpdate {
+                        assignments,
+                        where_clause,
+                    } => {
+                        let updated = on_conflict_do_update(
+                            bpm, lm, wal, catalog, stmt.table_id, &table.name,
+                            conflict_rid, assignments, where_clause.as_ref(), tx,
+                        )?;
+                        if updated {
+                            count += 1;
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
+
         enforce_check_constraints(catalog, stmt.table_id, &stmt.table_name, &values)?;
         let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &values);
         let (rid, _lsn) = insert_bytes(bpm, wal, tx, table.first_page_id, &bytes)?;
@@ -2336,6 +2367,179 @@ fn index_insert_for_row_with_lm(
         )?;
     }
     Ok(())
+}
+
+/// Apply an `ON CONFLICT ... DO UPDATE` clause to a single conflicting
+/// row. Behaves like a one-row UPDATE: re-fetch the conflicting tuple,
+/// run the analyzer-bound WHERE filter (if any), evaluate each
+/// assignment against the existing row, set xmax + write a new heap
+/// tuple + WAL Delete + maintain indexes. Returns true if the row was
+/// actually updated (false ⇒ WHERE filtered it out, equivalent to
+/// DO NOTHING for this row).
+fn on_conflict_do_update(
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    catalog: &Catalog,
+    table_id: usize,
+    table_name: &str,
+    target_rid: Rid,
+    assignments: &[crate::analyzer::AnalyzedAssignment],
+    where_clause: Option<&AnalyzedExpr>,
+    tx: &mut Transaction,
+) -> Result<bool> {
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table id {table_id} not in catalog"))?;
+    let schema = table.to_schema();
+    // Read the existing tuple's values.
+    let old_values: Vec<Value> = {
+        let g = bpm.fetch_page(target_rid.0)?;
+        let p = g.read();
+        let raw = p
+            .get_tuple(target_rid.1)
+            .ok_or_else(|| anyhow::anyhow!("ON CONFLICT target tuple disappeared"))?;
+        let (_, _, vals) = deserialize_tuple_mvcc(raw, &schema)?;
+        vals
+    };
+    let row = Tuple::new(old_values.clone());
+    if !matches(where_clause, &row)? {
+        return Ok(false);
+    }
+    let mut new_values = old_values.clone();
+    for a in assignments {
+        let v = evaluate_expr(&a.value, &row)?;
+        let target = table.columns[a.column_index].data_type;
+        new_values[a.column_index] = coerce_for_storage(v, target)?;
+    }
+    enforce_check_constraints(catalog, table_id, table_name, &new_values)?;
+
+    // Tombstone old + log Delete.
+    lm.lock(tx.id(), target_rid, LockMode::Exclusive)
+        .map_err(|e| anyhow::anyhow!("X-lock on {target_rid:?}: {e}"))?;
+    tx.add_lock(target_rid);
+    {
+        let g = bpm.fetch_page(target_rid.0)?;
+        let mut p = g.write();
+        p.set_tuple_xmax(target_rid.1, tx.id())?;
+        let lsn = log_record(
+            wal,
+            tx,
+            WalRecordType::Delete {
+                rid: target_rid,
+                xmax: tx.id(),
+            },
+        )?;
+        p.set_page_lsn(lsn);
+    }
+
+    // Insert new version + maintain indexes (uniqueness check sees our own
+    // freshly-deleted row and skips it).
+    let new_bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
+    let (new_rid, _lsn) = insert_bytes(bpm, wal, tx, table.first_page_id, &new_bytes)?;
+    lm.lock(tx.id(), new_rid, LockMode::Exclusive)
+        .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
+    tx.add_lock(new_rid);
+    let tm_arc = Arc::clone(tx.tm());
+    index_insert_for_row_with_lm(
+        bpm, Some(lm), wal, Some(&tm_arc), catalog, tx, table_id, &new_values, new_rid,
+    )?;
+    Ok(true)
+}
+
+/// Like `check_unique_or_wait` but returns the conflicting heap RID
+/// instead of erroring. Used by INSERT ... ON CONFLICT to dispatch
+/// before any heap write happens. None ⇒ no conflict, the caller
+/// can proceed with the normal INSERT path.
+fn detect_unique_conflict(
+    bpm: &BufferPool,
+    lm: &LockManager,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    table_id: usize,
+    values: &[Value],
+    tx: &mut Transaction,
+) -> Result<Option<(crate::catalog::IndexDef, Rid)>> {
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table {table_id} missing"))?;
+    let schema = table.to_schema();
+    for idx in catalog.indexes_for_table(table_id)? {
+        if !idx.is_unique {
+            continue;
+        }
+        let key_value = &values[idx.column_index];
+        if matches!(key_value, Value::Null) {
+            continue;
+        }
+        let key = crate::btree::encode_key(key_value);
+        let dt = table.columns[idx.column_index].data_type;
+        // Re-run the visibility loop, returning the first live RID we see.
+        loop {
+            let leaf_id = crate::btree::descend_to_leaf(bpm, idx.root_page_id, &key, dt)?;
+            let candidates: Vec<Rid> = {
+                let g = bpm.fetch_page(leaf_id)?;
+                let p = g.read();
+                crate::btree::leaf_lookup_eq(&p, &key, dt)?
+            };
+            let mut to_wait: Option<u64> = None;
+            let mut found: Option<Rid> = None;
+            for cand in candidates {
+                let g = bpm.fetch_page(cand.0)?;
+                let p = g.read();
+                let raw = match p.get_tuple(cand.1) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let (xmin, xmax, _) = deserialize_tuple_mvcc(raw, &schema)?;
+                drop(p);
+                drop(g);
+                if xmin == tx.id() && xmax == INVALID_TXN_ID {
+                    found = Some(cand);
+                    break;
+                }
+                match tm.status(xmin) {
+                    TxnStatus::Aborted => continue,
+                    TxnStatus::InProgress => {
+                        to_wait = Some(xmin);
+                        break;
+                    }
+                    TxnStatus::Committed => {
+                        if xmax == INVALID_TXN_ID {
+                            found = Some(cand);
+                            break;
+                        }
+                        if xmax == tx.id() {
+                            continue;
+                        }
+                        match tm.status(xmax) {
+                            TxnStatus::Committed => continue,
+                            TxnStatus::Aborted => {
+                                found = Some(cand);
+                                break;
+                            }
+                            TxnStatus::InProgress => {
+                                to_wait = Some(xmax);
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(r) = found {
+                return Ok(Some((idx.clone(), r)));
+            }
+            match to_wait {
+                None => break,
+                Some(other) => {
+                    lm.wait_for_txn_completion(other, tm)
+                        .map_err(|e| anyhow::anyhow!("waiting for txn {other}: {e}"))?;
+                    continue;
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// PG-style speculative uniqueness check. Looks up every existing entry for

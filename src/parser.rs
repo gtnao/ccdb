@@ -236,10 +236,73 @@ impl Parser {
                 break;
             }
         }
+        // Optional ON CONFLICT [(target_col)] DO NOTHING / DO UPDATE SET ...
+        let on_conflict = if matches!(self.peek(), Some(Token::On)) {
+            self.bump();
+            self.expect(&Token::Conflict)?;
+            // Optional conflict target — we accept and discard `(col)` /
+            // `ON CONSTRAINT name`. The executor doesn't yet target a
+            // specific index, it relies on whichever unique check fires.
+            if matches!(self.peek(), Some(Token::LParen)) {
+                self.bump();
+                let mut depth = 1;
+                while depth > 0 {
+                    match self.peek() {
+                        Some(Token::LParen) => depth += 1,
+                        Some(Token::RParen) => depth -= 1,
+                        None => bail!("unterminated ON CONFLICT target list"),
+                        _ => {}
+                    }
+                    self.bump();
+                }
+            } else if matches!(self.peek(), Some(Token::On)) {
+                // ON CONFLICT ON CONSTRAINT <name>
+                self.bump();
+                self.expect(&Token::Constraint)?;
+                self.parse_ident()?;
+            }
+            self.expect(&Token::Do)?;
+            match self.peek() {
+                Some(Token::Nothing) => {
+                    self.bump();
+                    Some(OnConflict::DoNothing)
+                }
+                Some(Token::Update) => {
+                    self.bump();
+                    self.expect(&Token::Set)?;
+                    let mut assignments = Vec::new();
+                    loop {
+                        let column = self.parse_ident()?;
+                        self.expect(&Token::Eq)?;
+                        let value = self.parse_expr()?;
+                        assignments.push(Assignment { column, value });
+                        if matches!(self.peek(), Some(Token::Comma)) {
+                            self.bump();
+                            continue;
+                        }
+                        break;
+                    }
+                    let where_clause = if matches!(self.peek(), Some(Token::Where)) {
+                        self.bump();
+                        Some(self.parse_expr()?)
+                    } else {
+                        None
+                    };
+                    Some(OnConflict::DoUpdate {
+                        assignments,
+                        where_clause,
+                    })
+                }
+                other => bail!("expected NOTHING or UPDATE after DO, got {other:?}"),
+            }
+        } else {
+            None
+        };
         Ok(Statement::Insert(InsertStatement {
             table,
             columns,
             rows,
+            on_conflict,
         }))
     }
 
