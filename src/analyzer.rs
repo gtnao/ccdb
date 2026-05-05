@@ -14,8 +14,8 @@ use std::mem;
 use anyhow::{Result, bail};
 
 use crate::ast::{
-    self, BinaryOperator, CreateTableStatement, Expr, InsertStatement, Literal, SelectColumn,
-    SelectStatement, Statement, UnaryOperator,
+    self, BinaryOperator, CreateTableStatement, DeleteStatement, Expr, InsertStatement, Literal,
+    SelectColumn, SelectStatement, Statement, UnaryOperator, UpdateStatement,
 };
 use crate::catalog::Catalog;
 use crate::tuple::DataType;
@@ -46,7 +46,31 @@ pub struct RangeTableEntry {
 pub enum AnalyzedStatement {
     Select(AnalyzedSelectStatement),
     Insert(AnalyzedInsertStatement),
+    Delete(AnalyzedDeleteStatement),
+    Update(AnalyzedUpdateStatement),
     CreateTable(AnalyzedCreateTableStatement),
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedDeleteStatement {
+    pub table_id: usize,
+    pub table_name: String,
+    pub where_clause: Option<AnalyzedExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedUpdateStatement {
+    pub table_id: usize,
+    pub table_name: String,
+    pub assignments: Vec<AnalyzedAssignment>,
+    pub where_clause: Option<AnalyzedExpr>,
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalyzedAssignment {
+    pub column_index: usize,
+    pub column_name: String,
+    pub value: AnalyzedExpr,
 }
 
 #[derive(Debug, Clone)]
@@ -322,6 +346,132 @@ impl<'a> Analyzer<'a> {
         })
     }
 
+    fn analyze_delete(&mut self, s: &DeleteStatement) -> Result<AnalyzedDeleteStatement> {
+        let (table_id, table) = self
+            .catalog
+            .find_table(&s.table)
+            .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
+
+        // Build a scope so WHERE expressions can reference columns.
+        let output_columns: Vec<OutputColumn> = table
+            .columns
+            .iter()
+            .map(|c| OutputColumn {
+                name: c.name.clone(),
+                data_type: c.data_type,
+                nullable: c.nullable,
+            })
+            .collect();
+        let rte_index = self.add_rte(
+            TableSource::BaseTable {
+                table_id,
+                table_name: s.table.clone(),
+            },
+            output_columns,
+        );
+        self.scopes.push(vec![ScopeEntry {
+            name: s.table.clone(),
+            rte_index,
+        }]);
+
+        let where_clause = match &s.where_clause {
+            Some(e) => {
+                let analyzed = self.analyze_expr(e)?;
+                if !matches!(analyzed.data_type(), Some(DataType::Bool) | None) {
+                    bail!("WHERE clause must be boolean, got {:?}", analyzed.data_type());
+                }
+                Some(analyzed)
+            }
+            None => None,
+        };
+
+        self.scopes.pop();
+
+        Ok(AnalyzedDeleteStatement {
+            table_id,
+            table_name: s.table.clone(),
+            where_clause,
+        })
+    }
+
+    fn analyze_update(&mut self, s: &UpdateStatement) -> Result<AnalyzedUpdateStatement> {
+        let (table_id, table) = self
+            .catalog
+            .find_table(&s.table)
+            .ok_or_else(|| anyhow::anyhow!("table '{}' not found", s.table))?;
+
+        let output_columns: Vec<OutputColumn> = table
+            .columns
+            .iter()
+            .map(|c| OutputColumn {
+                name: c.name.clone(),
+                data_type: c.data_type,
+                nullable: c.nullable,
+            })
+            .collect();
+        let rte_index = self.add_rte(
+            TableSource::BaseTable {
+                table_id,
+                table_name: s.table.clone(),
+            },
+            output_columns,
+        );
+        self.scopes.push(vec![ScopeEntry {
+            name: s.table.clone(),
+            rte_index,
+        }]);
+
+        let mut assignments = Vec::with_capacity(s.assignments.len());
+        for a in &s.assignments {
+            let (col_idx, col) = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, c)| c.name == a.column)
+                .ok_or_else(|| anyhow::anyhow!("column '{}' not found", a.column))?;
+            let analyzed_value = self.analyze_expr(&a.value)?;
+            match analyzed_value.data_type() {
+                None => {
+                    if !col.nullable {
+                        bail!("column '{}' is not nullable", col.name);
+                    }
+                }
+                Some(t) if t == col.data_type => {}
+                Some(t) => bail!(
+                    "type mismatch in UPDATE for column '{}': expected {:?}, got {:?}",
+                    col.name,
+                    col.data_type,
+                    t
+                ),
+            }
+            assignments.push(AnalyzedAssignment {
+                column_index: col_idx,
+                column_name: a.column.clone(),
+                value: analyzed_value,
+            });
+        }
+
+        let where_clause = match &s.where_clause {
+            Some(e) => {
+                let analyzed = self.analyze_expr(e)?;
+                if !matches!(analyzed.data_type(), Some(DataType::Bool) | None) {
+                    bail!("WHERE clause must be boolean, got {:?}", analyzed.data_type());
+                }
+                Some(analyzed)
+            }
+            None => None,
+        };
+
+        self.scopes.pop();
+
+        Ok(AnalyzedUpdateStatement {
+            table_id,
+            table_name: s.table.clone(),
+            assignments,
+            where_clause,
+        })
+    }
+
     fn analyze_create_table(
         &self,
         s: &CreateTableStatement,
@@ -392,6 +542,8 @@ pub fn analyze(catalog: &Catalog, stmt: &Statement) -> Result<AnalyzedStatement>
     Ok(match stmt {
         Statement::Select(s) => AnalyzedStatement::Select(a.analyze_select(s)?),
         Statement::Insert(s) => AnalyzedStatement::Insert(a.analyze_insert(s)?),
+        Statement::Delete(s) => AnalyzedStatement::Delete(a.analyze_delete(s)?),
+        Statement::Update(s) => AnalyzedStatement::Update(a.analyze_update(s)?),
         Statement::CreateTable(s) => AnalyzedStatement::CreateTable(a.analyze_create_table(s)?),
     })
 }

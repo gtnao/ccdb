@@ -8,12 +8,13 @@
 use anyhow::{Result, bail};
 
 use crate::analyzer::{
-    AnalyzedExpr, AnalyzedInsertStatement, AnalyzedLiteral, AnalyzedSelectStatement,
-    AnalyzedStatement, LiteralValue, TableSource,
+    AnalyzedDeleteStatement, AnalyzedExpr, AnalyzedInsertStatement, AnalyzedLiteral,
+    AnalyzedSelectStatement, AnalyzedStatement, AnalyzedUpdateStatement, LiteralValue, TableSource,
 };
 use crate::ast::{BinaryOperator, UnaryOperator};
 use crate::buffer_pool::BufferPoolManager;
 use crate::catalog::Catalog;
+use crate::page::{PageId, SlotId};
 use crate::tuple::{Schema, Value, deserialize_tuple, serialize_tuple};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -272,23 +273,118 @@ fn perform_insert(
             _ => bail!("INSERT VALUES must be literals (no exprs yet)"),
         })
         .collect::<Result<_>>()?;
-    let bytes = serialize_tuple(&values);
+    insert_bytes(bpm, &serialize_tuple(&values))?;
+    Ok(1)
+}
 
-    // Try the last page; if it doesn't fit, allocate a new one.
+// -- DELETE / UPDATE (not Executors either — both are bulk side effects) -----
+
+/// Materializes the table once into (rid, tuple) pairs so we can apply
+/// modifications without worrying about re-visiting newly inserted rows
+/// (UPDATE does delete+insert; without snapshotting we'd loop forever).
+fn snapshot_table(
+    bpm: &mut BufferPoolManager,
+    catalog: &Catalog,
+    table_id: usize,
+) -> Result<(Schema, Vec<(PageId, SlotId, Vec<Value>)>)> {
+    let schema = catalog
+        .table_by_id(table_id)
+        .ok_or_else(|| anyhow::anyhow!("table id {table_id} not in catalog"))?
+        .to_schema();
+    let mut out = Vec::new();
+    for pid in 0..bpm.page_count() {
+        let guard = bpm.fetch_page(pid)?;
+        let tc = guard.page().tuple_count();
+        for slot in 0..tc {
+            if let Some(raw) = guard.page().get_tuple(slot) {
+                let values = deserialize_tuple(raw, &schema)?;
+                out.push((pid, slot, values));
+            }
+        }
+    }
+    Ok((schema, out))
+}
+
+fn matches(predicate: Option<&AnalyzedExpr>, tuple: &Tuple) -> Result<bool> {
+    let Some(pred) = predicate else { return Ok(true) };
+    match evaluate_expr(pred, tuple)? {
+        Value::Bool(b) => Ok(b),
+        Value::Null => Ok(false),
+        other => bail!("WHERE predicate must be boolean, got {other:?}"),
+    }
+}
+
+fn perform_delete(
+    bpm: &mut BufferPoolManager,
+    catalog: &Catalog,
+    stmt: &AnalyzedDeleteStatement,
+) -> Result<usize> {
+    let (_schema, rows) = snapshot_table(bpm, catalog, stmt.table_id)?;
+    let mut victims = Vec::new();
+    for (pid, slot, values) in rows {
+        let t = Tuple::new(values);
+        if matches(stmt.where_clause.as_ref(), &t)? {
+            victims.push((pid, slot));
+        }
+    }
+    for (pid, slot) in &victims {
+        let mut g = bpm.fetch_page(*pid)?;
+        g.page_mut().delete(*slot)?;
+    }
+    Ok(victims.len())
+}
+
+fn perform_update(
+    bpm: &mut BufferPoolManager,
+    catalog: &Catalog,
+    stmt: &AnalyzedUpdateStatement,
+) -> Result<usize> {
+    let (_schema, rows) = snapshot_table(bpm, catalog, stmt.table_id)?;
+    let mut work: Vec<(PageId, SlotId, Vec<u8>)> = Vec::new();
+
+    for (pid, slot, values) in rows {
+        let t = Tuple::new(values);
+        if !matches(stmt.where_clause.as_ref(), &t)? {
+            continue;
+        }
+        // Build the new tuple: start from the old, apply each assignment.
+        let mut new_values = t.values.clone();
+        for a in &stmt.assignments {
+            let v = evaluate_expr(&a.value, &t)?;
+            new_values[a.column_index] = v;
+        }
+        work.push((pid, slot, serialize_tuple(&new_values)));
+    }
+
+    let count = work.len();
+    for (pid, slot, bytes) in work {
+        // Tombstone the old slot first.
+        {
+            let mut g = bpm.fetch_page(pid)?;
+            g.page_mut().delete(slot)?;
+        }
+        // Insert the new tuple via the standard path (last page, or new one).
+        insert_bytes(bpm, &bytes)?;
+    }
+    Ok(count)
+}
+
+// Shared insertion helper used by INSERT and UPDATE.
+fn insert_bytes(bpm: &mut BufferPoolManager, bytes: &[u8]) -> Result<()> {
     let n = bpm.page_count();
     if n > 0 {
         let last = n - 1;
         let mut g = bpm.fetch_page(last)?;
-        if g.page_mut().insert(&bytes).is_ok() {
-            return Ok(1);
+        if g.page_mut().insert(bytes).is_ok() {
+            return Ok(());
         }
         drop(g);
     }
     let mut g = bpm.new_page()?;
     g.page_mut()
-        .insert(&bytes)
+        .insert(bytes)
         .map_err(|e| anyhow::anyhow!("tuple does not fit on a fresh page: {e}"))?;
-    Ok(1)
+    Ok(())
 }
 
 // -- ExecutionEngine ---------------------------------------------------------
@@ -309,6 +405,8 @@ pub fn execute(
             Ok(Output::Rows(rows))
         }
         AnalyzedStatement::Insert(s) => Ok(Output::Affected(perform_insert(bpm, s)?)),
+        AnalyzedStatement::Delete(s) => Ok(Output::Affected(perform_delete(bpm, catalog, s)?)),
+        AnalyzedStatement::Update(s) => Ok(Output::Affected(perform_update(bpm, catalog, s)?)),
         AnalyzedStatement::CreateTable(_) => {
             bail!("CREATE TABLE execution is not yet wired up (catalog is read-only)")
         }
@@ -441,6 +539,111 @@ mod tests {
         };
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Int(1));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_with_predicate() {
+        let path = temp_path("delete-pred");
+        let disk = DiskManager::open(&path).unwrap();
+        let mut bpm = BufferPoolManager::new(disk, 4);
+        let cat = Catalog::new();
+        for i in 1..=4 {
+            run(
+                &format!("INSERT INTO users VALUES ({i}, 'x')"),
+                &cat,
+                &mut bpm,
+            );
+        }
+        assert!(matches!(
+            run("DELETE FROM users WHERE id > 2", &cat, &mut bpm),
+            Output::Affected(2)
+        ));
+        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &mut bpm) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].values[0], Value::Int(1));
+        assert_eq!(rows[1].values[0], Value::Int(2));
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn delete_all_rows() {
+        let path = temp_path("delete-all");
+        let disk = DiskManager::open(&path).unwrap();
+        let mut bpm = BufferPoolManager::new(disk, 4);
+        let cat = Catalog::new();
+        for i in 1..=3 {
+            run(
+                &format!("INSERT INTO users VALUES ({i}, 'x')"),
+                &cat,
+                &mut bpm,
+            );
+        }
+        assert!(matches!(
+            run("DELETE FROM users", &cat, &mut bpm),
+            Output::Affected(3)
+        ));
+        let Output::Rows(rows) = run("SELECT * FROM users", &cat, &mut bpm) else {
+            panic!()
+        };
+        assert!(rows.is_empty());
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn update_changes_matching_rows() {
+        let path = temp_path("update");
+        let disk = DiskManager::open(&path).unwrap();
+        let mut bpm = BufferPoolManager::new(disk, 4);
+        let cat = Catalog::new();
+        run("INSERT INTO users VALUES (1, 'Alice')", &cat, &mut bpm);
+        run("INSERT INTO users VALUES (2, 'Bob')", &cat, &mut bpm);
+        assert!(matches!(
+            run(
+                "UPDATE users SET name = 'A2' WHERE id = 1",
+                &cat,
+                &mut bpm
+            ),
+            Output::Affected(1)
+        ));
+        let Output::Rows(rows) = run("SELECT id, name FROM users", &cat, &mut bpm) else {
+            panic!()
+        };
+        // Order may shift because UPDATE = delete + insert; check by id.
+        let mut seen = std::collections::HashMap::new();
+        for r in &rows {
+            let Value::Int(id) = r.values[0] else { panic!() };
+            let Value::Varchar(name) = &r.values[1] else { panic!() };
+            seen.insert(id, name.clone());
+        }
+        assert_eq!(seen[&1], "A2");
+        assert_eq!(seen[&2], "Bob");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn update_does_not_re_match_inserted_row() {
+        // Snapshot-then-apply guarantees we don't see our own writes.
+        let path = temp_path("update-stable");
+        let disk = DiskManager::open(&path).unwrap();
+        let mut bpm = BufferPoolManager::new(disk, 4);
+        let cat = Catalog::new();
+        run("INSERT INTO users VALUES (1, 'a')", &cat, &mut bpm);
+        // SET name = 'a' WHERE name = 'a' affects exactly one row, not infinite.
+        assert!(matches!(
+            run(
+                "UPDATE users SET name = 'a' WHERE name = 'a'",
+                &cat,
+                &mut bpm
+            ),
+            Output::Affected(1)
+        ));
+        let Output::Rows(rows) = run("SELECT id FROM users", &cat, &mut bpm) else {
+            panic!()
+        };
+        assert_eq!(rows.len(), 1);
         std::fs::remove_file(&path).ok();
     }
 

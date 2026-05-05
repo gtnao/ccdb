@@ -116,7 +116,25 @@ impl Page {
             return None;
         }
         let (off, len) = self.read_slot(slot_id);
+        if len == 0 {
+            // tombstone — slot exists but tuple was deleted
+            return None;
+        }
         Some(&self.data[off as usize..(off + len) as usize])
+    }
+
+    /// Logical delete: marks the slot as a tombstone (length=0). The tuple's
+    /// bytes are NOT reclaimed — vacuum/compaction is a future concern.
+    pub fn delete(&mut self, slot_id: SlotId) -> Result<()> {
+        if slot_id >= self.tuple_count() {
+            bail!("slot {slot_id} out of range");
+        }
+        let (off, len) = self.read_slot(slot_id);
+        if len == 0 {
+            bail!("slot {slot_id} already deleted");
+        }
+        self.write_slot(slot_id, off, 0);
+        Ok(())
     }
 }
 
@@ -143,6 +161,19 @@ mod tests {
         assert_eq!(q.page_id(), 3);
         assert_eq!(q.tuple_count(), 1);
         assert_eq!(q.get_tuple(0).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn tombstone_hides_tuple() {
+        let mut p = Page::new(0);
+        let s0 = p.insert(b"hello").unwrap();
+        let s1 = p.insert(b"world").unwrap();
+        assert_eq!(p.get_tuple(s0).unwrap(), b"hello");
+        p.delete(s0).unwrap();
+        assert!(p.get_tuple(s0).is_none());
+        assert_eq!(p.get_tuple(s1).unwrap(), b"world");
+        // Double-delete is an error.
+        assert!(p.delete(s0).is_err());
     }
 
     #[test]

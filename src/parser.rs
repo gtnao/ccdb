@@ -35,8 +35,12 @@ impl Parser {
         let stmt = match self.peek() {
             Some(Token::Select) => self.parse_select()?,
             Some(Token::Insert) => self.parse_insert()?,
+            Some(Token::Delete) => self.parse_delete()?,
+            Some(Token::Update) => self.parse_update()?,
             Some(Token::Create) => self.parse_create_table()?,
-            other => bail!("expected SELECT / INSERT / CREATE, got {other:?}"),
+            other => bail!(
+                "expected SELECT / INSERT / DELETE / UPDATE / CREATE, got {other:?}"
+            ),
         };
         if let Some(Token::Semicolon) = self.peek() {
             self.bump();
@@ -132,6 +136,51 @@ impl Parser {
             }
             other => bail!("expected data type, got {other:?}"),
         }
+    }
+
+    fn parse_delete(&mut self) -> Result<Statement> {
+        self.expect(&Token::Delete)?;
+        self.expect(&Token::From)?;
+        let table = self.parse_ident()?;
+        let where_clause = if matches!(self.peek(), Some(Token::Where)) {
+            self.bump();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Delete(DeleteStatement {
+            table,
+            where_clause,
+        }))
+    }
+
+    fn parse_update(&mut self) -> Result<Statement> {
+        self.expect(&Token::Update)?;
+        let table = self.parse_ident()?;
+        self.expect(&Token::Set)?;
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.parse_ident()?;
+            self.expect(&Token::Eq)?;
+            let value = self.parse_expr()?;
+            assignments.push(Assignment { column, value });
+            if matches!(self.peek(), Some(Token::Comma)) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        let where_clause = if matches!(self.peek(), Some(Token::Where)) {
+            self.bump();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok(Statement::Update(UpdateStatement {
+            table,
+            assignments,
+            where_clause,
+        }))
     }
 
     fn parse_table_ref(&mut self) -> Result<TableRef> {
@@ -432,5 +481,30 @@ mod tests {
     #[test]
     fn empty_input_errors() {
         assert!(parse("").is_err());
+    }
+
+    #[test]
+    fn delete_with_where() {
+        let s = parse("DELETE FROM users WHERE id = 1").unwrap();
+        let Statement::Delete(d) = s else { panic!() };
+        assert_eq!(d.table, "users");
+        assert!(d.where_clause.is_some());
+    }
+
+    #[test]
+    fn delete_no_where() {
+        let s = parse("DELETE FROM users").unwrap();
+        let Statement::Delete(d) = s else { panic!() };
+        assert!(d.where_clause.is_none());
+    }
+
+    #[test]
+    fn update_two_assignments_with_where() {
+        let s = parse("UPDATE users SET name = 'A', id = 5 WHERE id = 1").unwrap();
+        let Statement::Update(u) = s else { panic!() };
+        assert_eq!(u.assignments.len(), 2);
+        assert_eq!(u.assignments[0].column, "name");
+        assert_eq!(u.assignments[1].column, "id");
+        assert!(u.where_clause.is_some());
     }
 }

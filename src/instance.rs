@@ -109,18 +109,29 @@ impl Instance {
                 conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
             }
             AnalyzedStatement::Insert(_) => {
-                let out = execute(&mut self.bpm, &self.catalog, &analyzed)?;
-                let n = match out {
-                    Output::Affected(n) => n,
-                    Output::Rows(_) => bail!("INSERT yielded Rows output"),
-                };
+                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed)?)?;
                 conn.send_command_complete(&format!("INSERT 0 {n}"))?;
+            }
+            AnalyzedStatement::Delete(_) => {
+                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed)?)?;
+                conn.send_command_complete(&format!("DELETE {n}"))?;
+            }
+            AnalyzedStatement::Update(_) => {
+                let n = expect_affected(execute(&mut self.bpm, &self.catalog, &analyzed)?)?;
+                conn.send_command_complete(&format!("UPDATE {n}"))?;
             }
             AnalyzedStatement::CreateTable(_) => {
                 bail!("CREATE TABLE is not yet wired up (catalog is read-only)")
             }
         }
         Ok(())
+    }
+}
+
+fn expect_affected(out: Output) -> Result<usize> {
+    match out {
+        Output::Affected(n) => Ok(n),
+        Output::Rows(_) => bail!("expected affected-row count, got rows"),
     }
 }
 

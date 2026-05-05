@@ -4,7 +4,28 @@
 pub enum Statement {
     Select(SelectStatement),
     Insert(InsertStatement),
+    Delete(DeleteStatement),
+    Update(UpdateStatement),
     CreateTable(CreateTableStatement),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteStatement {
+    pub table: String,
+    pub where_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateStatement {
+    pub table: String,
+    pub assignments: Vec<Assignment>,
+    pub where_clause: Option<Expr>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    pub column: String,
+    pub value: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
