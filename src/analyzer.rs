@@ -230,6 +230,10 @@ pub struct AnalyzedCreateTableStatement {
     /// CHECK predicates (table-level + lifted column-level), serialized
     /// via Expr::Display. Stored in pg_constraint by the executor.
     pub check_constraints: Vec<String>,
+    /// FK declarations encoded as `ForeignKeyDef::encode` strings —
+    /// resolved against existing tables but not yet bound to runtime
+    /// column indexes.
+    pub foreign_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1433,12 +1437,56 @@ impl<'a> Analyzer<'a> {
         };
         let check_constraints: Vec<String> =
             s.check_constraints.iter().map(|e| e.to_string()).collect();
+
+        // Validate each FK and produce its encoded definition.
+        let mut foreign_keys: Vec<String> = Vec::new();
+        for fk in &s.foreign_keys {
+            // Local column must exist in the new table.
+            if !columns.iter().any(|c| c.name == fk.column) {
+                bail!("FOREIGN KEY references unknown column '{}'", fk.column);
+            }
+            // Referenced table must exist (self-references aren't supported
+            // yet — the table doesn't exist in the catalog at this point).
+            let ref_table = self
+                .catalog
+                .find_table(&fk.ref_table)?
+                .ok_or_else(|| anyhow::anyhow!("referenced table '{}' not found", fk.ref_table))?
+                .1;
+            if !ref_table.columns.iter().any(|c| c.name == fk.ref_column) {
+                bail!(
+                    "referenced column '{}.{}' not found",
+                    fk.ref_table,
+                    fk.ref_column
+                );
+            }
+            let on_delete = fk_action_to_str(fk.on_delete);
+            let on_update = fk_action_to_str(fk.on_update);
+            let def = crate::catalog::ForeignKeyDef {
+                child_column: fk.column.clone(),
+                ref_table: fk.ref_table.clone(),
+                ref_column: fk.ref_column.clone(),
+                on_delete: on_delete.to_string(),
+                on_update: on_update.to_string(),
+            };
+            foreign_keys.push(def.encode());
+        }
+
         Ok(AnalyzedCreateTableStatement {
             table_name: s.table.clone(),
             columns,
             primary_key_column,
             check_constraints,
+            foreign_keys,
         })
+    }
+}
+
+fn fk_action_to_str(a: ast::FkAction) -> &'static str {
+    match a {
+        ast::FkAction::NoAction => "NO_ACTION",
+        ast::FkAction::Restrict => "RESTRICT",
+        ast::FkAction::Cascade => "CASCADE",
+        ast::FkAction::SetNull => "SET_NULL",
     }
 }
 

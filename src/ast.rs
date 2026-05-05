@@ -148,6 +148,27 @@ pub struct CreateTableStatement {
     /// Each entry is the boolean expression as written; the executor
     /// re-binds it against each INSERT/UPDATE row.
     pub check_constraints: Vec<Expr>,
+    /// Foreign-key declarations (column-level + table-level merged).
+    pub foreign_keys: Vec<ForeignKey>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FkAction {
+    /// `NO ACTION` — same as RESTRICT for now (the deferred-check
+    /// distinction will land with SAVEPOINT).
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
 }
 
 #[derive(Debug, Clone, PartialEq)]

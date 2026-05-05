@@ -287,6 +287,8 @@ impl<S: Read + Write> Connection<S> {
             "23505" // unique_violation — set explicitly by the executor
         } else if message.contains("SQLSTATE 23514") {
             "23514" // check_violation
+        } else if message.contains("SQLSTATE 23503") {
+            "23503" // foreign_key_violation
         } else if message.contains("lock acquisition timeout")
             || message.contains("deadlock")
         {

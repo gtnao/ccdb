@@ -57,15 +57,56 @@ pub struct IndexDef {
 #[repr(i32)]
 pub enum ConstraintKind {
     Check = 1,
-    // Foreign key, primary key, unique, etc. join here in later rounds.
+    ForeignKey = 2,
+    // Primary key, unique, etc. join here in later rounds.
 }
 
 impl ConstraintKind {
     pub fn from_int(n: i32) -> Option<Self> {
         match n {
             1 => Some(Self::Check),
+            2 => Some(Self::ForeignKey),
             _ => None,
         }
+    }
+}
+
+/// Decoded `pg_constraint.definition` for a FOREIGN KEY constraint.
+/// Stored on disk as a tab-delimited string; this is the parsed form
+/// the executor uses to enforce / cascade.
+#[derive(Debug, Clone)]
+pub struct ForeignKeyDef {
+    pub child_column: String,
+    pub ref_table: String,
+    pub ref_column: String,
+    pub on_delete: String,
+    pub on_update: String,
+}
+
+impl ForeignKeyDef {
+    pub fn encode(&self) -> String {
+        format!(
+            "FK\t{}\t{}\t{}\t{}\t{}",
+            self.child_column,
+            self.ref_table,
+            self.ref_column,
+            self.on_delete,
+            self.on_update,
+        )
+    }
+
+    pub fn decode(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.split('\t').collect();
+        if parts.len() != 6 || parts[0] != "FK" {
+            return None;
+        }
+        Some(Self {
+            child_column: parts[1].to_string(),
+            ref_table: parts[2].to_string(),
+            ref_column: parts[3].to_string(),
+            on_delete: parts[4].to_string(),
+            on_update: parts[5].to_string(),
+        })
     }
 }
 

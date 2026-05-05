@@ -1456,9 +1456,8 @@ fn perform_create_table(
     }
 
     // CHECK constraints → pg_constraint rows, one per predicate.
-    if !stmt.check_constraints.is_empty() {
-        use crate::bootstrap::{PG_CONSTRAINT_PAGE_ID, PG_CONSTRAINT_TABLE_ID};
-        let _ = PG_CONSTRAINT_TABLE_ID;
+    if !stmt.check_constraints.is_empty() || !stmt.foreign_keys.is_empty() {
+        use crate::bootstrap::PG_CONSTRAINT_PAGE_ID;
         let existing = catalog.all_constraints()?;
         let mut next_id: i32 = existing
             .iter()
@@ -1476,6 +1475,22 @@ fn perform_create_table(
                     Value::Varchar(cname),
                     Value::Int(new_table_id),
                     Value::Int(crate::catalog::ConstraintKind::Check as i32),
+                    Value::Varchar(defn.clone()),
+                ],
+            );
+            insert_bytes(bpm, wal, tx, PG_CONSTRAINT_PAGE_ID, &row)?;
+            next_id += 1;
+        }
+        for (i, defn) in stmt.foreign_keys.iter().enumerate() {
+            let cname = format!("{}_fkey_{}", stmt.table_name, i);
+            let row = serialize_tuple_mvcc(
+                tx.id(),
+                INVALID_TXN_ID,
+                &[
+                    Value::Int(next_id),
+                    Value::Varchar(cname),
+                    Value::Int(new_table_id),
+                    Value::Int(crate::catalog::ConstraintKind::ForeignKey as i32),
                     Value::Varchar(defn.clone()),
                 ],
             );
@@ -2129,6 +2144,97 @@ fn rewrite_catalog_row(
     Ok(())
 }
 
+/// Confirm every FOREIGN KEY on `table_id` is satisfied by the candidate
+/// row. NULL FK values are allowed (PG semantics: a NULL key references
+/// nothing). Otherwise a visible row with `ref_column = value` must
+/// exist in `ref_table`. Bails with SQLSTATE 23503.
+fn enforce_fk_on_child_write(
+    bpm: &BufferPool,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    table_id: usize,
+    values: &[Value],
+    tx: &Transaction,
+) -> Result<()> {
+    let constraints = catalog.constraints_for_table(table_id)?;
+    let table = catalog
+        .table_by_id(table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table {table_id} missing"))?;
+    let snapshot = tx
+        .snapshot()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
+    for c in constraints {
+        if !matches!(c.kind, crate::catalog::ConstraintKind::ForeignKey) {
+            continue;
+        }
+        let fk = match crate::catalog::ForeignKeyDef::decode(&c.definition) {
+            Some(f) => f,
+            None => bail!("malformed FK definition: {}", c.definition),
+        };
+        let col_idx = table
+            .columns
+            .iter()
+            .position(|tc| tc.name == fk.child_column)
+            .ok_or_else(|| anyhow::anyhow!("FK '{}' references missing local column", c.name))?;
+        let v = &values[col_idx];
+        if matches!(v, Value::Null) {
+            continue;
+        }
+        let (ref_table_id, _) = catalog
+            .find_table(&fk.ref_table)?
+            .ok_or_else(|| anyhow::anyhow!("FK target '{}' missing", fk.ref_table))?;
+        if !fk_target_exists(bpm, catalog, tm, &snapshot, ref_table_id, &fk.ref_column, v)? {
+            bail!(
+                "insert or update on \"{}\" violates foreign key constraint \"{}\" [SQLSTATE 23503]",
+                table.name,
+                c.name
+            );
+        }
+    }
+    Ok(())
+}
+
+fn fk_target_exists(
+    bpm: &BufferPool,
+    catalog: &Catalog,
+    tm: &TransactionManager,
+    snapshot: &Snapshot,
+    ref_table_id: usize,
+    ref_column: &str,
+    target: &Value,
+) -> Result<bool> {
+    let ref_table = catalog
+        .table_by_id(ref_table_id)?
+        .ok_or_else(|| anyhow::anyhow!("ref table {ref_table_id} missing"))?;
+    let ref_col_idx = ref_table
+        .columns
+        .iter()
+        .position(|c| c.name == ref_column)
+        .ok_or_else(|| anyhow::anyhow!("ref column {ref_column} missing"))?;
+    let (_schema, rows) = visible_rows(bpm, catalog, ref_table_id, snapshot, tm)?;
+    for (_, _, vals) in rows {
+        if values_equal(&vals[ref_col_idx], target) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn values_equal(a: &Value, b: &Value) -> bool {
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        (Value::Int(x), Value::Int(y)) => x == y,
+        (Value::Varchar(x), Value::Varchar(y)) => x == y,
+        (Value::Bool(x), Value::Bool(y)) => x == y,
+        (Value::Double(x), Value::Double(y)) => x.to_bits() == y.to_bits(),
+        (Value::Timestamp(x), Value::Timestamp(y)) => x == y,
+        (Value::Date(x), Value::Date(y)) => x == y,
+        (Value::Time(x), Value::Time(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// Evaluate every CHECK constraint registered for `table_id` against a
 /// fully-coerced row. Re-parses + re-binds each predicate's text on every
 /// call — fine for now (a per-row hashmap cache would help under load).
@@ -2196,6 +2302,8 @@ pub fn perform_copy_row(
         .map(|(v, c)| coerce_for_storage(v, c.data_type))
         .collect::<Result<_>>()?;
     enforce_check_constraints(catalog, table_id, &table.name, &coerced)?;
+    let tm_for_fk = Arc::clone(tx.tm());
+    enforce_fk_on_child_write(bpm, &tm_for_fk, catalog, table_id, &coerced, tx)?;
     let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &coerced);
     let (rid, _lsn, new_tail) =
         insert_bytes_hinted(bpm, wal, tx, table.first_page_id, &bytes, tail_hint)?;
@@ -2272,6 +2380,8 @@ fn perform_insert(
         }
 
         enforce_check_constraints(catalog, stmt.table_id, &stmt.table_name, &values)?;
+        let tm_for_fk = Arc::clone(tx.tm());
+        enforce_fk_on_child_write(bpm, &tm_for_fk, catalog, stmt.table_id, &values, tx)?;
         let bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &values);
         let (rid, _lsn) = insert_bytes(bpm, wal, tx, table.first_page_id, &bytes)?;
         lm.lock(tx.id(), rid, LockMode::Exclusive)
@@ -2864,10 +2974,15 @@ fn perform_delete(
         .map(|(pid, slot, values)| ((pid, slot), values))
         .collect();
     for ((pid, slot), values) in &victims {
+        // FK action on referencing children must run BEFORE we tombstone
+        // this row — RESTRICT needs to be able to abort the whole DELETE
+        // before any heap state has changed for this victim.
+        cascade_fk_on_parent_delete(
+            bpm, lm, wal, tm, catalog, stmt.table_id, values, tx,
+        )?;
         lm.lock(tx.id(), (*pid, *slot), LockMode::Exclusive)
             .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (*pid, *slot)))?;
         tx.add_lock((*pid, *slot));
-        // MVCC logical delete: only the xmax field changes.
         {
             let g = bpm.fetch_page(*pid)?;
             let mut p = g.write();
@@ -2882,11 +2997,161 @@ fn perform_delete(
             )?;
             p.set_page_lsn(lsn);
         }
-        // No index op on DELETE: index is add-only. The heap xmax marker
-        // is the source of truth for visibility; IndexScan re-checks it.
-        let _ = values;
     }
     Ok(victims.len())
+}
+
+/// Walk every FK that *targets* `parent_table_id` and apply its
+/// `on_delete` action to rows in the child table that reference the
+/// row about to be deleted. RESTRICT/NO ACTION raise SQLSTATE 23503;
+/// CASCADE recursively deletes; SET NULL writes NULL into the child
+/// FK column.
+fn cascade_fk_on_parent_delete(
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    parent_table_id: usize,
+    parent_row: &[Value],
+    tx: &mut Transaction,
+) -> Result<()> {
+    let parent = catalog
+        .table_by_id(parent_table_id)?
+        .ok_or_else(|| anyhow::anyhow!("parent table {parent_table_id} missing"))?;
+    let snapshot = tx
+        .snapshot()
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
+
+    // Collect FK constraints (across all tables) that point at this parent.
+    let all = catalog.all_constraints()?;
+    for c in all {
+        if !matches!(c.kind, crate::catalog::ConstraintKind::ForeignKey) {
+            continue;
+        }
+        let fk = match crate::catalog::ForeignKeyDef::decode(&c.definition) {
+            Some(f) => f,
+            None => continue,
+        };
+        if fk.ref_table != parent.name {
+            continue;
+        }
+        let parent_col_idx = parent
+            .columns
+            .iter()
+            .position(|col| col.name == fk.ref_column)
+            .ok_or_else(|| anyhow::anyhow!("FK ref column missing"))?;
+        let target_value = &parent_row[parent_col_idx];
+        if matches!(target_value, Value::Null) {
+            continue;
+        }
+        let child_table_id = c.table_id;
+        let child = catalog
+            .table_by_id(child_table_id)?
+            .ok_or_else(|| anyhow::anyhow!("child table {child_table_id} missing"))?;
+        let child_col_idx = child
+            .columns
+            .iter()
+            .position(|col| col.name == fk.child_column)
+            .ok_or_else(|| anyhow::anyhow!("FK child column missing"))?;
+
+        // Find all visible child rows that reference target_value.
+        let (_schema, rows) =
+            visible_rows(bpm, catalog, child_table_id, &snapshot, tm)?;
+        let matches_rows: Vec<(Rid, Vec<Value>)> = rows
+            .into_iter()
+            .filter(|(_, _, v)| values_equal(&v[child_col_idx], target_value))
+            .map(|(p, s, v)| ((p, s), v))
+            .collect();
+        if matches_rows.is_empty() {
+            continue;
+        }
+
+        match fk.on_delete.as_str() {
+            "RESTRICT" | "NO_ACTION" => {
+                bail!(
+                    "update or delete on \"{}\" violates foreign key constraint \"{}\" on \"{}\" [SQLSTATE 23503]",
+                    parent.name,
+                    c.name,
+                    child.name
+                );
+            }
+            "CASCADE" => {
+                for ((pid, slot), values) in &matches_rows {
+                    // Recurse so cascading children are also handled.
+                    cascade_fk_on_parent_delete(
+                        bpm, lm, wal, tm, catalog, child_table_id, values, tx,
+                    )?;
+                    lm.lock(tx.id(), (*pid, *slot), LockMode::Exclusive).map_err(
+                        |e| anyhow::anyhow!("X-lock on {:?}: {e}", (*pid, *slot)),
+                    )?;
+                    tx.add_lock((*pid, *slot));
+                    let g = bpm.fetch_page(*pid)?;
+                    let mut p = g.write();
+                    p.set_tuple_xmax(*slot, tx.id())?;
+                    let lsn = log_record(
+                        wal,
+                        tx,
+                        WalRecordType::Delete {
+                            rid: (*pid, *slot),
+                            xmax: tx.id(),
+                        },
+                    )?;
+                    p.set_page_lsn(lsn);
+                }
+            }
+            "SET_NULL" => {
+                for ((pid, slot), old_values) in matches_rows {
+                    let mut new_values = old_values.clone();
+                    new_values[child_col_idx] = Value::Null;
+                    enforce_check_constraints(
+                        catalog, child_table_id, &child.name, &new_values,
+                    )?;
+                    lm.lock(tx.id(), (pid, slot), LockMode::Exclusive).map_err(
+                        |e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)),
+                    )?;
+                    tx.add_lock((pid, slot));
+                    {
+                        let g = bpm.fetch_page(pid)?;
+                        let mut p = g.write();
+                        p.set_tuple_xmax(slot, tx.id())?;
+                        let lsn = log_record(
+                            wal,
+                            tx,
+                            WalRecordType::Delete {
+                                rid: (pid, slot),
+                                xmax: tx.id(),
+                            },
+                        )?;
+                        p.set_page_lsn(lsn);
+                    }
+                    let new_bytes =
+                        serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
+                    let (new_rid, _lsn) =
+                        insert_bytes(bpm, wal, tx, child.first_page_id, &new_bytes)?;
+                    lm.lock(tx.id(), new_rid, LockMode::Exclusive).map_err(
+                        |e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"),
+                    )?;
+                    tx.add_lock(new_rid);
+                    let tm_arc = Arc::clone(tx.tm());
+                    index_insert_for_row_with_lm(
+                        bpm,
+                        Some(lm),
+                        wal,
+                        Some(&tm_arc),
+                        catalog,
+                        tx,
+                        child_table_id,
+                        &new_values,
+                        new_rid,
+                    )?;
+                }
+            }
+            other => bail!("unknown FK action '{other}'"),
+        }
+    }
+    Ok(())
 }
 
 fn perform_update(
@@ -2920,6 +3185,10 @@ fn perform_update(
             new_values[a.column_index] = coerce_for_storage(v, target)?;
         }
         enforce_check_constraints(catalog, stmt.table_id, &stmt.table_name, &new_values)?;
+        let tm_for_fk = Arc::clone(tx.tm());
+        enforce_fk_on_child_write(
+            bpm, &tm_for_fk, catalog, stmt.table_id, &new_values, tx,
+        )?;
         let new_bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
         work.push((pid, slot, old_values, new_values, new_bytes));
     }

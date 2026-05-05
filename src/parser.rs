@@ -329,12 +329,29 @@ impl Parser {
         let mut columns = Vec::new();
         let mut primary_key: Vec<String> = Vec::new();
         let mut check_constraints: Vec<Expr> = Vec::new();
+        let mut foreign_keys: Vec<ForeignKey> = Vec::new();
         loop {
             // Optional `CONSTRAINT <name>` prefix on a table-level constraint
             // — the name is parsed and discarded for now.
             if matches!(self.peek(), Some(Token::Constraint)) {
                 self.bump();
                 self.parse_ident()?;
+            }
+            // Table-level FOREIGN KEY (col) REFERENCES other(col) [...].
+            if matches!(self.peek(), Some(Token::Foreign)) {
+                self.bump();
+                self.expect(&Token::Key)?;
+                self.expect(&Token::LParen)?;
+                let local_col = self.parse_ident()?;
+                self.expect(&Token::RParen)?;
+                let fk = self.parse_fk_tail(local_col)?;
+                foreign_keys.push(fk);
+                if matches!(self.peek(), Some(Token::Comma)) {
+                    self.bump();
+                    continue;
+                } else {
+                    break;
+                }
             }
             // Table-level CHECK (...).
             if matches!(self.peek(), Some(Token::Check)) {
@@ -433,6 +450,12 @@ impl Parser {
                         self.expect(&Token::RParen)?;
                         check_constraints.push(expr);
                     }
+                    // Column-level REFERENCES — implicit single-column FK
+                    // on the column being defined.
+                    Some(Token::References) => {
+                        let fk = self.parse_fk_tail(name.clone())?;
+                        foreign_keys.push(fk);
+                    }
                     // Column-level `PRIMARY KEY`. Records this column as
                     // the table's PK; the executor will create the unique
                     // index after the table itself is registered.
@@ -482,7 +505,79 @@ impl Parser {
             columns,
             primary_key,
             check_constraints,
+            foreign_keys,
         }))
+    }
+
+    /// Parse the tail of a FOREIGN KEY clause, starting at `REFERENCES`.
+    /// `column` is the local column name (already known by the caller —
+    /// either the column being defined for an inline reference, or the
+    /// single name inside a table-level `FOREIGN KEY (col)`).
+    fn parse_fk_tail(&mut self, column: String) -> Result<ForeignKey> {
+        self.expect(&Token::References)?;
+        let ref_table = self.parse_ident()?;
+        let ref_column = if matches!(self.peek(), Some(Token::LParen)) {
+            self.bump();
+            let c = self.parse_ident()?;
+            self.expect(&Token::RParen)?;
+            c
+        } else {
+            // PG default: reference the primary key column. We don't yet
+            // resolve it here — flag and let the analyzer surface a clear
+            // error. For now require an explicit column.
+            bail!("FOREIGN KEY without an explicit (col) target is not supported");
+        };
+        let mut on_delete = FkAction::NoAction;
+        let mut on_update = FkAction::NoAction;
+        loop {
+            if !matches!(self.peek(), Some(Token::On)) {
+                break;
+            }
+            self.bump();
+            let which_delete = match self.peek() {
+                Some(Token::Delete) => true,
+                Some(Token::Update) => false,
+                other => bail!("expected DELETE or UPDATE after ON, got {other:?}"),
+            };
+            self.bump();
+            let action = self.parse_fk_action()?;
+            if which_delete {
+                on_delete = action;
+            } else {
+                on_update = action;
+            }
+        }
+        Ok(ForeignKey {
+            column,
+            ref_table,
+            ref_column,
+            on_delete,
+            on_update,
+        })
+    }
+
+    fn parse_fk_action(&mut self) -> Result<FkAction> {
+        match self.peek() {
+            Some(Token::Cascade) => {
+                self.bump();
+                Ok(FkAction::Cascade)
+            }
+            Some(Token::Restrict) => {
+                self.bump();
+                Ok(FkAction::Restrict)
+            }
+            Some(Token::No) => {
+                self.bump();
+                self.expect(&Token::Action)?;
+                Ok(FkAction::NoAction)
+            }
+            Some(Token::Set) => {
+                self.bump();
+                self.expect(&Token::Null)?;
+                Ok(FkAction::SetNull)
+            }
+            other => bail!("expected CASCADE/RESTRICT/NO ACTION/SET NULL, got {other:?}"),
+        }
     }
 
     /// `CREATE SEQUENCE [IF NOT EXISTS] name
