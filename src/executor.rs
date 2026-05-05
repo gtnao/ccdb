@@ -990,11 +990,108 @@ fn evaluate_expr(expr: &AnalyzedExpr, tuple: &Tuple) -> Result<Value> {
         }
         // IS NULL is the one predicate that returns a *definite* bool when
         // its operand is NULL — that's the whole point.
+        AnalyzedExpr::Now => bail!(
+            "internal: AnalyzedExpr::Now reached evaluator (should be substituted at execute() entry)"
+        ),
         AnalyzedExpr::IsNull { expr, negated } => {
             let v = evaluate_expr(expr, tuple)?;
             let is_null = matches!(v, Value::Null);
             Ok(Value::Bool(if *negated { !is_null } else { is_null }))
         }
+    }
+}
+
+/// Walk every AnalyzedExpr in a statement and replace `Now` with a
+/// Literal::Timestamp(ts). The substitution is structural — we clone the
+/// statement so the original analyzer-cached version stays Now-bearing and
+/// can be re-executed in a different transaction with a different ts.
+fn substitute_now_in_statement(stmt: &AnalyzedStatement, ts: i64) -> AnalyzedStatement {
+    match stmt {
+        AnalyzedStatement::Select(s) => {
+            let mut s = s.clone();
+            substitute_now_in_select(&mut s, ts);
+            AnalyzedStatement::Select(s)
+        }
+        AnalyzedStatement::Insert(s) => {
+            let mut s = s.clone();
+            for row in &mut s.rows {
+                for e in row.iter_mut() {
+                    substitute_now_in_expr(e, ts);
+                }
+            }
+            AnalyzedStatement::Insert(s)
+        }
+        AnalyzedStatement::Update(s) => {
+            let mut s = s.clone();
+            for a in &mut s.assignments {
+                substitute_now_in_expr(&mut a.value, ts);
+            }
+            if let Some(w) = &mut s.where_clause {
+                substitute_now_in_expr(w, ts);
+            }
+            AnalyzedStatement::Update(s)
+        }
+        AnalyzedStatement::Delete(s) => {
+            let mut s = s.clone();
+            if let Some(w) = &mut s.where_clause {
+                substitute_now_in_expr(w, ts);
+            }
+            AnalyzedStatement::Delete(s)
+        }
+        // CreateTable / CreateIndex / Begin / Commit / Rollback / Checkpoint
+        // don't carry user-supplied expressions that could contain now().
+        other => other.clone(),
+    }
+}
+
+fn substitute_now_in_select(s: &mut AnalyzedSelectStatement, ts: i64) {
+    if let Some(w) = &mut s.where_clause {
+        substitute_now_in_expr(w, ts);
+    }
+    for it in &mut s.select_items {
+        substitute_now_in_expr(&mut it.expr, ts);
+    }
+    if let Some(h) = &mut s.having {
+        substitute_now_in_expr(h, ts);
+    }
+    for ob in &mut s.order_by {
+        substitute_now_in_expr(&mut ob.expr, ts);
+    }
+    if let Some(agg) = &mut s.aggregation {
+        for k in &mut agg.group_keys {
+            substitute_now_in_expr(k, ts);
+        }
+        for a in &mut agg.aggregates {
+            if let crate::analyzer::AggArg::Expr(e) = &mut a.arg {
+                substitute_now_in_expr(e, ts);
+            }
+        }
+    }
+    substitute_now_in_from(&mut s.from, ts);
+}
+
+fn substitute_now_in_from(f: &mut AnalyzedFrom, ts: i64) {
+    if let AnalyzedFrom::Join { left, on, .. } = f {
+        substitute_now_in_from(left, ts);
+        substitute_now_in_expr(on, ts);
+    }
+}
+
+fn substitute_now_in_expr(e: &mut AnalyzedExpr, ts: i64) {
+    match e {
+        AnalyzedExpr::Now => {
+            *e = AnalyzedExpr::Literal(AnalyzedLiteral {
+                value: LiteralValue::Timestamp(ts),
+                data_type: Some(DataType::Timestamp),
+            });
+        }
+        AnalyzedExpr::Literal(_) | AnalyzedExpr::ColumnRef(_) => {}
+        AnalyzedExpr::BinaryOp { left, right, .. } => {
+            substitute_now_in_expr(left, ts);
+            substitute_now_in_expr(right, ts);
+        }
+        AnalyzedExpr::UnaryOp { expr, .. } => substitute_now_in_expr(expr, ts),
+        AnalyzedExpr::IsNull { expr, .. } => substitute_now_in_expr(expr, ts),
     }
 }
 
@@ -1811,6 +1908,12 @@ pub fn execute(
     if was_inactive_at_start {
         tx.refresh_autocommit();
     }
+
+    // Replace `now()` / `current_timestamp` placeholders with the txn's
+    // start timestamp. This makes the value stable within a single tx
+    // and lets every downstream operator see only Literal nodes.
+    let stmt_owned = substitute_now_in_statement(stmt, tx.start_ts());
+    let stmt = &stmt_owned;
 
     // For DML running under auto-commit, bracket the records with Begin/Commit
     // (or Abort on error) so the WAL is self-describing for recovery.

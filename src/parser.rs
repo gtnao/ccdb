@@ -727,6 +727,16 @@ impl Parser {
                     micros,
                 }))
             }
+            Some(Token::CurrentTimestamp) => {
+                // SQL standard: `current_timestamp` (no parens). Normalised to
+                // a `now()` function call so analyzer treats both forms the
+                // same.
+                self.bump();
+                Ok(Expr::FuncCall {
+                    name: "now".to_string(),
+                    args: FuncArgs::Exprs(Vec::new()),
+                })
+            }
             Some(Token::Integer(n)) => {
                 let n = *n;
                 self.bump();

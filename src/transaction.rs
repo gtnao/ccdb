@@ -49,6 +49,10 @@ pub struct Transaction {
     /// Snapshot taken at BEGIN (or at every auto-commit boundary). MVCC
     /// reads filter visibility against this.
     snapshot: Option<Snapshot>,
+    /// PG-epoch microseconds at which the *current* (sub-)transaction
+    /// boundary started. Updated on `begin()` and `refresh_autocommit()`
+    /// so `now()` / `current_timestamp` are stable within one tx.
+    start_ts: i64,
 }
 
 impl Transaction {
@@ -63,7 +67,14 @@ impl Transaction {
             last_lsn: 0,
             tm,
             snapshot: Some(snapshot),
+            start_ts: pg_epoch_micros_now(),
         }
+    }
+
+    /// PG-epoch microseconds at which this transaction's current boundary
+    /// started. Used by `now()` / `current_timestamp`.
+    pub fn start_ts(&self) -> i64 {
+        self.start_ts
     }
 
     pub fn snapshot(&self) -> Option<&Snapshot> {
@@ -100,6 +111,7 @@ impl Transaction {
         self.held_locks.clear();
         self.last_lsn = 0;
         self.snapshot = Some(self.tm.snapshot(self.id));
+        self.start_ts = pg_epoch_micros_now();
     }
 
     pub fn commit(&mut self) {
@@ -120,6 +132,7 @@ impl Transaction {
             self.held_locks.clear();
             self.last_lsn = 0;
             self.snapshot = Some(self.tm.snapshot(self.id));
+            self.start_ts = pg_epoch_micros_now();
         }
     }
 
@@ -191,4 +204,20 @@ mod tests {
         tx.refresh_autocommit(); // no-op while active
         assert_eq!(tx.id(), id3);
     }
+}
+
+/// Wall-clock now expressed as microseconds from the PostgreSQL epoch
+/// (2000-01-01 UTC midnight). Used for transaction-scoped `now()` /
+/// `current_timestamp` evaluation.
+fn pg_epoch_micros_now() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // Microseconds between Unix epoch (1970-01-01) and PG epoch (2000-01-01):
+    // 30 years * 365.25 days * 86400 sec * 1e6 ≈ 9.466e14. Exact: 30 years
+    // includes 7 leap days (2000 not counted, 1972..1996 = 7).
+    const PG_EPOCH_FROM_UNIX_MICROS: i64 = 946_684_800_000_000;
+    let unix_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    unix_micros - PG_EPOCH_FROM_UNIX_MICROS
 }

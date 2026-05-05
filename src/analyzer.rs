@@ -238,6 +238,10 @@ pub enum AnalyzedExpr {
         expr: Box<AnalyzedExpr>,
         negated: bool,
     },
+    /// `now()` / `current_timestamp` — placeholder for the transaction
+    /// start timestamp. Replaced with a Literal at the executor entry once
+    /// `tx.start_ts()` is known. Always typed as TIMESTAMP.
+    Now,
 }
 
 #[derive(Debug, Clone)]
@@ -277,6 +281,7 @@ impl AnalyzedExpr {
             AnalyzedExpr::BinaryOp { result_type, .. }
             | AnalyzedExpr::UnaryOp { result_type, .. } => Some(*result_type),
             AnalyzedExpr::IsNull { .. } => Some(DataType::Bool),
+            AnalyzedExpr::Now => Some(DataType::Timestamp),
         }
     }
 }
@@ -413,7 +418,10 @@ impl<'a> Analyzer<'a> {
                     negated: *negated,
                 })
             }
-            Expr::FuncCall { name, .. } => {
+            Expr::FuncCall { name, args } => {
+                if let Some(builtin) = analyze_scalar_builtin(name, args)? {
+                    return Ok(builtin);
+                }
                 if AggKind::from_name(name).is_some() {
                     bail!("aggregate '{name}' not allowed here");
                 }
@@ -727,6 +735,9 @@ impl<'a> Analyzer<'a> {
                 })
             }
             Expr::FuncCall { name, args } => {
+                if let Some(builtin) = analyze_scalar_builtin(name, args)? {
+                    return Ok(builtin);
+                }
                 let kind = AggKind::from_name(name)
                     .ok_or_else(|| anyhow::anyhow!("unknown function '{name}'"))?;
                 let (analyzed_arg, arg_type) = match (kind, args) {
@@ -1026,6 +1037,25 @@ fn substitute_aliases(e: &Expr, aliases: &[(String, Expr)]) -> Expr {
     }
 }
 
+/// Recognise a scalar built-in by name, returning its analyzed form when
+/// matched. Returns `None` for unknown names so callers can try aggregates
+/// or fall back to error.
+fn analyze_scalar_builtin(name: &str, args: &FuncArgs) -> Result<Option<AnalyzedExpr>> {
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "now" | "current_timestamp" | "transaction_timestamp" => {
+            match args {
+                FuncArgs::Star => bail!("{lower}() does not take *"),
+                FuncArgs::Exprs(es) if !es.is_empty() => {
+                    bail!("{lower}() takes no arguments")
+                }
+                _ => Ok(Some(AnalyzedExpr::Now)),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Walk an AST expression to see whether it contains any aggregate-named
 /// function call. Used to decide whether a SELECT needs an aggregation
 /// pipeline even without a GROUP BY clause.
@@ -1111,6 +1141,7 @@ fn same_expr(a: &AnalyzedExpr, b: &AnalyzedExpr) -> bool {
                 negated: n2,
             },
         ) => n1 == n2 && same_expr(e1, e2),
+        (AnalyzedExpr::Now, AnalyzedExpr::Now) => true,
         _ => false,
     }
 }
