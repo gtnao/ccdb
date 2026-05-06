@@ -364,29 +364,49 @@ pub fn first_ge(
     }
 }
 
-/// Read the entry at `cursor`, plus the cursor for the next entry (or `None`
-/// at end of chain). The btree latch is released between calls — the caller
-/// must tolerate concurrent inserts that would shift slots; for our
-/// single-writer-many-readers scan workload that's fine.
-pub fn read_at(bpm: &BufferPool, cursor: LeafCursor) -> Result<(KeyBytes, Rid, Option<LeafCursor>)> {
-    let (page_id, slot) = cursor;
-    let g = bpm.fetch_page(page_id)?;
-    let p = g.read();
-    let raw = p
-        .get_tuple(slot)
-        .ok_or_else(|| anyhow::anyhow!("btree cursor points at empty slot"))?;
-    let (key, rid) = decode_leaf_entry(raw);
-    let next_cursor = if (slot + 1) < p.tuple_count() {
-        Some((page_id, slot + 1))
-    } else {
-        let next = p.next_page_id();
-        if next == NO_NEXT_PAGE {
-            None
-        } else {
-            Some((next, 0))
+/// Read the entry at `cursor`, plus the cursor for the next entry. Returns
+/// `Ok(None)` at end of chain.
+///
+/// The btree latch is released between calls, so by the time we re-fetch
+/// the leaf it may have been split (entries moved to a sibling, slot
+/// indexes renumbered) or had an entry tombstoned via `btree::delete`.
+/// In either case our cached slot index can land past `tuple_count` or
+/// on a length-0 slot. We tolerate that by walking forward through the
+/// leaf — and, if necessary, into the next leaf — until a live entry
+/// shows up or the chain ends.
+pub fn read_at(bpm: &BufferPool, cursor: LeafCursor) -> Result<Option<(KeyBytes, Rid, Option<LeafCursor>)>> {
+    let (mut page_id, mut slot) = cursor;
+    loop {
+        let g = bpm.fetch_page(page_id)?;
+        let p = g.read();
+        let n = p.tuple_count();
+        while slot < n {
+            if let Some(raw) = p.get_tuple(slot) {
+                let (key, rid) = decode_leaf_entry(raw);
+                let next_cursor = if (slot + 1) < n {
+                    Some((page_id, slot + 1))
+                } else {
+                    let next = p.next_page_id();
+                    if next == NO_NEXT_PAGE {
+                        None
+                    } else {
+                        Some((next, 0))
+                    }
+                };
+                return Ok(Some((key, rid, next_cursor)));
+            }
+            slot += 1;
         }
-    };
-    Ok((key, rid, next_cursor))
+        // Exhausted this leaf — try its right neighbour.
+        let next = p.next_page_id();
+        drop(p);
+        drop(g);
+        if next == NO_NEXT_PAGE {
+            return Ok(None);
+        }
+        page_id = next;
+        slot = 0;
+    }
 }
 
 // ---- insert ---------------------------------------------------------------
@@ -912,7 +932,9 @@ mod tests {
         let mut seen = Vec::new();
         let mut c = Some(cur);
         while let Some(cursor) = c {
-            let (key, _, next) = read_at(&bpm, cursor).unwrap();
+            let Some((key, _, next)) = read_at(&bpm, cursor).unwrap() else {
+                break;
+            };
             seen.push(decode_key(&key, DataType::Int).unwrap());
             c = next;
         }

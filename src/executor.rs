@@ -267,7 +267,10 @@ impl Executor for IndexScan<'_> {
             let Some(c) = self.cursor else {
                 return Ok(None);
             };
-            let (key, rid, next_cursor) = crate::btree::read_at(self.bpm, c)?;
+            let Some((key, rid, next_cursor)) = crate::btree::read_at(self.bpm, c)? else {
+                self.cursor = None;
+                return Ok(None);
+            };
             self.cursor = next_cursor;
             if self.key_past_upper(&key)? {
                 self.cursor = None;
@@ -2804,6 +2807,13 @@ fn update_index_root(bpm: &BufferPool, index_id: usize, new_root: PageId) -> Res
         let mut p = g.write();
         p.delete(slot)?;
     }
+    // Re-emit ALL columns the original row carried, including is_unique
+    // (added in Phase 4-1b). Older codepaths only re-wrote 5 of the 6
+    // columns, which left a row that decode_tuple later couldn't parse.
+    let is_unique_val = vals
+        .get(5)
+        .cloned()
+        .unwrap_or(Value::Bool(false));
     let new_bytes = serialize_tuple_mvcc(
         SYSTEM_TXN_ID,
         INVALID_TXN_ID,
@@ -2813,6 +2823,7 @@ fn update_index_root(bpm: &BufferPool, index_id: usize, new_root: PageId) -> Res
             vals[2].clone(),
             vals[3].clone(),
             Value::Int(new_root as i32),
+            is_unique_val,
         ],
     );
     let g = bpm.fetch_page(PG_INDEX_PAGE_ID)?;
@@ -2864,7 +2875,9 @@ fn matching_rows(
         };
         let mut cursor = crate::btree::first_ge(bpm, idx.root_page_id, &start_key, key_type)?;
         while let Some(c) = cursor {
-            let (key, rid, next) = crate::btree::read_at(bpm, c)?;
+            let Some((key, rid, next)) = crate::btree::read_at(bpm, c)? else {
+                break;
+            };
             cursor = next;
             // Stop once we've stepped past the upper bound.
             let past = match &range {
@@ -2962,43 +2975,75 @@ fn perform_delete(
     stmt: &AnalyzedDeleteStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
-    let snapshot = tx
-        .snapshot()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
-    let (_schema, rows) = matching_rows(
-        bpm, catalog, stmt.table_id, &stmt.where_clause, &snapshot, tm,
-    )?;
-    let victims: Vec<(Rid, Vec<Value>)> = rows
-        .into_iter()
-        .map(|(pid, slot, values)| ((pid, slot), values))
-        .collect();
-    for ((pid, slot), values) in &victims {
-        // FK action on referencing children must run BEFORE we tombstone
-        // this row — RESTRICT needs to be able to abort the whole DELETE
-        // before any heap state has changed for this victim.
-        cascade_fk_on_parent_delete(
-            bpm, lm, wal, tm, catalog, stmt.table_id, values, tx,
+    let table = catalog
+        .table_by_id(stmt.table_id)?
+        .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
+    let schema = table.to_schema();
+
+    const MAX_RETRIES: u32 = 8;
+    'restart: for _attempt in 0..MAX_RETRIES {
+        let snapshot = tx.tm().snapshot(tx.id());
+        tx.set_snapshot(snapshot.clone());
+        let (_schema, rows) = matching_rows(
+            bpm, catalog, stmt.table_id, &stmt.where_clause, &snapshot, tm,
         )?;
-        lm.lock(tx.id(), (*pid, *slot), LockMode::Exclusive)
-            .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (*pid, *slot)))?;
-        tx.add_lock((*pid, *slot));
-        {
-            let g = bpm.fetch_page(*pid)?;
-            let mut p = g.write();
-            p.set_tuple_xmax(*slot, tx.id())?;
-            let lsn = log_record(
-                wal,
-                tx,
-                WalRecordType::Delete {
-                    rid: (*pid, *slot),
-                    xmax: tx.id(),
-                },
+        let victims: Vec<(Rid, Vec<Value>)> = rows
+            .into_iter()
+            .map(|(pid, slot, values)| ((pid, slot), values))
+            .collect();
+        let mut count = 0usize;
+        for ((pid, slot), values) in &victims {
+            // FK action on referencing children must run BEFORE we tombstone
+            // this row — RESTRICT needs to be able to abort the whole DELETE
+            // before any heap state has changed for this victim.
+            cascade_fk_on_parent_delete(
+                bpm, lm, wal, tm, catalog, stmt.table_id, values, tx,
             )?;
-            p.set_page_lsn(lsn);
+            lm.lock(tx.id(), (*pid, *slot), LockMode::Exclusive)
+                .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (*pid, *slot)))?;
+            tx.add_lock((*pid, *slot));
+
+            // Post-lock recheck — same Read-Committed pattern as UPDATE.
+            let current_xmax = {
+                let g = bpm.fetch_page(*pid)?;
+                let p = g.read();
+                let raw = match p.get_tuple(*slot) {
+                    Some(r) => r,
+                    None => continue,
+                };
+                let (_, x, _) = deserialize_tuple_mvcc(raw, &schema)?;
+                x
+            };
+            if current_xmax != INVALID_TXN_ID && current_xmax != tx.id() {
+                match tm.status(current_xmax) {
+                    TxnStatus::Committed => continue 'restart,
+                    TxnStatus::Aborted => {}
+                    TxnStatus::InProgress => bail!(
+                        "could not serialize access due to concurrent update [SQLSTATE 40001]"
+                    ),
+                }
+            }
+            {
+                let g = bpm.fetch_page(*pid)?;
+                let mut p = g.write();
+                p.set_tuple_xmax(*slot, tx.id())?;
+                let lsn = log_record(
+                    wal,
+                    tx,
+                    WalRecordType::Delete {
+                        rid: (*pid, *slot),
+                        xmax: tx.id(),
+                    },
+                )?;
+                p.set_page_lsn(lsn);
+            }
+            count += 1;
         }
+        return Ok(count);
     }
-    Ok(victims.len())
+    bail!(
+        "could not serialize access — DELETE retried {MAX_RETRIES} times against concurrent updates [SQLSTATE 40001]"
+    );
 }
 
 /// Walk every FK that *targets* `parent_table_id` and apply its
@@ -3163,68 +3208,126 @@ fn perform_update(
     stmt: &AnalyzedUpdateStatement,
     tx: &mut Transaction,
 ) -> Result<usize> {
-    let snapshot = tx
-        .snapshot()
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
-    let (_schema, rows) = matching_rows(
-        bpm, catalog, stmt.table_id, &stmt.where_clause, &snapshot, tm,
-    )?;
     let table = catalog
         .table_by_id(stmt.table_id)?
         .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
-    let mut work: Vec<(PageId, SlotId, Vec<Value>, Vec<Value>, Vec<u8>)> = Vec::new();
+    let schema = table.to_schema();
+    let mut count = 0usize;
 
-    for (pid, slot, values) in rows {
-        let t = Tuple::new(values);
-        let old_values = t.values.clone();
-        let mut new_values = t.values.clone();
-        for a in &stmt.assignments {
-            let v = evaluate_expr(&a.value, &t)?;
-            let target = table.columns[a.column_index].data_type;
-            new_values[a.column_index] = coerce_for_storage(v, target)?;
-        }
-        enforce_check_constraints(catalog, stmt.table_id, &stmt.table_name, &new_values)?;
-        let tm_for_fk = Arc::clone(tx.tm());
-        enforce_fk_on_child_write(
-            bpm, &tm_for_fk, catalog, stmt.table_id, &new_values, tx,
+    // PG-style "Read Committed" loop: take a fresh statement snapshot,
+    // find matching rows, lock+update each. If a lock arrives at a row
+    // that's already been updated by a concurrent committed txn, restart
+    // the whole statement against the latest snapshot. Capped to a few
+    // retries so a stuck conflict surfaces as 40001 instead of looping.
+    const MAX_RETRIES: u32 = 8;
+    'restart: for _attempt in 0..MAX_RETRIES {
+        // Fresh snapshot: pulls in every txn that has committed since the
+        // last attempt — that's what makes a re-evaluated WHERE see the
+        // updated row instead of the gone one.
+        let snapshot = tx.tm().snapshot(tx.id());
+        tx.set_snapshot(snapshot.clone());
+        let (_schema, rows) = matching_rows(
+            bpm, catalog, stmt.table_id, &stmt.where_clause, &snapshot, tm,
         )?;
-        let new_bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
-        work.push((pid, slot, old_values, new_values, new_bytes));
-    }
+        count = 0;
+        for (pid, slot, values) in rows {
+            // Acquire the row X-lock before reading the latest header,
+            // so any other writer either left or is now sequenced behind us.
+            lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
+                .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
+            tx.add_lock((pid, slot));
 
-    let count = work.len();
-    for (pid, slot, old_values, new_values, new_bytes) in work {
-        lm.lock(tx.id(), (pid, slot), LockMode::Exclusive)
-            .map_err(|e| anyhow::anyhow!("X-lock on {:?}: {e}", (pid, slot)))?;
-        tx.add_lock((pid, slot));
-        {
-            let g = bpm.fetch_page(pid)?;
-            let mut p = g.write();
-            p.set_tuple_xmax(slot, tx.id())?;
-            let lsn = log_record(
-                wal,
-                tx,
-                WalRecordType::Delete {
-                    rid: (pid, slot),
-                    xmax: tx.id(),
-                },
+            // Post-lock recheck: if the row was updated/deleted by another
+            // committed txn while we were finding it, restart with a fresh
+            // snapshot. A self-set xmax (re-running our own UPDATE) just
+            // means we've already done the work for this row.
+            let (current_xmax, _row_alive) = {
+                let g = bpm.fetch_page(pid)?;
+                let p = g.read();
+                let raw = match p.get_tuple(slot) {
+                    Some(r) => r,
+                    None => continue, // tombstoned by VACUUM mid-flight
+                };
+                let (_, x, _) = deserialize_tuple_mvcc(raw, &schema)?;
+                (x, ())
+            };
+            if current_xmax != INVALID_TXN_ID && current_xmax != tx.id() {
+                match tm.status(current_xmax) {
+                    TxnStatus::Committed => {
+                        // Row was replaced under our feet — let matching_rows
+                        // pick up the new version on the next pass.
+                        continue 'restart;
+                    }
+                    TxnStatus::Aborted => {
+                        // Their delete didn't take effect; row is still ours.
+                    }
+                    TxnStatus::InProgress => {
+                        // We hold the X-lock, so no one else should be in
+                        // the middle of writing this row. Defensive abort.
+                        bail!(
+                            "could not serialize access due to concurrent update [SQLSTATE 40001]"
+                        );
+                    }
+                }
+            }
+
+            // Now safe to compute the new tuple and write it.
+            let t = Tuple::new(values);
+            let mut new_values = t.values.clone();
+            for a in &stmt.assignments {
+                let v = evaluate_expr(&a.value, &t)?;
+                let target = table.columns[a.column_index].data_type;
+                new_values[a.column_index] = coerce_for_storage(v, target)?;
+            }
+            enforce_check_constraints(catalog, stmt.table_id, &stmt.table_name, &new_values)?;
+            let tm_for_fk = Arc::clone(tx.tm());
+            enforce_fk_on_child_write(
+                bpm, &tm_for_fk, catalog, stmt.table_id, &new_values, tx,
             )?;
-            p.set_page_lsn(lsn);
+            {
+                let g = bpm.fetch_page(pid)?;
+                let mut p = g.write();
+                p.set_tuple_xmax(slot, tx.id())?;
+                let lsn = log_record(
+                    wal,
+                    tx,
+                    WalRecordType::Delete {
+                        rid: (pid, slot),
+                        xmax: tx.id(),
+                    },
+                )?;
+                p.set_page_lsn(lsn);
+            }
+            let new_bytes = serialize_tuple_mvcc(tx.id(), INVALID_TXN_ID, &new_values);
+            let (new_rid, _) = insert_bytes(bpm, wal, tx, table.first_page_id, &new_bytes)?;
+            lm.lock(tx.id(), new_rid, LockMode::Exclusive)
+                .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
+            tx.add_lock(new_rid);
+            let tm_arc = Arc::clone(tx.tm());
+            // A 23505 here means another concurrent UPDATE on the same
+            // unique key beat us between our matching_rows snapshot and
+            // our own new-row index_insert. Treat it as a serialization
+            // conflict and let the outer loop redo the statement against
+            // a fresh snapshot — at which point matching_rows finds the
+            // *other* tx's new version and we update that instead. Real
+            // user-visible 23505 (true duplicate-key INSERT) goes through
+            // perform_insert, not here.
+            match index_insert_for_row_with_lm(
+                bpm, Some(lm), wal, Some(&tm_arc), catalog, tx, stmt.table_id, &new_values, new_rid,
+            ) {
+                Ok(()) => {}
+                Err(e) if e.to_string().contains("SQLSTATE 23505") => {
+                    continue 'restart;
+                }
+                Err(e) => return Err(e),
+            }
+            count += 1;
         }
-        // Index is add-only; the old entry stays and visibility filters it
-        // through the heap xmax. We just add the new version's entry.
-        let _ = old_values;
-        let (new_rid, _) = insert_bytes(bpm, wal, tx, table.first_page_id, &new_bytes)?;
-        lm.lock(tx.id(), new_rid, LockMode::Exclusive)
-            .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
-        tx.add_lock(new_rid);
-        let tm_arc = Arc::clone(tx.tm());
-        index_insert_for_row_with_lm(
-            bpm, Some(lm), wal, Some(&tm_arc), catalog, tx, stmt.table_id, &new_values, new_rid,
-        )?;
+        return Ok(count);
     }
-    Ok(count)
+    bail!(
+        "could not serialize access — UPDATE retried {MAX_RETRIES} times against concurrent updates [SQLSTATE 40001]"
+    );
 }
 
 /// Walk the table's page chain to its tail, then try to insert. If the
@@ -4199,15 +4302,12 @@ mod tests {
         h_a.join().unwrap();
         h_b.join().unwrap();
 
-        // Under MVCC without lost-update prevention, both T1's and T2's
-        // updates produce visible versions: T2's snapshot was taken before
-        // T1 committed, so T2's UPDATE matches the *original* (xmax=T1 in
-        // T2's view doesn't make it invisible because T1 was active in T2's
-        // snapshot). Each writer's new tuple lives on. This is the classic
-        // "lost update" anomaly that plain Snapshot Isolation allows;
-        // preventing it would require a row-version check at write time
-        // (Postgres' EvalPlanQual). Within day14's scope we just verify
-        // that BOTH writers' values become visible.
+        // Lost-update prevention (added in Phase 4): T2 takes the row's
+        // X-lock after T1 commits, sees that the snapshot's row was
+        // updated by a concurrent committed txn, and restarts its
+        // statement against a fresh snapshot. The restart sees T1's new
+        // version and overwrites it. So exactly the second writer's
+        // value survives — no anomaly.
         let mut tx = Transaction::new(Arc::clone(&tm));
         let Output::Rows(rows) = run_full(
             "SELECT name FROM users WHERE id = 1",
@@ -4226,8 +4326,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert!(names.contains("A"));
-        assert!(names.contains("B"));
+        // Whichever thread won the lock race goes first and gets
+        // overwritten by the other. Exactly one of the two writes
+        // survives.
+        assert_eq!(names.len(), 1, "expected one surviving version, got {names:?}");
+        assert!(names.contains("A") || names.contains("B"));
     }
 
     /// Same as setup_users() but also creates an `orders(id INT, user_id INT,

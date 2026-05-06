@@ -289,6 +289,8 @@ impl<S: Read + Write> Connection<S> {
             "23514" // check_violation
         } else if message.contains("SQLSTATE 23503") {
             "23503" // foreign_key_violation
+        } else if message.contains("SQLSTATE 40001") {
+            "40001" // serialization_failure — pgbench retries on this
         } else if message.contains("lock acquisition timeout")
             || message.contains("deadlock")
         {

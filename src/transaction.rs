@@ -81,6 +81,13 @@ impl Transaction {
         self.snapshot.as_ref()
     }
 
+    /// Replace the transaction's snapshot. Used by Read-Committed-style
+    /// statement re-evaluation in UPDATE/DELETE so a retry sees the row
+    /// versions other concurrent txns have just committed.
+    pub fn set_snapshot(&mut self, snapshot: Snapshot) {
+        self.snapshot = Some(snapshot);
+    }
+
     pub fn tm(&self) -> &Arc<TransactionManager> {
         &self.tm
     }
