@@ -227,14 +227,14 @@ impl BufferPool {
     ///   4. fall back to the slow path on a miss / racy contention.
     pub fn fetch_page(&self, page_id: PageId) -> Result<PageGuard> {
         let sh = self.shard(page_id);
-        if let Some(arc) = self.try_fetch_fast(sh, page_id) {
-            return Ok(PageGuard::new(self.clone(), page_id, arc));
+        if let Some((arc, fid)) = self.try_fetch_fast(sh, page_id) {
+            return Ok(PageGuard::new(self.clone(), page_id, fid, arc));
         }
-        let arc = self.fetch_slow(sh, page_id)?;
-        Ok(PageGuard::new(self.clone(), page_id, arc))
+        let (arc, fid) = self.fetch_slow(sh, page_id)?;
+        Ok(PageGuard::new(self.clone(), page_id, fid, arc))
     }
 
-    fn try_fetch_fast(&self, sh: &Shard, page_id: PageId) -> Option<Arc<RwLock<Page>>> {
+    fn try_fetch_fast(&self, sh: &Shard, page_id: PageId) -> Option<(Arc<RwLock<Page>>, usize)> {
         let pt = sh.page_table.read().unwrap();
         let fid = *pt.get(&page_id)?;
         // Hold the read lock just long enough to grab the Arc. Pin and
@@ -249,10 +249,10 @@ impl BufferPool {
             return None;
         }
         frame.referenced.store(true, ORDER);
-        Some(Arc::clone(&frame.page))
+        Some((Arc::clone(&frame.page), fid))
     }
 
-    fn fetch_slow(&self, sh: &Shard, page_id: PageId) -> Result<Arc<RwLock<Page>>> {
+    fn fetch_slow(&self, sh: &Shard, page_id: PageId) -> Result<(Arc<RwLock<Page>>, usize)> {
         // Take the page_table write lock once; it covers both the
         // double-check and the new-frame insertion.
         let mut pt = sh.page_table.write().unwrap();
@@ -261,7 +261,7 @@ impl BufferPool {
             let frame = &sh.frames[fid];
             frame.pin_count.fetch_add(1, ORDER);
             frame.referenced.store(true, ORDER);
-            return Ok(Arc::clone(&frame.page));
+            return Ok((Arc::clone(&frame.page), fid));
         }
         let fid = self.pick_or_evict(sh, &mut pt)?;
         let mut buf = [0u8; PAGE_SIZE];
@@ -276,7 +276,7 @@ impl BufferPool {
         frame.pin_count.store(1, ORDER);
         frame.referenced.store(true, ORDER);
         pt.insert(page_id, fid);
-        Ok(Arc::clone(&frame.page))
+        Ok((Arc::clone(&frame.page), fid))
     }
 
     /// Reserve a frame for a new resident page. Caller already holds
@@ -328,18 +328,18 @@ impl BufferPool {
             if let Some(page_id) = fl.pop() {
                 drop(fl);
                 let home = self.shard(page_id);
-                let arc = self.install_recycled(home, page_id)?;
-                return Ok(PageGuard::new(self.clone(), page_id, arc));
+                let (arc, fid) = self.install_recycled(home, page_id)?;
+                return Ok(PageGuard::new(self.clone(), page_id, fid, arc));
             }
         }
         // Otherwise extend the file.
         let page_id = self.disk.allocate_page()?;
         let sh = self.shard(page_id);
-        let arc = self.install_fresh(sh, page_id)?;
-        Ok(PageGuard::new(self.clone(), page_id, arc))
+        let (arc, fid) = self.install_fresh(sh, page_id)?;
+        Ok(PageGuard::new(self.clone(), page_id, fid, arc))
     }
 
-    fn install_recycled(&self, sh: &Shard, page_id: PageId) -> Result<Arc<RwLock<Page>>> {
+    fn install_recycled(&self, sh: &Shard, page_id: PageId) -> Result<(Arc<RwLock<Page>>, usize)> {
         let mut pt = sh.page_table.write().unwrap();
         // Evict any stale resident copy of `page_id`.
         if let Some(&fid) = pt.get(&page_id) {
@@ -357,10 +357,10 @@ impl BufferPool {
         frame.pin_count.store(1, ORDER);
         frame.referenced.store(true, ORDER);
         pt.insert(page_id, fid);
-        Ok(Arc::clone(&frame.page))
+        Ok((Arc::clone(&frame.page), fid))
     }
 
-    fn install_fresh(&self, sh: &Shard, page_id: PageId) -> Result<Arc<RwLock<Page>>> {
+    fn install_fresh(&self, sh: &Shard, page_id: PageId) -> Result<(Arc<RwLock<Page>>, usize)> {
         let mut pt = sh.page_table.write().unwrap();
         let fid = self.pick_or_evict(sh, &mut pt)?;
         let frame = &sh.frames[fid];
@@ -373,7 +373,7 @@ impl BufferPool {
         frame.pin_count.store(1, ORDER);
         frame.referenced.store(true, ORDER);
         pt.insert(page_id, fid);
-        Ok(Arc::clone(&frame.page))
+        Ok((Arc::clone(&frame.page), fid))
     }
 
     pub fn flush_all(&self) -> Result<()> {
@@ -417,12 +417,13 @@ impl BufferPool {
         self.disk.sync()
     }
 
-    fn release(&self, page_id: PageId, mutated: bool) {
+    /// Drop a pin. `fid` is the frame index the PageGuard captured at
+    /// fetch time — pinned frames cannot be evicted, so the index is
+    /// stable for the guard's lifetime and we don't need to reacquire
+    /// the page_table read lock here. Hot path is now: atomic load
+    /// (sanity), optional swap+lock for dirty marking, atomic dec.
+    fn release(&self, page_id: PageId, fid: usize, mutated: bool) {
         let sh = self.shard(page_id);
-        let pt = sh.page_table.read().unwrap();
-        let Some(&fid) = pt.get(&page_id) else {
-            return;
-        };
         let frame = &sh.frames[fid];
         if frame.pin_count.load(ORDER) == 0 {
             return;
@@ -446,15 +447,20 @@ impl BufferPool {
 pub struct PageGuard {
     pool: BufferPool,
     page_id: PageId,
+    /// Frame index captured at fetch time. Pinned frames cannot be
+    /// evicted, so this stays valid for the guard's lifetime — used
+    /// by `release` to skip the page_table lookup.
+    fid: usize,
     page: Arc<RwLock<Page>>,
     mutated: AtomicBool,
 }
 
 impl PageGuard {
-    fn new(pool: BufferPool, page_id: PageId, page: Arc<RwLock<Page>>) -> Self {
+    fn new(pool: BufferPool, page_id: PageId, fid: usize, page: Arc<RwLock<Page>>) -> Self {
         Self {
             pool,
             page_id,
+            fid,
             page,
             mutated: AtomicBool::new(false),
         }
@@ -477,7 +483,7 @@ impl PageGuard {
 impl Drop for PageGuard {
     fn drop(&mut self) {
         let mutated = self.mutated.load(ORDER);
-        self.pool.release(self.page_id, mutated);
+        self.pool.release(self.page_id, self.fid, mutated);
     }
 }
 
