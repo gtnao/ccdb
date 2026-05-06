@@ -128,104 +128,149 @@ impl Frame {
     }
 }
 
-struct Inner {
+/// One partition of the buffer pool. Per-shard Mutex isolates fetch /
+/// new / release on different page-id ranges so multi-threaded workloads
+/// stop serialising on a single global lock. `disk` and `wal` are shared
+/// because both already accept `&self` (DiskManager via pread/pwrite,
+/// WalManager via its internal Mutex).
+struct Shard {
     frames: Vec<Frame>,
     page_table: HashMap<PageId, usize>,
-    disk: DiskManager,
     replacer: LruReplacer,
+    /// Per-shard slice of the global capacity.
     capacity: usize,
-    wal: Arc<WalManager>,
-    /// Dirty Page Table: `page_id → rec_lsn`. `rec_lsn` is the LSN at
-    /// which the page first became dirty since its last flush. Used by
-    /// fuzzy checkpoint to bound recovery's redo phase.
     dpt: HashMap<PageId, Lsn>,
-    /// In-memory free list of page ids handed back by VACUUM (or any
-    /// future caller via `recycle_page`). `new_page` pulls from here
-    /// before extending the file. Lost on restart — recovery doesn't
-    /// rebuild it; the next VACUUM repopulates.
     free_list: Vec<PageId>,
-    /// Frame ids that currently hold no page — start of life or just
-    /// evicted. Used to make `pick_or_evict`'s "find an empty frame"
-    /// step O(1) instead of an O(capacity) scan.
     free_frames: Vec<usize>,
 }
 
+const NUM_SHARDS: usize = 16;
+
 #[derive(Clone)]
 pub struct BufferPool {
-    inner: Arc<Mutex<Inner>>,
+    shards: Arc<Vec<Mutex<Shard>>>,
+    disk: Arc<DiskManager>,
+    wal: Arc<WalManager>,
+}
+
+fn shard_idx(page_id: PageId) -> usize {
+    (page_id as usize) % NUM_SHARDS
 }
 
 impl BufferPool {
     pub fn new(disk: DiskManager, capacity: usize, wal: Arc<WalManager>) -> Self {
-        let frames = (0..capacity).map(|_| Frame::empty()).collect();
-        // Every frame starts empty — push them all onto the free list so
-        // the first `capacity` allocations skip the LRU path entirely.
-        let free_frames = (0..capacity).rev().collect();
-        Self {
-            inner: Arc::new(Mutex::new(Inner {
+        let per_shard = capacity.div_ceil(NUM_SHARDS).max(1);
+        let mut shards = Vec::with_capacity(NUM_SHARDS);
+        for _ in 0..NUM_SHARDS {
+            let frames: Vec<Frame> = (0..per_shard).map(|_| Frame::empty()).collect();
+            let free_frames = (0..per_shard).rev().collect();
+            shards.push(Mutex::new(Shard {
                 frames,
                 page_table: HashMap::new(),
-                disk,
-                replacer: LruReplacer::new(capacity),
-                capacity,
-                wal,
+                replacer: LruReplacer::new(per_shard),
+                capacity: per_shard,
                 dpt: HashMap::new(),
                 free_list: Vec::new(),
                 free_frames,
-            })),
+            }));
+        }
+        Self {
+            shards: Arc::new(shards),
+            disk: Arc::new(disk),
+            wal,
         }
     }
 
-    /// Hand a page back to the free list so the next `new_page` reuses it
-    /// instead of extending the file. Caller (currently only VACUUM) must
-    /// have removed every reachable reference to the page first.
-    pub fn recycle_page(&self, page_id: PageId) {
-        self.inner.lock().unwrap().free_list.push(page_id);
+    fn shard(&self, page_id: PageId) -> &Mutex<Shard> {
+        &self.shards[shard_idx(page_id)]
     }
 
-    /// Snapshot of the current DPT for inclusion in a Checkpoint record.
+    /// Hand a page back to the free list of *its* shard. Caller (VACUUM)
+    /// has already removed every reachable reference.
+    pub fn recycle_page(&self, page_id: PageId) {
+        let mut s = self.shard(page_id).lock().unwrap();
+        s.free_list.push(page_id);
+    }
+
+    /// Snapshot of the current DPT (merged across shards). Used by the
+    /// fuzzy checkpoint record.
     pub fn dpt_snapshot(&self) -> HashMap<PageId, Lsn> {
-        self.inner.lock().unwrap().dpt.clone()
+        let mut out = HashMap::new();
+        for sh in self.shards.iter() {
+            let s = sh.lock().unwrap();
+            for (pid, lsn) in s.dpt.iter() {
+                out.insert(*pid, *lsn);
+            }
+        }
+        out
     }
 
     pub fn page_count(&self) -> u32 {
-        self.inner.lock().unwrap().disk.page_count()
+        self.disk.page_count()
     }
 
     pub fn fetch_page(&self, page_id: PageId) -> Result<PageGuard> {
-        let mut inner = self.inner.lock().unwrap();
-        let (page_arc, _frame_id) = inner.fetch_locked(page_id)?;
+        let mut s = self.shard(page_id).lock().unwrap();
+        let (page_arc, _frame_id) = s.fetch_locked(page_id, &self.disk, &self.wal)?;
         Ok(PageGuard::new(self.clone(), page_id, page_arc))
     }
 
     pub fn new_page(&self) -> Result<PageGuard> {
-        let mut inner = self.inner.lock().unwrap();
-        let (page_id, page_arc) = inner.new_page_locked()?;
-        Ok(PageGuard::new(self.clone(), page_id, page_arc))
+        // Try to reuse a recycled page id from any shard before extending
+        // the file. We look at our routing shard's free_list first; if
+        // it's empty, fall through to disk allocation.
+        // (Not strictly required for correctness — recycle_page deposits
+        // into the page's home shard, so by the time someone calls
+        // new_page that shard is the right place to look.)
+        // First pass: try to find a recycled page id quickly.
+        for sh_idx in 0..NUM_SHARDS {
+            let mut s = self.shards[sh_idx].lock().unwrap();
+            if let Some(page_id) = s.free_list.pop() {
+                if shard_idx(page_id) != sh_idx {
+                    // The page id belongs to a different shard. Re-route.
+                    drop(s);
+                    let mut home = self.shard(page_id).lock().unwrap();
+                    let (pid, arc) =
+                        home.new_recycled(page_id, &self.disk, &self.wal)?;
+                    return Ok(PageGuard::new(self.clone(), pid, arc));
+                }
+                let (pid, arc) = s.new_recycled(page_id, &self.disk, &self.wal)?;
+                return Ok(PageGuard::new(self.clone(), pid, arc));
+            }
+        }
+        // No recycled id available; extend the file.
+        let page_id = self.disk.allocate_page()?;
+        let mut s = self.shard(page_id).lock().unwrap();
+        let arc = s.new_fresh(page_id, &self.disk, &self.wal)?;
+        Ok(PageGuard::new(self.clone(), page_id, arc))
     }
 
     pub fn flush_all(&self) -> Result<()> {
-        self.inner.lock().unwrap().flush_all_locked()
+        // Flush WAL once first — covers every dirty page about to be
+        // written from any shard.
+        self.wal.flush()?;
+        for sh in self.shards.iter() {
+            let mut s = sh.lock().unwrap();
+            s.flush_all_locked(&self.disk)?;
+        }
+        self.disk.sync()?;
+        Ok(())
     }
 
-    /// Flush a single page synchronously. Used when the page's *structural*
-    /// state (page_kind, etc.) must be on disk before a crash, because there
-    /// is no WAL record that would let recovery rebuild it. The B+Tree leaf
-    /// allocation is the current case: `init_leaf` only mutates the in-memory
-    /// page, so without this, a crash before eviction leaves the on-disk
-    /// page tagged as Heap.
+    /// Flush a single page synchronously (caller wants it durable now).
     pub fn flush_page(&self, page_id: PageId) -> Result<()> {
-        self.inner.lock().unwrap().flush_page_locked(page_id)
+        let mut s = self.shard(page_id).lock().unwrap();
+        s.flush_page_locked(page_id, &self.disk, &self.wal)
     }
 
     fn release(&self, page_id: PageId, mutated: bool) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.release_locked(page_id, mutated);
+        let mut s = self.shard(page_id).lock().unwrap();
+        s.release_locked(page_id, mutated);
     }
 }
 
-impl Inner {
-    fn pick_or_evict(&mut self) -> Result<usize> {
+impl Shard {
+    fn pick_or_evict(&mut self, disk: &DiskManager, wal: &WalManager) -> Result<usize> {
         if let Some(fid) = self.free_frames.pop() {
             return Ok(fid);
         }
@@ -233,17 +278,17 @@ impl Inner {
             .replacer
             .victim()
             .ok_or_else(|| anyhow::anyhow!("buffer pool exhausted: all frames pinned"))?;
-        self.evict(victim)?;
+        self.evict(victim, disk, wal)?;
         Ok(victim)
     }
 
-    fn evict(&mut self, frame_id: usize) -> Result<()> {
+    fn evict(&mut self, frame_id: usize, disk: &DiskManager, wal: &WalManager) -> Result<()> {
         let frame = &mut self.frames[frame_id];
         if let Some(pid) = frame.page_id {
             if frame.dirty {
                 let page_guard = frame.page.read().unwrap();
-                self.wal.flush_to(page_guard.page_lsn())?;
-                self.disk.write_page(pid, page_guard.as_bytes())?;
+                wal.flush_to(page_guard.page_lsn())?;
+                disk.write_page(pid, page_guard.as_bytes())?;
             }
             self.page_table.remove(&pid);
             self.dpt.remove(&pid);
@@ -251,27 +296,23 @@ impl Inner {
         frame.page_id = None;
         frame.dirty = false;
         frame.pin_count = 0;
-        // Note: caller (pick_or_evict) is about to reuse this frame
-        // immediately, so we don't push it onto free_frames here. The
-        // only time a frame becomes free without an immediate reuse is
-        // when `recycle_page` evicts a stale resident copy — that path
-        // explicitly pushes onto free_frames itself (see new_page_locked).
         Ok(())
     }
 
-    fn fetch_locked(&mut self, page_id: PageId) -> Result<(Arc<RwLock<Page>>, usize)> {
+    fn fetch_locked(
+        &mut self,
+        page_id: PageId,
+        disk: &DiskManager,
+        wal: &WalManager,
+    ) -> Result<(Arc<RwLock<Page>>, usize)> {
         if let Some(&fid) = self.page_table.get(&page_id) {
             self.frames[fid].pin_count += 1;
             self.replacer.pin(fid);
             return Ok((Arc::clone(&self.frames[fid].page), fid));
         }
-        let fid = self.pick_or_evict()?;
+        let fid = self.pick_or_evict(disk, wal)?;
         let mut buf = [0u8; PAGE_SIZE];
-        self.disk.read_page(page_id, &mut buf)?;
-        // Replace the inner Page atomically so any prior holders of the Arc
-        // don't see torn state. Since the frame was just made empty by evict()
-        // (or this is its first use), no one should be holding the Arc, but
-        // we use write() to be safe.
+        disk.read_page(page_id, &mut buf)?;
         {
             let mut p = self.frames[fid].page.write().unwrap();
             *p = Page::from_bytes(&buf);
@@ -285,32 +326,21 @@ impl Inner {
         Ok((Arc::clone(&f.page), fid))
     }
 
-    fn new_page_locked(&mut self) -> Result<(PageId, Arc<RwLock<Page>>)> {
-        // Reuse a recycled page id if VACUUM left one for us.
-        if let Some(page_id) = self.free_list.pop() {
-            // The recycled page may still be pinned in a frame from before
-            // it was freed — evict it first so the buffered (stale) image
-            // doesn't survive into the new occupant.
-            if let Some(&fid) = self.page_table.get(&page_id) {
-                self.replacer.pin(fid); // unhook from LRU before evicting
-                self.evict(fid)?;
-                self.free_frames.push(fid);
-            }
-            let fid = self.pick_or_evict()?;
-            {
-                let mut p = self.frames[fid].page.write().unwrap();
-                *p = Page::new(page_id);
-            }
-            let f = &mut self.frames[fid];
-            f.page_id = Some(page_id);
-            f.pin_count = 1;
-            f.dirty = true; // disk image is whatever VACUUM left there
-            self.page_table.insert(page_id, fid);
+    /// Set up a frame for a recycled page id. Caller has already ensured
+    /// this is the home shard for `page_id`. If a stale resident copy
+    /// existed, evict it first.
+    fn new_recycled(
+        &mut self,
+        page_id: PageId,
+        disk: &DiskManager,
+        wal: &WalManager,
+    ) -> Result<(PageId, Arc<RwLock<Page>>)> {
+        if let Some(&fid) = self.page_table.get(&page_id) {
             self.replacer.pin(fid);
-            return Ok((page_id, Arc::clone(&f.page)));
+            self.evict(fid, disk, wal)?;
+            self.free_frames.push(fid);
         }
-        let fid = self.pick_or_evict()?;
-        let page_id = self.disk.allocate_page()?;
+        let fid = self.pick_or_evict(disk, wal)?;
         {
             let mut p = self.frames[fid].page.write().unwrap();
             *p = Page::new(page_id);
@@ -318,11 +348,30 @@ impl Inner {
         let f = &mut self.frames[fid];
         f.page_id = Some(page_id);
         f.pin_count = 1;
-        // Freshly allocated → must be flushed (disk has only zeros).
         f.dirty = true;
         self.page_table.insert(page_id, fid);
         self.replacer.pin(fid);
         Ok((page_id, Arc::clone(&f.page)))
+    }
+
+    fn new_fresh(
+        &mut self,
+        page_id: PageId,
+        disk: &DiskManager,
+        wal: &WalManager,
+    ) -> Result<Arc<RwLock<Page>>> {
+        let fid = self.pick_or_evict(disk, wal)?;
+        {
+            let mut p = self.frames[fid].page.write().unwrap();
+            *p = Page::new(page_id);
+        }
+        let f = &mut self.frames[fid];
+        f.page_id = Some(page_id);
+        f.pin_count = 1;
+        f.dirty = true;
+        self.page_table.insert(page_id, fid);
+        self.replacer.pin(fid);
+        Ok(Arc::clone(&f.page))
     }
 
     fn release_locked(&mut self, page_id: PageId, mutated: bool) {
@@ -336,8 +385,6 @@ impl Inner {
                 let was_clean = !f.dirty;
                 f.dirty = true;
                 if was_clean {
-                    // First-write since last flush: rec_lsn = current page_lsn
-                    // (which the writer has just stamped via set_page_lsn).
                     let page_lsn = f.page.read().unwrap().page_lsn();
                     self.dpt.entry(page_id).or_insert(page_lsn);
                 }
@@ -348,48 +395,42 @@ impl Inner {
         }
     }
 
-    fn flush_page_locked(&mut self, page_id: PageId) -> Result<()> {
+    fn flush_page_locked(
+        &mut self,
+        page_id: PageId,
+        disk: &DiskManager,
+        wal: &WalManager,
+    ) -> Result<()> {
         let Some(&fid) = self.page_table.get(&page_id) else {
-            return Ok(()); // not resident — disk image is already authoritative
+            return Ok(());
         };
         let f = &mut self.frames[fid];
         if !f.dirty {
             return Ok(());
         }
         let pg = f.page.read().unwrap();
-        self.wal.flush_to(pg.page_lsn())?;
-        self.disk.write_page(page_id, pg.as_bytes())?;
+        wal.flush_to(pg.page_lsn())?;
+        disk.write_page(page_id, pg.as_bytes())?;
         drop(pg);
         f.dirty = false;
         self.dpt.remove(&page_id);
-        // This entry point exists specifically so callers (CREATE INDEX,
-        // CREATE SEQUENCE) can guarantee a structural change is durable
-        // before they continue, since no WAL record reconstructs page_kind
-        // changes today. Force the fsync here.
-        self.disk.sync()?;
+        disk.sync()?;
         Ok(())
     }
 
-    fn flush_all_locked(&mut self) -> Result<()> {
-        // Flush the entire WAL first — every page we're about to write is
-        // covered by `flushed_lsn >= page.page_lsn` after this.
-        self.wal.flush()?;
+    fn flush_all_locked(&mut self, disk: &DiskManager) -> Result<()> {
         for fid in 0..self.frames.len() {
             let f = &mut self.frames[fid];
             if let Some(pid) = f.page_id {
                 if f.dirty {
                     let pg = f.page.read().unwrap();
-                    self.disk.write_page(pid, pg.as_bytes())?;
+                    disk.write_page(pid, pg.as_bytes())?;
                     drop(pg);
                     f.dirty = false;
                     self.dpt.remove(&pid);
                 }
             }
         }
-        // One fsync for the whole sweep instead of one per page. Crash safety
-        // still holds: per-page writes after WAL flush + recovery redo cover
-        // any pages that don't make it to disk before a crash.
-        self.disk.sync()?;
         Ok(())
     }
 }

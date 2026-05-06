@@ -271,6 +271,23 @@ impl<S: Read + Write> Connection<S> {
         self.write_message(b'D', &buf)
     }
 
+    /// Send a row whose columns are already in their final wire form
+    /// (binary or text — caller decides per column). NULL is `None`.
+    pub fn send_data_row_bytes(&mut self, columns: &[Option<Vec<u8>>]) -> Result<()> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(columns.len() as i16).to_be_bytes());
+        for c in columns {
+            match c {
+                Some(bytes) => {
+                    buf.extend_from_slice(&(bytes.len() as i32).to_be_bytes());
+                    buf.extend_from_slice(bytes);
+                }
+                None => buf.extend_from_slice(&(-1i32).to_be_bytes()),
+            }
+        }
+        self.write_message(b'D', &buf)
+    }
+
     pub fn send_command_complete(&mut self, tag: &str) -> Result<()> {
         let mut buf = Vec::with_capacity(tag.len() + 1);
         buf.extend_from_slice(tag.as_bytes());

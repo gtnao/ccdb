@@ -354,6 +354,14 @@ pub struct WalManager {
     /// then re-check `flushed_lsn` and skip the fsync if the leader's
     /// flush already covered them.
     fsync_lock: Mutex<()>,
+    /// Notified after every successful `flush()` (and explicit
+    /// `flush_to()`). `flush_to` callers wait on this so the WAL
+    /// writer thread can absorb their fsync into its periodic sweep.
+    flush_cond: std::sync::Condvar,
+    /// Companion mutex for `flush_cond` (Condvar requires a Mutex).
+    flush_cond_lock: Mutex<()>,
+    /// Set by Instance shutdown to stop the WAL writer loop.
+    writer_stop: std::sync::atomic::AtomicBool,
 }
 
 impl WalManager {
@@ -368,7 +376,29 @@ impl WalManager {
             next_lsn: AtomicU64::new(1), // LSN 0 is reserved for "no WAL record"
             flushed_lsn: AtomicU64::new(0),
             fsync_lock: Mutex::new(()),
+            flush_cond: std::sync::Condvar::new(),
+            flush_cond_lock: Mutex::new(()),
+            writer_stop: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Spawn a background thread that periodically flushes the WAL.
+    /// Concurrent `flush_to(lsn)` callers can wait for this thread's
+    /// next fsync via the cond, sharing one syscall instead of paying
+    /// one each. Stops cleanly when `request_writer_stop` is invoked.
+    pub fn spawn_writer(self: std::sync::Arc<Self>, interval: std::time::Duration) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            while !self.writer_stop.load(Ordering::SeqCst) {
+                std::thread::sleep(interval);
+                let _ = self.flush();
+            }
+            // Final flush so anything written before shutdown is durable.
+            let _ = self.flush();
+        })
+    }
+
+    pub fn request_writer_stop(&self) {
+        self.writer_stop.store(true, Ordering::SeqCst);
     }
 
     /// Append a record. Returns its LSN. Does NOT fsync — caller decides
@@ -393,9 +423,6 @@ impl WalManager {
     /// the fsync block share that fsync's effect — no per-caller fsync
     /// for already-durable LSNs.
     pub fn flush(&self) -> Result<()> {
-        // Snapshot the LSN we must reach before grabbing the leader lock.
-        // Any append that lands after this point will be picked up by
-        // a future flush; no need for us to wait for it.
         let target = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
         let _leader = self.fsync_lock.lock().unwrap();
         if self.flushed_lsn.load(Ordering::SeqCst) >= target {
@@ -404,23 +431,35 @@ impl WalManager {
         let mut w = self.writer.lock().unwrap();
         w.flush()?;
         w.get_ref().sync_all()?;
-        // The fsync covers everything in the writer at the moment it
-        // returned, which is at least `target`. Other appends may have
-        // sneaked in after our snapshot — they're fine to advance to
-        // as well, since we just synced them.
         let now_durable = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
         let _ = self.flushed_lsn.fetch_max(now_durable, Ordering::SeqCst);
+        // Wake any flush_to waiters so they can re-check flushed_lsn.
+        let _g = self.flush_cond_lock.lock().unwrap();
+        self.flush_cond.notify_all();
         Ok(())
     }
 
-    /// Ensure all records up to `lsn` are durable. Cheap if already flushed
-    /// (no lock acquired in the fast path) and group-commits otherwise.
+    /// Ensure all records up to `lsn` are durable. Lock-free fast path
+    /// when already flushed; otherwise wait briefly for the WAL writer
+    /// thread (which fsyncs every `interval`) to catch us, and only
+    /// fall back to a self-fsync if it doesn't show up in time.
     pub fn flush_to(&self, lsn: Lsn) -> Result<()> {
         if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
             return Ok(());
         }
-        // Slow path: take the leader lock. If we lost the race, the
-        // leader's fsync has already advanced flushed_lsn past us.
+        // Wait briefly for the bg writer to flush past us.
+        let g = self.flush_cond_lock.lock().unwrap();
+        let timeout = std::time::Duration::from_millis(2);
+        let (_g, timed_out) = self
+            .flush_cond
+            .wait_timeout_while(g, timeout, |_| {
+                self.flushed_lsn.load(Ordering::SeqCst) < lsn
+            })
+            .expect("condvar poisoned");
+        if !timed_out.timed_out() {
+            return Ok(());
+        }
+        // Bg writer didn't make it in time — own the fsync ourselves.
         let _leader = self.fsync_lock.lock().unwrap();
         if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
             return Ok(());
@@ -430,6 +469,8 @@ impl WalManager {
         w.get_ref().sync_all()?;
         let now_durable = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
         let _ = self.flushed_lsn.fetch_max(now_durable, Ordering::SeqCst);
+        let _g = self.flush_cond_lock.lock().unwrap();
+        self.flush_cond.notify_all();
         Ok(())
     }
 

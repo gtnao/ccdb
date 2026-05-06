@@ -91,10 +91,33 @@ impl Instance {
             tm.set_next_txn_id(max_id + 1);
         }
 
+        // Background WAL writer: periodic fsync so commit-side flush_to
+        // can hand off to a single shared syscall. 10 ms is the PG-style
+        // wal_writer_delay sweet spot — short enough that commit latency
+        // stays bounded, long enough that idle sweeps don't burn CPU /
+        // syscall bandwidth.
+        let _writer = Arc::clone(&wal).spawn_writer(std::time::Duration::from_millis(10));
+
+        let catalog = Arc::new(Catalog::new(bpm.clone(), Arc::clone(&tm)));
+        let lock_manager = Arc::new(LockManager::new());
+
+        // Background autovacuum: 60 s is conservative — short enough
+        // for HOT chain growth not to dominate, long enough that the
+        // VACUUM pass doesn't fight a busy COPY / pgbench-i. Faster
+        // intervals tank bulk-insert throughput by an order of magnitude.
+        spawn_autovacuum(
+            bpm.clone(),
+            Arc::clone(&wal),
+            Arc::clone(&tm),
+            Arc::clone(&catalog),
+            Arc::clone(&lock_manager),
+            std::time::Duration::from_secs(60),
+        );
+
         Ok(Self {
-            catalog: Arc::new(Catalog::new(bpm.clone(), Arc::clone(&tm))),
+            catalog,
             bpm,
-            lock_manager: Arc::new(LockManager::new()),
+            lock_manager,
             wal,
             tm,
         })
@@ -223,7 +246,12 @@ fn handle_client(
     /// emit ParameterDescription without re-parsing.
     let mut statement_param_counts: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
-    let mut portals: std::collections::HashMap<String, crate::ast::Statement> =
+    /// portal name → (bound Statement, per-column wire format codes).
+    /// `format_codes` is the value Bind requested:
+    ///   - empty: implicit text
+    ///   - len 1: same format for all columns
+    ///   - len N: per-column override (0=text, 1=binary)
+    let mut portals: std::collections::HashMap<String, (crate::ast::Statement, Vec<i16>)> =
         std::collections::HashMap::new();
     // Tracks whether the current extended-protocol message group has hit
     // an error — once set, we skip everything until Sync (per spec).
@@ -294,7 +322,7 @@ fn handle_client(
                     statement,
                     param_formats: _,
                     params,
-                    result_formats: _,
+                    result_formats,
                 }) => {
                     if extended_error {
                         continue;
@@ -311,7 +339,7 @@ fn handle_client(
                     };
                     match bind_params_into_stmt(&template, &params) {
                         Ok(bound) => {
-                            portals.insert(portal, bound);
+                            portals.insert(portal, (bound, result_formats));
                             conn.send_bind_complete()?;
                         }
                         Err(e) => {
@@ -336,7 +364,7 @@ fn handle_client(
                     } else {
                         match portals.get(&name) {
                             None => conn.send_no_data()?,
-                            Some(stmt) => match describe_columns_for_stmt(stmt, &catalog) {
+                            Some((stmt, _fmts)) => match describe_columns_for_stmt(stmt, &catalog) {
                                 Ok(Some(cols)) => conn.send_row_description(&cols)?,
                                 Ok(None) => conn.send_no_data()?,
                                 Err(e) => {
@@ -351,8 +379,8 @@ fn handle_client(
                     if extended_error {
                         continue;
                     }
-                    let stmt = match portals.get(&portal) {
-                        Some(s) => s.clone(),
+                    let (stmt, fmts) = match portals.get(&portal) {
+                        Some((s, f)) => (s.clone(), f.clone()),
                         None => {
                             extended_error = true;
                             conn.send_error(&format!(
@@ -361,8 +389,9 @@ fn handle_client(
                             continue;
                         }
                     };
-                    if let Err(e) = run_parsed_with_options(
+                    if let Err(e) = run_parsed_with_formats(
                         &stmt,
+                        &fmts,
                         &mut conn,
                         &bpm,
                         &lock_manager,
@@ -371,7 +400,6 @@ fn handle_client(
                         &catalog,
                         &mut tx,
                         &instance,
-                        false, // RowDescription was sent at Describe-portal time.
                     ) {
                         eprintln!("execute error: {e}");
                         extended_error = true;
@@ -423,6 +451,48 @@ fn handle_client(
     result
 }
 
+/// Spawn a background thread that runs `VACUUM` on every user table at
+/// the given interval. Errors are logged and the loop continues —
+/// autovacuum is best-effort, not a correctness requirement.
+fn spawn_autovacuum(
+    bpm: BufferPool,
+    wal: Arc<WalManager>,
+    tm: Arc<TransactionManager>,
+    catalog: Arc<Catalog>,
+    lock_manager: Arc<LockManager>,
+    interval: std::time::Duration,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(interval);
+        if let Err(e) =
+            autovacuum_pass(&bpm, &wal, &tm, &catalog, &lock_manager)
+        {
+            eprintln!("autovacuum: {e}");
+        }
+    })
+}
+
+fn autovacuum_pass(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tm: &Arc<TransactionManager>,
+    catalog: &Catalog,
+    lock_manager: &LockManager,
+) -> Result<()> {
+    use crate::ast::{Statement, VacuumStatement};
+    if catalog.user_tables()?.is_empty() {
+        return Ok(());
+    }
+    let mut tx = Transaction::new(Arc::clone(tm));
+    let stmt = Statement::Vacuum(VacuumStatement {
+        tables: Vec::new(), // empty list ⇒ every user table
+        analyze: false,
+    });
+    let analyzed = analyze(catalog, &stmt)?;
+    executor::execute(bpm, lock_manager, wal, tm, catalog, &analyzed, &mut tx)?;
+    Ok(())
+}
+
 fn run_query(
     sql: &str,
     conn: &mut Connection<TcpStream>,
@@ -453,6 +523,54 @@ fn run_parsed_with_options(
     instance: &InstanceHandle,
     send_row_description: bool,
 ) -> Result<()> {
+    run_parsed_inner(
+        stmt,
+        &[],
+        conn,
+        bpm,
+        lm,
+        wal,
+        tm,
+        catalog,
+        tx,
+        instance,
+        send_row_description,
+    )
+}
+
+/// Extended-protocol Execute path: portal-specified format codes
+/// (text=0 / binary=1, optionally per-column). RowDescription is
+/// suppressed because Bind+Describe-portal already issued it.
+fn run_parsed_with_formats(
+    stmt: &crate::ast::Statement,
+    formats: &[i16],
+    conn: &mut Connection<TcpStream>,
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    tx: &mut Transaction,
+    instance: &InstanceHandle,
+) -> Result<()> {
+    run_parsed_inner(
+        stmt, formats, conn, bpm, lm, wal, tm, catalog, tx, instance, false,
+    )
+}
+
+fn run_parsed_inner(
+    stmt: &crate::ast::Statement,
+    formats: &[i16],
+    conn: &mut Connection<TcpStream>,
+    bpm: &BufferPool,
+    lm: &LockManager,
+    wal: &WalManager,
+    tm: &TransactionManager,
+    catalog: &Catalog,
+    tx: &mut Transaction,
+    instance: &InstanceHandle,
+    send_row_description: bool,
+) -> Result<()> {
     let analyzed = analyze(catalog, stmt)?;
 
     match &analyzed {
@@ -467,8 +585,13 @@ fn run_parsed_with_options(
                 conn.send_row_description(&columns)?;
             }
             for row in &rows {
-                let vals: Vec<Option<String>> = row.values.iter().map(value_to_text).collect();
-                conn.send_data_row(&vals)?;
+                let cols: Vec<Option<Vec<u8>>> = row
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| value_to_wire(v, format_for_col(formats, i)))
+                    .collect();
+                conn.send_data_row_bytes(&cols)?;
             }
             conn.send_command_complete(&format!("SELECT {}", rows.len()))?;
         }
@@ -1224,6 +1347,49 @@ fn display_name(e: &AnalyzedExpr) -> String {
         // Postgres reports "?column?" for unaliased computed expressions.
         _ => "?column?".to_string(),
     }
+}
+
+/// Pick the wire format for a particular result column. Bind sends:
+///   - empty Vec      ⇒ implicit text for every column
+///   - len 1          ⇒ same format for every column
+///   - len = #columns ⇒ per-column override
+fn format_for_col(formats: &[i16], col_idx: usize) -> i16 {
+    match formats.len() {
+        0 => 0,
+        1 => formats[0],
+        _ => formats.get(col_idx).copied().unwrap_or(0),
+    }
+}
+
+/// Encode one Value for the wire. `format=0` is PG-style text (same
+/// strings the simple-Q path emits); `format=1` is the on-the-wire
+/// binary form. NULL becomes `None` (-1 length).
+fn value_to_wire(v: &Value, format: i16) -> Option<Vec<u8>> {
+    if matches!(v, Value::Null) {
+        return None;
+    }
+    if format == 1 {
+        return Some(match v {
+            Value::Int(n) => n.to_be_bytes().to_vec(),
+            Value::Bool(b) => vec![if *b { 1 } else { 0 }],
+            Value::Double(f) => f.to_be_bytes().to_vec(),
+            Value::Varchar(s) => s.as_bytes().to_vec(),
+            Value::Timestamp(t) => t.to_be_bytes().to_vec(),
+            Value::Date(d) => d.to_be_bytes().to_vec(),
+            Value::Time(t) => t.to_be_bytes().to_vec(),
+            Value::Interval { months, days, micros } => {
+                // PG binary layout: int64 microseconds, int32 days,
+                // int32 months — big-endian.
+                let mut buf = Vec::with_capacity(16);
+                buf.extend_from_slice(&micros.to_be_bytes());
+                buf.extend_from_slice(&days.to_be_bytes());
+                buf.extend_from_slice(&months.to_be_bytes());
+                buf
+            }
+            Value::Null => unreachable!(),
+        });
+    }
+    value_to_text(v).map(|s| s.into_bytes())
 }
 
 fn value_to_text(v: &Value) -> Option<String> {

@@ -1941,11 +1941,11 @@ fn perform_vacuum(
             .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", table_id))?;
         let schema = table.to_schema();
         let indexes = catalog.indexes_for_table(*table_id)?;
-        let index_meta: Vec<(PageId, usize, DataType)> = indexes
+        let index_meta: Vec<(usize, PageId, usize, DataType)> = indexes
             .iter()
             .map(|i| {
                 let dt = table.columns[i.column_index].data_type;
-                (i.root_page_id, i.column_index, dt)
+                (i.index_id, i.root_page_id, i.column_index, dt)
             })
             .collect();
 
@@ -1960,7 +1960,11 @@ fn perform_vacuum(
             let g = bpm.fetch_page(cur)?;
             let next;
             let page_is_heap;
-            let mut dead: Vec<(SlotId, Vec<Value>)> = Vec::new();
+            // Each dead row carries its own values + the t_ctid forward
+            // pointer (sentinel-or-RID) so the index-cleanup pass below
+            // can walk a HOT chain to its live successor and re-aim the
+            // index entry there instead of just dropping it.
+            let mut dead: Vec<(SlotId, Vec<Value>, (u32, u16))> = Vec::new();
             {
                 let p = g.read();
                 next = p.next_page_id();
@@ -1978,9 +1982,10 @@ fn perform_vacuum(
                         Some(r) => r,
                         None => continue,
                     };
-                    let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &schema)?;
+                    let (xmin, xmax, ctid, values) =
+                        crate::tuple::deserialize_tuple_mvcc_full(raw, &schema)?;
                     if is_tuple_dead(xmin, xmax, oldest_xmin, tm) {
-                        dead.push((slot, values));
+                        dead.push((slot, values, ctid));
                     }
                 }
             }
@@ -1988,7 +1993,7 @@ fn perform_vacuum(
             {
                 if !dead.is_empty() {
                     let mut p = g.write();
-                    for (slot, _) in &dead {
+                    for (slot, _, _) in &dead {
                         p.delete(*slot)?;
                     }
                     p.vacuum_compact();
@@ -2037,17 +2042,68 @@ fn perform_vacuum(
             }
             drop(g);
 
-            // Index cleanup: drop (key, rid) entries for every reclaimed
-            // heap tuple. Done after releasing the heap page guard so the
-            // btree can take its own latches without deadlock.
-            for (root, col_idx, dt) in &index_meta {
-                for (slot, values) in &dead {
+            // Index cleanup. For each dead row's index entry:
+            //   - if the row was a HOT-chain head and its t_ctid leads
+            //     to a still-live successor with the *same* key, rewire
+            //     the index entry to point at the successor instead of
+            //     deleting it (otherwise the live successor — which is
+            //     reachable only via the chain — would become invisible
+            //     to index lookups);
+            //   - otherwise just drop the entry (this row was a plain
+            //     INSERT-then-DELETE or its successor's key has changed
+            //     so the same index entry no longer applies).
+            for (idx_id, root, col_idx, dt) in &index_meta {
+                for (slot, values, ctid) in &dead {
                     let key_value = &values[*col_idx];
                     if matches!(key_value, Value::Null) {
                         continue;
                     }
                     let key = crate::btree::encode_key(key_value);
-                    let _ = crate::btree::delete(bpm, *root, &key, (cur, *slot), *dt)?;
+                    let dead_rid: Rid = (cur, *slot);
+
+                    // Walk the chain looking for a live successor.
+                    let mut alive: Option<(Rid, Vec<Value>)> = None;
+                    if !crate::tuple::is_no_ctid(*ctid) {
+                        let mut step = (ctid.0, ctid.1);
+                        for _ in 0..32 {
+                            let g2 = bpm.fetch_page(step.0)?;
+                            let p2 = g2.read();
+                            let Some(raw) = p2.get_tuple(step.1) else {
+                                break;
+                            };
+                            let (sxmin, sxmax, sctid, svals) =
+                                crate::tuple::deserialize_tuple_mvcc_full(raw, &schema)?;
+                            drop(p2);
+                            drop(g2);
+                            if sxmax == INVALID_TXN_ID
+                                && matches!(tm.status(sxmin), TxnStatus::Committed)
+                            {
+                                alive = Some((step, svals));
+                                break;
+                            }
+                            if crate::tuple::is_no_ctid(sctid) {
+                                break;
+                            }
+                            step = (sctid.0, sctid.1);
+                        }
+                    }
+
+                    let _ = crate::btree::delete(bpm, *root, &key, dead_rid, *dt)?;
+                    if let Some((live_rid, live_vals)) = alive {
+                        let live_key = &live_vals[*col_idx];
+                        // Only rewire when the chain key didn't drift
+                        // (the HOT path stamps t_ctid only when no
+                        // indexed column changed, but a future relax
+                        // could allow drift — be defensive).
+                        if !matches!(live_key, Value::Null) && live_key == key_value {
+                            let new_root = crate::btree::insert(
+                                bpm, *root, &key, live_rid, *dt,
+                            )?;
+                            if new_root != *root {
+                                update_index_root(bpm, *idx_id, new_root)?;
+                            }
+                        }
+                    }
                 }
             }
 
