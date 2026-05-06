@@ -139,11 +139,21 @@ pub enum FrontendMessage {
 
 pub struct Connection<S: Read + Write> {
     stream: S,
+    /// Outbound bytes are accumulated here and flushed in one
+    /// write_all() at points where the client has to receive the
+    /// data before it can produce its next request — ReadyForQuery,
+    /// CopyInResponse, ErrorResponse on close. This collapses the
+    /// "RowDescription + N×DataRow + CommandComplete + ReadyForQuery"
+    /// reply for a single query into one syscall instead of N+3.
+    out_buf: Vec<u8>,
 }
 
 impl<S: Read + Write> Connection<S> {
     pub fn new(stream: S) -> Self {
-        Self { stream }
+        Self {
+            stream,
+            out_buf: Vec::with_capacity(8 * 1024),
+        }
     }
 
     // --- reads ---
@@ -236,8 +246,13 @@ impl<S: Read + Write> Connection<S> {
     }
 
     pub fn send_ready_for_query(&mut self) -> Result<()> {
-        // 'I' = idle (no transaction)
-        self.write_message(b'Z', b"I")
+        // 'I' = idle (no transaction). RFQ marks the end of a
+        // server response cycle: the client can't issue another
+        // request until it sees this, so we flush the whole queued
+        // reply (RowDescription + DataRows + CommandComplete + RFQ)
+        // in a single syscall.
+        self.write_message(b'Z', b"I")?;
+        self.flush_out()
     }
 
     pub fn send_row_description(&mut self, columns: &[ColumnDesc]) -> Result<()> {
@@ -385,22 +400,32 @@ impl<S: Read + Write> Connection<S> {
         for _ in 0..columns {
             buf.extend_from_slice(&0i16.to_be_bytes());
         }
-        self.write_message(b'G', &buf)
+        self.write_message(b'G', &buf)?;
+        // Client must see the CopyInResponse before it begins
+        // streaming CopyData. Flush any queued bytes too.
+        self.flush_out()
     }
 
     // --- low level ---
 
     fn write_message(&mut self, msg_type: u8, body: &[u8]) -> Result<()> {
-        // Header (tag + length) is built on the stack to avoid the
-        // per-message heap allocation a "concat into a Vec" form
-        // pays. Two write_all calls instead of three; the body is
-        // passed straight through.
+        // Append into the outbound buffer; flush_out() ships it.
         let len = (body.len() + 4) as i32;
-        let mut hdr = [0u8; 5];
-        hdr[0] = msg_type;
-        hdr[1..5].copy_from_slice(&len.to_be_bytes());
-        self.stream.write_all(&hdr)?;
-        self.stream.write_all(body)?;
+        self.out_buf.push(msg_type);
+        self.out_buf.extend_from_slice(&len.to_be_bytes());
+        self.out_buf.extend_from_slice(body);
+        Ok(())
+    }
+
+    /// Ship every queued message in one write_all + flush. Called at
+    /// points where the client cannot make progress without our
+    /// bytes (ReadyForQuery, CopyInResponse, after sending an
+    /// ErrorResponse during teardown).
+    pub fn flush_out(&mut self) -> Result<()> {
+        if !self.out_buf.is_empty() {
+            self.stream.write_all(&self.out_buf)?;
+            self.out_buf.clear();
+        }
         self.stream.flush()?;
         Ok(())
     }
@@ -580,6 +605,7 @@ mod tests {
     fn auth_ok_frame_bytes() {
         let mut conn = Connection::new(MemStream::new(Vec::new()));
         conn.send_auth_ok().unwrap();
+        conn.flush_out().unwrap();
         // 'R' | len=8 | i32(0)
         assert_eq!(conn.stream.outbuf, b"R\x00\x00\x00\x08\x00\x00\x00\x00");
     }
@@ -596,6 +622,7 @@ mod tests {
     fn data_row_with_null_uses_minus_one_length() {
         let mut conn = Connection::new(MemStream::new(Vec::new()));
         conn.send_data_row(&[Some("hi".into()), None]).unwrap();
+        conn.flush_out().unwrap();
         let out = conn.stream.outbuf;
         // 'D' | len | i16(2) | i32(2) | "hi" | i32(-1)
         assert_eq!(out[0], b'D');

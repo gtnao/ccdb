@@ -420,7 +420,12 @@ fn handle_client(
                     conn.send_ready_for_query()?;
                 }
                 Some(FrontendMessage::Flush) => {
-                    // We already flush after every send.
+                    // Per the extended-query protocol, Flush forces
+                    // any queued response messages out to the client
+                    // without ending the response cycle. Required so
+                    // a client that sent Parse/Describe/Flush gets
+                    // their replies before sending Bind.
+                    conn.flush_out()?;
                 }
                 Some(FrontendMessage::CopyData(_))
                 | Some(FrontendMessage::CopyDone)
