@@ -148,18 +148,55 @@ impl TableDef {
     }
 }
 
+/// Memoised lookups for the four hot read paths: table-by-id, table-by-name,
+/// indexes-for-table, constraints-for-table. Catalog rows change only on
+/// DDL; readers populate on miss, and `invalidate` clears everything after
+/// any catalog write.
+#[derive(Default)]
+struct CatalogCache {
+    tables_by_id: std::collections::HashMap<usize, TableDef>,
+    name_to_id: std::collections::HashMap<String, usize>,
+    indexes_by_table: std::collections::HashMap<usize, std::sync::Arc<Vec<IndexDef>>>,
+    constraints_by_table:
+        std::collections::HashMap<usize, std::sync::Arc<Vec<ConstraintDef>>>,
+}
+
 pub struct Catalog {
     bpm: BufferPool,
     tm: Arc<TransactionManager>,
+    cache: std::sync::Mutex<CatalogCache>,
 }
 
 impl Catalog {
     pub fn new(bpm: BufferPool, tm: Arc<TransactionManager>) -> Self {
-        Self { bpm, tm }
+        Self {
+            bpm,
+            tm,
+            cache: std::sync::Mutex::new(CatalogCache::default()),
+        }
+    }
+
+    /// Drop every cached entry. Call after any catalog write (CREATE /
+    /// DROP / ALTER, index/constraint changes). Cheap — readers rebuild
+    /// on next access.
+    pub fn invalidate(&self) {
+        let mut c = self.cache.lock().unwrap();
+        c.tables_by_id.clear();
+        c.name_to_id.clear();
+        c.indexes_by_table.clear();
+        c.constraints_by_table.clear();
     }
 
     /// Look up a table by name. Returns the full TableDef (including columns).
     pub fn find_table(&self, name: &str) -> Result<Option<(usize, TableDef)>> {
+        if let Some((id, def)) = {
+            let c = self.cache.lock().unwrap();
+            c.name_to_id
+                .get(name)
+                .and_then(|id| c.tables_by_id.get(id).map(|t| (*id, t.clone())))
+        } {
+            return Ok(Some((id, def)));
+        }
         let pg_class_schema = pg_class_schema();
         for (_, _, _, values) in self.scan_chain(PG_CLASS_PAGE_ID, &pg_class_schema)? {
             let table_id = match &values[0] {
@@ -176,21 +213,25 @@ impl Catalog {
             };
             if tname == name {
                 let columns = self.columns_for(table_id as i32)?;
-                return Ok(Some((
+                let def = TableDef {
                     table_id,
-                    TableDef {
-                        table_id,
-                        name: tname,
-                        first_page_id: first_page,
-                        columns,
-                    },
-                )));
+                    name: tname.clone(),
+                    first_page_id: first_page,
+                    columns,
+                };
+                let mut c = self.cache.lock().unwrap();
+                c.tables_by_id.insert(table_id, def.clone());
+                c.name_to_id.insert(tname, table_id);
+                return Ok(Some((table_id, def)));
             }
         }
         Ok(None)
     }
 
     pub fn table_by_id(&self, id: usize) -> Result<Option<TableDef>> {
+        if let Some(def) = self.cache.lock().unwrap().tables_by_id.get(&id).cloned() {
+            return Ok(Some(def));
+        }
         let pg_class_schema = pg_class_schema();
         for (_, _, _, values) in self.scan_chain(PG_CLASS_PAGE_ID, &pg_class_schema)? {
             let tid = match &values[0] {
@@ -207,12 +248,16 @@ impl Catalog {
                     _ => continue,
                 };
                 let columns = self.columns_for(id as i32)?;
-                return Ok(Some(TableDef {
+                let def = TableDef {
                     table_id: id,
-                    name,
+                    name: name.clone(),
                     first_page_id: first_page,
                     columns,
-                }));
+                };
+                let mut c = self.cache.lock().unwrap();
+                c.tables_by_id.insert(id, def.clone());
+                c.name_to_id.insert(name, id);
+                return Ok(Some(def));
             }
         }
         Ok(None)
@@ -389,12 +434,31 @@ impl Catalog {
     }
 
     /// Indexes defined on a particular table (in declaration order).
+    /// Cached: a per-table `Arc<Vec<IndexDef>>` is kept across calls and
+    /// invalidated by `invalidate()` after every DDL.
     pub fn indexes_for_table(&self, table_id: usize) -> Result<Vec<IndexDef>> {
-        Ok(self
+        if let Some(arc) = self
+            .cache
+            .lock()
+            .unwrap()
+            .indexes_by_table
+            .get(&table_id)
+            .cloned()
+        {
+            return Ok((*arc).clone());
+        }
+        let list: Vec<IndexDef> = self
             .all_indexes()?
             .into_iter()
             .filter(|i| i.table_id == table_id)
-            .collect())
+            .collect();
+        let arc = std::sync::Arc::new(list.clone());
+        self.cache
+            .lock()
+            .unwrap()
+            .indexes_by_table
+            .insert(table_id, arc);
+        Ok(list)
     }
 
     pub fn find_index(&self, name: &str) -> Result<Option<IndexDef>> {
@@ -491,11 +555,28 @@ impl Catalog {
     }
 
     pub fn constraints_for_table(&self, table_id: usize) -> Result<Vec<ConstraintDef>> {
-        Ok(self
+        if let Some(arc) = self
+            .cache
+            .lock()
+            .unwrap()
+            .constraints_by_table
+            .get(&table_id)
+            .cloned()
+        {
+            return Ok((*arc).clone());
+        }
+        let list: Vec<ConstraintDef> = self
             .all_constraints()?
             .into_iter()
             .filter(|c| c.table_id == table_id)
-            .collect())
+            .collect();
+        let arc = std::sync::Arc::new(list.clone());
+        self.cache
+            .lock()
+            .unwrap()
+            .constraints_by_table
+            .insert(table_id, arc);
+        Ok(list)
     }
 }
 

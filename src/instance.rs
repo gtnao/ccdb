@@ -30,7 +30,10 @@ const DATA_FILE: &str = "table.db";
 const WAL_FILE: &str = "wal.log";
 const DATA_DIR: &str = ".";
 const DEFAULT_PORT: u16 = 5433;
-const POOL_CAPACITY: usize = 64;
+/// 16384 frames × 4 KB = 64 MB. Enough to keep scale=10 pgbench
+/// working set (≈40 MB) entirely in memory; was 64 frames (256 KB)
+/// which forced near-every page fetch through disk I/O.
+const POOL_CAPACITY: usize = 16384;
 
 pub struct Instance {
     catalog: Arc<Catalog>,
@@ -243,6 +246,17 @@ fn handle_client(
                     ) {
                         eprintln!("query error: {e}");
                         conn.send_error(&e.to_string())?;
+                        // If the failure happened inside an explicit
+                        // transaction, roll it back automatically. PG
+                        // would put the txn into a "failed" state and
+                        // require ROLLBACK; abandoning that for now lets
+                        // pgbench's --max-tries retry path actually fire
+                        // a clean BEGIN on the next iteration.
+                        if tx.is_active() {
+                            let _ = executor::rollback(&bpm, &wal, &mut tx);
+                            let held = tx.take_held_locks();
+                            lock_manager.unlock_all(tx.id(), &held);
+                        }
                     }
                     conn.send_ready_for_query()?;
                 }

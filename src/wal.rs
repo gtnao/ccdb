@@ -349,6 +349,11 @@ pub struct WalManager {
     writer: Mutex<BufWriter<File>>,
     next_lsn: AtomicU64,
     flushed_lsn: AtomicU64,
+    /// Serialises fsync attempts so concurrent committers can group-commit.
+    /// First thread in becomes the leader; others queue on this Mutex,
+    /// then re-check `flushed_lsn` and skip the fsync if the leader's
+    /// flush already covered them.
+    fsync_lock: Mutex<()>,
 }
 
 impl WalManager {
@@ -362,6 +367,7 @@ impl WalManager {
             writer: Mutex::new(BufWriter::new(file)),
             next_lsn: AtomicU64::new(1), // LSN 0 is reserved for "no WAL record"
             flushed_lsn: AtomicU64::new(0),
+            fsync_lock: Mutex::new(()),
         })
     }
 
@@ -382,23 +388,49 @@ impl WalManager {
         Ok(lsn)
     }
 
-    /// Force everything written so far to durable storage.
+    /// Force everything written so far to durable storage. Group-commit
+    /// friendly: callers that pile up while a leader is already inside
+    /// the fsync block share that fsync's effect — no per-caller fsync
+    /// for already-durable LSNs.
     pub fn flush(&self) -> Result<()> {
+        // Snapshot the LSN we must reach before grabbing the leader lock.
+        // Any append that lands after this point will be picked up by
+        // a future flush; no need for us to wait for it.
+        let target = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
+        let _leader = self.fsync_lock.lock().unwrap();
+        if self.flushed_lsn.load(Ordering::SeqCst) >= target {
+            return Ok(());
+        }
         let mut w = self.writer.lock().unwrap();
         w.flush()?;
         w.get_ref().sync_all()?;
-        let durable_through = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
-        // Monotone update; another thread may have flushed past us already.
-        let _ = self.flushed_lsn.fetch_max(durable_through, Ordering::SeqCst);
+        // The fsync covers everything in the writer at the moment it
+        // returned, which is at least `target`. Other appends may have
+        // sneaked in after our snapshot — they're fine to advance to
+        // as well, since we just synced them.
+        let now_durable = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
+        let _ = self.flushed_lsn.fetch_max(now_durable, Ordering::SeqCst);
         Ok(())
     }
 
-    /// Ensure all records up to `lsn` are durable. Cheap if already flushed.
+    /// Ensure all records up to `lsn` are durable. Cheap if already flushed
+    /// (no lock acquired in the fast path) and group-commits otherwise.
     pub fn flush_to(&self, lsn: Lsn) -> Result<()> {
         if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
             return Ok(());
         }
-        self.flush()
+        // Slow path: take the leader lock. If we lost the race, the
+        // leader's fsync has already advanced flushed_lsn past us.
+        let _leader = self.fsync_lock.lock().unwrap();
+        if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
+            return Ok(());
+        }
+        let mut w = self.writer.lock().unwrap();
+        w.flush()?;
+        w.get_ref().sync_all()?;
+        let now_durable = self.next_lsn.load(Ordering::SeqCst).saturating_sub(1);
+        let _ = self.flushed_lsn.fetch_max(now_durable, Ordering::SeqCst);
+        Ok(())
     }
 
     #[allow(dead_code)]

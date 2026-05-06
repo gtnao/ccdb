@@ -91,9 +91,24 @@ impl LockState {
     }
 }
 
-pub struct LockManager {
+/// Lock-table sharding. Each shard owns a Mutex<HashMap> + Condvar so
+/// `lock` / `unlock_all` on different rids only block under the same
+/// shard's lock — not the global table.
+struct Shard {
     table: Mutex<HashMap<Rid, LockState>>,
     cond: Condvar,
+}
+
+const NUM_SHARDS: usize = 16;
+
+pub struct LockManager {
+    shards: Vec<Shard>,
+    /// Wakes any thread waiting on `wait_for_txn_completion`. Notified
+    /// at the tail of `unlock_all` (which is what every commit / rollback
+    /// hits). Kept separate from the per-shard condvars so a waiter
+    /// doesn't have to pick "the right" shard.
+    tx_done_lock: Mutex<()>,
+    tx_done_cond: Condvar,
     timeout: Duration,
 }
 
@@ -107,17 +122,32 @@ impl LockManager {
     }
 
     pub fn with_timeout(timeout: Duration) -> Self {
+        let shards = (0..NUM_SHARDS)
+            .map(|_| Shard {
+                table: Mutex::new(HashMap::new()),
+                cond: Condvar::new(),
+            })
+            .collect();
         Self {
-            table: Mutex::new(HashMap::new()),
-            cond: Condvar::new(),
+            shards,
+            tx_done_lock: Mutex::new(()),
+            tx_done_cond: Condvar::new(),
             timeout,
         }
+    }
+
+    fn shard_for(&self, rid: Rid) -> &Shard {
+        let h = (rid.0 as u64)
+            .wrapping_mul(0x9e3779b97f4a7c15)
+            ^ rid.1 as u64;
+        &self.shards[(h as usize) % self.shards.len()]
     }
 
     /// Acquire `mode` on `rid` for `txn_id`. Blocks until granted or until
     /// the configured timeout elapses (interpreted as a deadlock signal).
     pub fn lock(&self, txn_id: u64, rid: Rid, mode: LockMode) -> Result<(), LockError> {
-        let mut table = self.table.lock().unwrap();
+        let shard = self.shard_for(rid);
+        let mut table = shard.table.lock().unwrap();
 
         let state = table.entry(rid).or_insert_with(LockState::new);
 
@@ -129,7 +159,7 @@ impl LockManager {
         // Must wait. Enqueue, then sleep on the Condvar.
         state.wait_queue.push_back(LockRequest { txn_id, mode });
 
-        let (mut table, timed_out) = self
+        let (mut table, timed_out) = shard
             .cond
             .wait_timeout_while(table, self.timeout, |t| {
                 let s = t.get(&rid).expect("rid entry was removed while we slept");
@@ -149,28 +179,43 @@ impl LockManager {
     }
 
     /// Release every lock held by `txn_id`. Wakes up any waiters that can
-    /// now be granted.
+    /// now be granted, and any thread blocked in `wait_for_txn_completion`.
     pub fn unlock_all(&self, txn_id: u64, held: &HashSet<Rid>) {
-        let mut table = self.table.lock().unwrap();
-
+        // Group rids by shard so we acquire each shard's lock at most once.
+        let mut by_shard: [Vec<Rid>; NUM_SHARDS] = Default::default();
         for rid in held {
-            if let Some(state) = table.get_mut(rid) {
-                state.holders.remove(&txn_id);
-                grant_waiting(state);
-                if state.holders.is_empty() && state.wait_queue.is_empty() {
-                    table.remove(rid);
+            let idx = {
+                let h = (rid.0 as u64).wrapping_mul(0x9e3779b97f4a7c15) ^ rid.1 as u64;
+                (h as usize) % NUM_SHARDS
+            };
+            by_shard[idx].push(*rid);
+        }
+        for (idx, rids) in by_shard.iter().enumerate() {
+            if rids.is_empty() {
+                continue;
+            }
+            let shard = &self.shards[idx];
+            let mut table = shard.table.lock().unwrap();
+            for rid in rids {
+                if let Some(state) = table.get_mut(rid) {
+                    state.holders.remove(&txn_id);
+                    grant_waiting(state);
+                    if state.holders.is_empty() && state.wait_queue.is_empty() {
+                        table.remove(rid);
+                    }
                 }
             }
+            drop(table);
+            shard.cond.notify_all();
         }
-        // notify_all is over-broadcast, but each thread re-checks its own
-        // predicate, and lock contention is the slow path anyway.
-        self.cond.notify_all();
+        // Wake any wait_for_txn_completion observer.
+        let _g = self.tx_done_lock.lock().unwrap();
+        self.tx_done_cond.notify_all();
     }
 
     /// Block until `target_txn_id` finishes (commits or aborts), or the
-    /// configured timeout elapses. The shared `Condvar` is the same one
-    /// notified by `unlock_all`, so a writer's `unlock_all` at commit /
-    /// rollback wakes us up immediately.
+    /// configured timeout elapses. Uses the dedicated `tx_done_cond`
+    /// notified at the tail of every `unlock_all`.
     ///
     /// Returns the txn's final status. Used by speculative unique-index
     /// insertion: when a colliding entry's xmin is in-progress, we wait
@@ -180,10 +225,10 @@ impl LockManager {
         target_txn_id: u64,
         tm: &TransactionManager,
     ) -> Result<TxnStatus, LockError> {
-        let table = self.table.lock().unwrap();
-        let (_table, timed_out) = self
-            .cond
-            .wait_timeout_while(table, self.timeout, |_| {
+        let g = self.tx_done_lock.lock().unwrap();
+        let (_g, timed_out) = self
+            .tx_done_cond
+            .wait_timeout_while(g, self.timeout, |_| {
                 matches!(tm.status(target_txn_id), TxnStatus::InProgress)
             })
             .expect("condvar poisoned");
@@ -195,7 +240,8 @@ impl LockManager {
 
     #[cfg(test)]
     fn holders_of(&self, rid: Rid) -> Vec<(u64, LockMode)> {
-        let table = self.table.lock().unwrap();
+        let shard = self.shard_for(rid);
+        let table = shard.table.lock().unwrap();
         table
             .get(&rid)
             .map(|s| s.holders.iter().map(|(k, v)| (*k, *v)).collect())

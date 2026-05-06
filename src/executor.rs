@@ -1519,6 +1519,7 @@ fn perform_create_table(
         };
         perform_create_index(bpm, wal, catalog, &pk_stmt, tx)?;
     }
+    catalog.invalidate();
     Ok(())
 }
 
@@ -1550,45 +1551,47 @@ fn perform_create_index(
     }
     let new_index_id = max_id + 1;
 
-    // Allocate root.
-    let root = crate::btree::new_empty_root(bpm, wal, tx)?;
-
-    // Bulk insert: scan heap, push each (key, rid) into the tree. We use a
-    // system snapshot so we see all rows; visibility is checked at scan time
-    // (so aborted/uncommitted-other rows are skipped).
-    let table = catalog
-        .table_by_id(stmt.table_id)?
-        .ok_or_else(|| anyhow::anyhow!("table id {} not in catalog", stmt.table_id))?;
+    // Bulk-build path: heap scan → sort by key → pack leaves → fan up
+    // internal nodes. Avoids the O(n log n) per-row btree::insert with
+    // its descend + split overhead, which dominates `pgbench -i` time.
     let snapshot = tx
         .snapshot()
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("no snapshot for tx"))?;
     let (_schema, rows) = visible_rows(bpm, catalog, stmt.table_id, &snapshot, tx.tm())?;
-    let mut current_root = root;
+    let mut entries: Vec<(crate::btree::KeyBytes, Rid)> = Vec::with_capacity(rows.len());
     for (pid, slot, values) in rows {
         let key_value = &values[stmt.column_index];
         if matches!(key_value, Value::Null) {
-            // Convention: NULL keys are not indexed (matches PostgreSQL with
-            // partial indexes; equality lookups for NULL would need IS NULL
-            // which is a separate syntactic path anyway).
-            continue;
+            continue; // NULLs are not indexed (matches CREATE INDEX convention)
         }
         let key = crate::btree::encode_key(key_value);
-        current_root = crate::btree::insert(bpm, current_root, &key, (pid, slot), stmt.data_type)?;
-        // Log each entry so recovery can rebuild the tree if we crash before
-        // the pg_index row is durably written. The index_id is the one we
-        // just chose above; replay looks it up via the catalog row that
-        // gets logged via insert_bytes below.
+        entries.push((key, (pid, slot)));
+    }
+    // Sort by key (ties broken by rid for determinism).
+    entries.sort_by(|a, b| {
+        match crate::btree::compare_keys(&a.0, &b.0, stmt.data_type) {
+            Ok(o) if o != std::cmp::Ordering::Equal => o,
+            _ => a.1.cmp(&b.1),
+        }
+    });
+
+    // WAL: still log per-(key, rid) IndexInsert so recovery can rebuild
+    // the tree from records if we crash before pg_index is durable.
+    for (key, rid) in &entries {
         log_record(
             wal,
             tx,
             WalRecordType::IndexInsert {
                 index_id: new_index_id as u64,
-                key,
-                rid: (pid, slot),
+                key: key.clone(),
+                rid: *rid,
             },
         )?;
     }
+
+    let current_root =
+        bulk_build_btree(bpm, wal, tx, &entries, stmt.data_type)?;
 
     // Register in pg_index.
     let row = serialize_tuple_mvcc(
@@ -1604,8 +1607,126 @@ fn perform_create_index(
         ],
     );
     insert_bytes(bpm, wal, tx, PG_INDEX_PAGE_ID, &row)?;
-    let _ = table; // referenced for the catalog read; suppress unused warning
+    catalog.invalidate();
     Ok(())
+}
+
+/// Sort-then-pack B+Tree builder. Returns the new root's PageId.
+/// `entries` must already be sorted by key. Logs PageInit for every
+/// allocated tree page so recovery can re-tag them as
+/// BTreeLeaf / BTreeInternal even if no flush reached disk.
+fn bulk_build_btree(
+    bpm: &BufferPool,
+    wal: &WalManager,
+    tx: &mut Transaction,
+    entries: &[(crate::btree::KeyBytes, Rid)],
+    _dt: DataType,
+) -> Result<PageId> {
+    use crate::page::PageKind;
+
+    if entries.is_empty() {
+        return crate::btree::new_empty_root(bpm, wal, tx);
+    }
+
+    // Pack into leaves left-to-right, threading next_page_id along.
+    // Each entry is `[key_len:u16][key][rid_page:u32][rid_slot:u16]`
+    // plus a 4-byte slot, so we need free_space() ≥ entry_len + 4.
+    struct LevelNode {
+        page_id: PageId,
+        first_key: crate::btree::KeyBytes,
+    }
+
+    let mut leaves: Vec<LevelNode> = Vec::new();
+    let mut prev_leaf: Option<PageId> = None;
+    let mut i = 0usize;
+    while i < entries.len() {
+        let g = bpm.new_page()?;
+        let pid = g.page_id();
+        let lsn = log_record(
+            wal,
+            tx,
+            WalRecordType::PageInit {
+                page_id: pid,
+                kind: PageKind::BTreeLeaf as u8,
+            },
+        )?;
+        let mut p = g.write();
+        crate::btree::init_leaf(&mut p);
+        p.set_page_lsn(lsn);
+
+        let first_key = entries[i].0.clone();
+        while i < entries.len() {
+            let raw = crate::btree::encode_leaf_entry(&entries[i].0, entries[i].1);
+            // page.insert needs raw.len() + slot (4) of free space.
+            if p.free_space() < raw.len() + 4 {
+                break;
+            }
+            p.insert(&raw)?;
+            i += 1;
+        }
+        drop(p);
+
+        // Link prev leaf's next_page_id forward.
+        if let Some(prev) = prev_leaf {
+            let prev_g = bpm.fetch_page(prev)?;
+            prev_g.write().set_next_page_id(pid);
+        }
+        prev_leaf = Some(pid);
+        leaves.push(LevelNode {
+            page_id: pid,
+            first_key,
+        });
+    }
+
+    if leaves.len() == 1 {
+        return Ok(leaves[0].page_id);
+    }
+
+    // Build internal levels until a single root remains. Each internal
+    // node has a leftmost child (`p0`, stored in next_page_id) plus a
+    // sequence of `(separator_key, child)` entries — the separator is
+    // the first key of the child subtree.
+    let mut current: Vec<LevelNode> = leaves;
+    while current.len() > 1 {
+        let mut next: Vec<LevelNode> = Vec::new();
+        let mut j = 0;
+        while j < current.len() {
+            let g = bpm.new_page()?;
+            let pid = g.page_id();
+            let lsn = log_record(
+                wal,
+                tx,
+                WalRecordType::PageInit {
+                    page_id: pid,
+                    kind: PageKind::BTreeInternal as u8,
+                },
+            )?;
+            let mut p = g.write();
+            crate::btree::init_internal(&mut p, current[j].page_id);
+            p.set_page_lsn(lsn);
+            let internal_first_key = current[j].first_key.clone();
+            j += 1;
+
+            while j < current.len() {
+                let raw = crate::btree::encode_internal_entry(
+                    &current[j].first_key,
+                    current[j].page_id,
+                );
+                if p.free_space() < raw.len() + 4 {
+                    break;
+                }
+                p.insert(&raw)?;
+                j += 1;
+            }
+            drop(p);
+            next.push(LevelNode {
+                page_id: pid,
+                first_key: internal_first_key,
+            });
+        }
+        current = next;
+    }
+    Ok(current[0].page_id)
 }
 
 /// `CREATE SEQUENCE` — allocate a sequence relation page, initialise it,
@@ -1662,6 +1783,7 @@ fn perform_create_sequence(
         ],
     );
     insert_bytes(bpm, wal, tx, PG_SEQUENCE_PAGE_ID, &row)?;
+    catalog.invalidate();
     Ok(())
 }
 
@@ -1670,6 +1792,7 @@ fn perform_create_sequence(
 fn perform_drop_sequence(
     bpm: &BufferPool,
     wal: &WalManager,
+    catalog: &Catalog,
     stmt: &AnalyzedDropSequenceStatement,
     tx: &mut Transaction,
 ) -> Result<()> {
@@ -1680,6 +1803,7 @@ fn perform_drop_sequence(
             matches!(&vals[0], Value::Int(n) if *n as usize == id)
         })?;
     }
+    catalog.invalidate();
     Ok(())
 }
 
@@ -1707,6 +1831,7 @@ fn perform_drop_table(
             matches!(&vals[2], Value::Int(n) if *n as usize == *table_id)
         })?;
     }
+    catalog.invalidate();
     Ok(())
 }
 
@@ -1714,7 +1839,7 @@ fn perform_drop_table(
 fn perform_drop_index(
     bpm: &BufferPool,
     wal: &WalManager,
-    _catalog: &Catalog,
+    catalog: &Catalog,
     stmt: &AnalyzedDropIndexStatement,
     tx: &mut Transaction,
 ) -> Result<()> {
@@ -1726,6 +1851,7 @@ fn perform_drop_index(
     tombstone_catalog_rows(bpm, wal, tx, PG_INDEX_PAGE_ID, |vals| {
         matches!(&vals[0], Value::Int(n) if *n as usize == idx_id)
     })?;
+    catalog.invalidate();
     Ok(())
 }
 
@@ -1780,6 +1906,7 @@ fn perform_truncate(
             )?;
         }
     }
+    catalog.invalidate();
     Ok(stmt.tables.len())
 }
 
@@ -2215,6 +2342,43 @@ fn fk_target_exists(
         .iter()
         .position(|c| c.name == ref_column)
         .ok_or_else(|| anyhow::anyhow!("ref column {ref_column} missing"))?;
+    let schema = ref_table.to_schema();
+
+    // Fast path: a covering index on the ref column lets us answer with
+    // an O(log n) btree probe instead of an O(n) heap scan. PRIMARY KEYs
+    // and explicit UNIQUE indexes both qualify; secondary non-unique
+    // indexes work too (we only need to find *any* visible matching row).
+    let indexes = catalog.indexes_for_table(ref_table_id)?;
+    if let Some(idx) = indexes.iter().find(|i| i.column_index == ref_col_idx) {
+        let dt = ref_table.columns[ref_col_idx].data_type;
+        let key = crate::btree::encode_key(target);
+        let leaf_id = crate::btree::descend_to_leaf(bpm, idx.root_page_id, &key, dt)?;
+        let candidates: Vec<Rid> = {
+            let g = bpm.fetch_page(leaf_id)?;
+            let p = g.read();
+            crate::btree::leaf_lookup_eq(&p, &key, dt)?
+        };
+        for rid in candidates {
+            let g = bpm.fetch_page(rid.0)?;
+            let p = g.read();
+            let Some(raw) = p.get_tuple(rid.1) else {
+                continue;
+            };
+            let (xmin, xmax, vals) = deserialize_tuple_mvcc(raw, &schema)?;
+            if !visibility::is_visible(xmin, xmax, snapshot, tm) {
+                continue;
+            }
+            // Stale index entry under a different key would still get
+            // surfaced by leaf_lookup_eq if memcmp succeeded, so confirm
+            // the heap value really matches.
+            if values_equal(&vals[ref_col_idx], target) {
+                return Ok(true);
+            }
+        }
+        return Ok(false);
+    }
+
+    // Fallback: full visible scan + linear probe.
     let (_schema, rows) = visible_rows(bpm, catalog, ref_table_id, snapshot, tm)?;
     for (_, _, vals) in rows {
         if values_equal(&vals[ref_col_idx], target) {
@@ -2238,10 +2402,26 @@ fn values_equal(a: &Value, b: &Value) -> bool {
     }
 }
 
+/// Process-wide cache of bound CHECK predicates keyed by `constraint_id`.
+/// pg_constraint never reuses a constraint id (perform_create_table picks
+/// `max+1`), so the cache is append-only — no invalidation needed even
+/// across DROP / CREATE cycles. Re-parsing + re-binding every CHECK on
+/// every row was the dominant cost on tables with multiple CHECK
+/// constraints.
+fn analyzed_check_cache() -> &'static std::sync::Mutex<
+    std::collections::HashMap<usize, std::sync::Arc<crate::analyzer::AnalyzedExpr>>,
+> {
+    static C: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<usize, std::sync::Arc<crate::analyzer::AnalyzedExpr>>,
+        >,
+    > = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
 /// Evaluate every CHECK constraint registered for `table_id` against a
-/// fully-coerced row. Re-parses + re-binds each predicate's text on every
-/// call — fine for now (a per-row hashmap cache would help under load).
-/// Bails with SQLSTATE 23514 on the first failing predicate.
+/// fully-coerced row. AnalyzedExpr cached by constraint_id; bails with
+/// SQLSTATE 23514 on the first failing predicate.
 fn enforce_check_constraints(
     catalog: &Catalog,
     table_id: usize,
@@ -2253,26 +2433,36 @@ fn enforce_check_constraints(
         return Ok(());
     }
     let row = Tuple::new(values.to_vec());
+    let cache = analyzed_check_cache();
     for c in constraints {
         if !matches!(c.kind, crate::catalog::ConstraintKind::Check) {
             continue;
         }
-        let expr = crate::parser::parse_expr_str(&c.definition).map_err(|e| {
-            anyhow::anyhow!(
-                "stored CHECK '{}' failed to parse: {e}",
-                c.definition
-            )
-        })?;
-        let analyzed =
-            crate::analyzer::analyze_expr_for_table(catalog, table_id, table_name, &expr)?;
+        let analyzed: std::sync::Arc<crate::analyzer::AnalyzedExpr> = {
+            let mut g = cache.lock().unwrap();
+            if let Some(a) = g.get(&c.constraint_id).cloned() {
+                a
+            } else {
+                let expr = crate::parser::parse_expr_str(&c.definition).map_err(|e| {
+                    anyhow::anyhow!(
+                        "stored CHECK '{}' failed to parse: {e}",
+                        c.definition
+                    )
+                })?;
+                let bound =
+                    crate::analyzer::analyze_expr_for_table(catalog, table_id, table_name, &expr)?;
+                let arc = std::sync::Arc::new(bound);
+                g.insert(c.constraint_id, arc.clone());
+                arc
+            }
+        };
         match evaluate_expr(&analyzed, &row)? {
             Value::Bool(true) => continue,
             Value::Bool(false) => bail!(
                 "new row violates check constraint \"{}\" [SQLSTATE 23514]",
                 c.name
             ),
-            // PG semantics: a NULL check passes (treated as not-violated).
-            Value::Null => continue,
+            Value::Null => continue, // PG semantics: NULL check passes
             other => bail!("CHECK '{}' returned non-boolean: {other:?}", c.name),
         }
     }
@@ -3559,7 +3749,7 @@ pub fn execute(
             Ok(Output::Affected(0))
         }
         AnalyzedStatement::DropSequence(s) => {
-            perform_drop_sequence(bpm, wal, s, tx)?;
+            perform_drop_sequence(bpm, wal, catalog, s, tx)?;
             Ok(Output::Affected(0))
         }
         AnalyzedStatement::Vacuum(s) => {
