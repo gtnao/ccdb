@@ -16,13 +16,13 @@ use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Result;
-use indexmap::IndexSet;
 
 use crate::disk::DiskManager;
 use crate::page::{PAGE_SIZE, Page, PageId};
 use crate::wal::{Lsn, WalManager};
 
 const ORDER: Ordering = Ordering::SeqCst;
+const NIL: usize = usize::MAX;
 
 /// Replacement policy for choosing an evictable frame.
 trait Replacer {
@@ -31,31 +31,82 @@ trait Replacer {
     fn unpin(&mut self, frame_id: usize);
 }
 
+/// O(1) LRU using a doubly-linked list embedded in two Vec arrays.
+/// `head` is the least-recently-used (eviction candidate), `tail` is
+/// the most recently unpinned. Pinned frames are simply unlinked from
+/// the list — `in_list[fid]` says whether a frame is currently
+/// participating, so pin/unpin become O(1) instead of an O(n) scan.
 struct LruReplacer {
-    order: IndexSet<usize>,
-    pinned: Vec<bool>,
+    prev: Vec<usize>,
+    next: Vec<usize>,
+    in_list: Vec<bool>,
+    head: usize,
+    tail: usize,
 }
 
 impl LruReplacer {
     fn new(capacity: usize) -> Self {
         Self {
-            order: IndexSet::new(),
-            pinned: vec![true; capacity],
+            prev: vec![NIL; capacity],
+            next: vec![NIL; capacity],
+            in_list: vec![false; capacity],
+            head: NIL,
+            tail: NIL,
         }
+    }
+
+    fn unlink(&mut self, fid: usize) {
+        if !self.in_list[fid] {
+            return;
+        }
+        let p = self.prev[fid];
+        let n = self.next[fid];
+        if p != NIL {
+            self.next[p] = n;
+        } else {
+            self.head = n;
+        }
+        if n != NIL {
+            self.prev[n] = p;
+        } else {
+            self.tail = p;
+        }
+        self.prev[fid] = NIL;
+        self.next[fid] = NIL;
+        self.in_list[fid] = false;
+    }
+
+    fn push_back(&mut self, fid: usize) {
+        if self.in_list[fid] {
+            return;
+        }
+        self.prev[fid] = self.tail;
+        self.next[fid] = NIL;
+        if self.tail != NIL {
+            self.next[self.tail] = fid;
+        } else {
+            self.head = fid;
+        }
+        self.tail = fid;
+        self.in_list[fid] = true;
     }
 }
 
 impl Replacer for LruReplacer {
     fn victim(&mut self) -> Option<usize> {
-        self.order.iter().find(|&&id| !self.pinned[id]).copied()
+        if self.head == NIL {
+            return None;
+        }
+        let fid = self.head;
+        self.unlink(fid);
+        Some(fid)
     }
     fn pin(&mut self, frame_id: usize) {
-        self.pinned[frame_id] = true;
-        self.order.shift_remove(&frame_id);
-        self.order.insert(frame_id);
+        self.unlink(frame_id);
     }
     fn unpin(&mut self, frame_id: usize) {
-        self.pinned[frame_id] = false;
+        self.unlink(frame_id);
+        self.push_back(frame_id);
     }
 }
 
@@ -93,6 +144,10 @@ struct Inner {
     /// before extending the file. Lost on restart — recovery doesn't
     /// rebuild it; the next VACUUM repopulates.
     free_list: Vec<PageId>,
+    /// Frame ids that currently hold no page — start of life or just
+    /// evicted. Used to make `pick_or_evict`'s "find an empty frame"
+    /// step O(1) instead of an O(capacity) scan.
+    free_frames: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -103,6 +158,9 @@ pub struct BufferPool {
 impl BufferPool {
     pub fn new(disk: DiskManager, capacity: usize, wal: Arc<WalManager>) -> Self {
         let frames = (0..capacity).map(|_| Frame::empty()).collect();
+        // Every frame starts empty — push them all onto the free list so
+        // the first `capacity` allocations skip the LRU path entirely.
+        let free_frames = (0..capacity).rev().collect();
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 frames,
@@ -113,6 +171,7 @@ impl BufferPool {
                 wal,
                 dpt: HashMap::new(),
                 free_list: Vec::new(),
+                free_frames,
             })),
         }
     }
@@ -167,12 +226,7 @@ impl BufferPool {
 
 impl Inner {
     fn pick_or_evict(&mut self) -> Result<usize> {
-        if self.page_table.len() < self.capacity {
-            let fid = self
-                .frames
-                .iter()
-                .position(|f| f.page_id.is_none())
-                .expect("page_table < capacity implies an empty frame exists");
+        if let Some(fid) = self.free_frames.pop() {
             return Ok(fid);
         }
         let victim = self
@@ -197,6 +251,11 @@ impl Inner {
         frame.page_id = None;
         frame.dirty = false;
         frame.pin_count = 0;
+        // Note: caller (pick_or_evict) is about to reuse this frame
+        // immediately, so we don't push it onto free_frames here. The
+        // only time a frame becomes free without an immediate reuse is
+        // when `recycle_page` evicts a stale resident copy — that path
+        // explicitly pushes onto free_frames itself (see new_page_locked).
         Ok(())
     }
 
@@ -233,7 +292,9 @@ impl Inner {
             // it was freed — evict it first so the buffered (stale) image
             // doesn't survive into the new occupant.
             if let Some(&fid) = self.page_table.get(&page_id) {
+                self.replacer.pin(fid); // unhook from LRU before evicting
                 self.evict(fid)?;
+                self.free_frames.push(fid);
             }
             let fid = self.pick_or_evict()?;
             {
