@@ -1329,6 +1329,11 @@ impl Parser {
                 self.bump();
                 Ok(Expr::Literal(Literal::Boolean(false)))
             }
+            Some(Token::Param(n)) => {
+                let n = *n;
+                self.bump();
+                Ok(Expr::Param(n))
+            }
             Some(Token::Ident(s)) => {
                 let s = s.clone();
                 self.bump();

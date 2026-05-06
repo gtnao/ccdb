@@ -4,8 +4,15 @@ use anyhow::{Result, bail};
 pub type TxnId = u64;
 /// Sentinel meaning "no deletion yet" in `xmax`.
 pub const INVALID_TXN_ID: TxnId = 0;
-/// Bytes occupied by the per-tuple MVCC header: xmin (8) + xmax (8).
-pub const MVCC_HEADER_SIZE: usize = 16;
+/// Bytes occupied by the per-tuple MVCC header:
+///   xmin   (8)
+///   xmax   (8)
+///   t_ctid (6) — forward pointer for HOT update chains:
+///     [u32 page_id][u16 slot]. Sentinel `(u32::MAX, u16::MAX)`
+///     means "no successor; this tuple is the head/tail".
+pub const MVCC_HEADER_SIZE: usize = 22;
+pub const TCTID_PAGE_OFF: usize = 16;
+pub const TCTID_SLOT_OFF: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -200,16 +207,43 @@ pub fn deserialize_tuple(data: &[u8], schema: &Schema) -> Result<Vec<Value>> {
 
 // -- MVCC tuple format -------------------------------------------------------
 //
-// On-disk layout: `[xmin: u64][xmax: u64][bitmap][values...]`. xmin is the
-// txn that created the row; xmax is the txn that deleted it (0 = not
-// deleted). Visibility check (in `visibility.rs`) interprets these against
-// a snapshot.
+// On-disk layout: `[xmin: u64][xmax: u64][t_ctid: u32+u16][bitmap][values...]`.
+// xmin is the txn that created the row; xmax is the txn that deleted it
+// (0 = not deleted). t_ctid is the HOT-chain forward pointer set during
+// an UPDATE that doesn't change any indexed column — the deleted version
+// uses it to point at its replacement so IndexScan can follow the chain
+// past stale-but-still-indexed entries. `(u32::MAX, u16::MAX)` ⇒ no
+// successor.
+//
+// Visibility check (in `visibility.rs`) interprets xmin/xmax against a
+// snapshot; `t_ctid` is consumed by the heap-walk callers when they need
+// to find the live successor of an invisible-because-deleted row.
+
+/// Sentinel "no successor" forward pointer.
+pub fn no_ctid() -> (u32, u16) {
+    (u32::MAX, u16::MAX)
+}
+
+pub fn is_no_ctid(c: (u32, u16)) -> bool {
+    c == no_ctid()
+}
 
 pub fn serialize_tuple_mvcc(xmin: TxnId, xmax: TxnId, values: &[Value]) -> Vec<u8> {
+    serialize_tuple_mvcc_with_ctid(xmin, xmax, no_ctid(), values)
+}
+
+pub fn serialize_tuple_mvcc_with_ctid(
+    xmin: TxnId,
+    xmax: TxnId,
+    ctid: (u32, u16),
+    values: &[Value],
+) -> Vec<u8> {
     let payload = serialize_tuple(values);
     let mut buf = Vec::with_capacity(MVCC_HEADER_SIZE + payload.len());
     buf.extend_from_slice(&xmin.to_le_bytes());
     buf.extend_from_slice(&xmax.to_le_bytes());
+    buf.extend_from_slice(&ctid.0.to_le_bytes());
+    buf.extend_from_slice(&ctid.1.to_le_bytes());
     buf.extend_from_slice(&payload);
     buf
 }
@@ -225,6 +259,21 @@ pub fn deserialize_tuple_mvcc(
     let xmax = u64::from_le_bytes(data[8..16].try_into().unwrap());
     let values = deserialize_tuple(&data[MVCC_HEADER_SIZE..], schema)?;
     Ok((xmin, xmax, values))
+}
+
+pub fn deserialize_tuple_mvcc_full(
+    data: &[u8],
+    schema: &Schema,
+) -> Result<(TxnId, TxnId, (u32, u16), Vec<Value>)> {
+    if data.len() < MVCC_HEADER_SIZE {
+        bail!("tuple truncated: missing MVCC header");
+    }
+    let xmin = u64::from_le_bytes(data[0..8].try_into().unwrap());
+    let xmax = u64::from_le_bytes(data[8..16].try_into().unwrap());
+    let ctid_page = u32::from_le_bytes(data[TCTID_PAGE_OFF..TCTID_PAGE_OFF + 4].try_into().unwrap());
+    let ctid_slot = u16::from_le_bytes(data[TCTID_SLOT_OFF..TCTID_SLOT_OFF + 2].try_into().unwrap());
+    let values = deserialize_tuple(&data[MVCC_HEADER_SIZE..], schema)?;
+    Ok((xmin, xmax, (ctid_page, ctid_slot), values))
 }
 
 #[cfg(test)]

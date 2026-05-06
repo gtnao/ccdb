@@ -121,7 +121,36 @@ impl TransactionManager {
     /// Look up a transaction's commit/abort status. Reads from CLOG;
     /// defaults to `Aborted` for unknown txn_ids that aren't in the ATT
     /// (matches the "unfinished = aborted" recovery convention).
+    ///
+    /// Hot path: visibility checks call this once per tuple per scan.
+    /// We memoise terminal results (Committed / Aborted) in a thread-
+    /// local cache — those statuses never change once observed, so no
+    /// invalidation is needed. Capped at 4096 entries to keep the
+    /// per-thread footprint bounded; on overflow the cache is just
+    /// flushed (cold path becomes the next miss).
     pub fn status(&self, txn_id: TxnId) -> TxnStatus {
+        thread_local! {
+            static CLOG_CACHE: std::cell::RefCell<
+                std::collections::HashMap<TxnId, TxnStatus>,
+            > = std::cell::RefCell::new(std::collections::HashMap::new());
+        }
+        if let Some(s) = CLOG_CACHE.with(|c| c.borrow().get(&txn_id).copied()) {
+            return s;
+        }
+        let s = self.status_uncached(txn_id);
+        if matches!(s, TxnStatus::Committed | TxnStatus::Aborted) {
+            CLOG_CACHE.with(|c| {
+                let mut m = c.borrow_mut();
+                if m.len() >= 4096 {
+                    m.clear();
+                }
+                m.insert(txn_id, s);
+            });
+        }
+        s
+    }
+
+    fn status_uncached(&self, txn_id: TxnId) -> TxnStatus {
         match self.clog.get(txn_id).unwrap_or(TxnStatus::InProgress) {
             TxnStatus::Committed => TxnStatus::Committed,
             TxnStatus::Aborted => TxnStatus::Aborted,

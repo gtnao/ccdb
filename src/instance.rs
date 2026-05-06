@@ -213,9 +213,17 @@ fn handle_client(
 
     // Extended-protocol scratchpad. Statements/portals are scoped to the
     // session and survive across Sync boundaries.
-    let mut statements: std::collections::HashMap<String, String> =
+    //
+    // Statements hold the parsed AST: one parse per Parse message, every
+    // Execute on a derived portal reuses that AST. Portals carry the
+    // post-Bind AST (parameters substituted in place).
+    let mut statements: std::collections::HashMap<String, crate::ast::Statement> =
         std::collections::HashMap::new();
-    let mut portals: std::collections::HashMap<String, String> =
+    /// Parameter count cached at Parse time so Describe-statement can
+    /// emit ParameterDescription without re-parsing.
+    let mut statement_param_counts: std::collections::HashMap<String, usize> =
+        std::collections::HashMap::new();
+    let mut portals: std::collections::HashMap<String, crate::ast::Statement> =
         std::collections::HashMap::new();
     // Tracks whether the current extended-protocol message group has hit
     // an error — once set, we skip everything until Sync (per spec).
@@ -268,8 +276,18 @@ fn handle_client(
                     if extended_error {
                         continue;
                     }
-                    statements.insert(name, query);
-                    conn.send_parse_complete()?;
+                    match parse(&query) {
+                        Ok(stmt) => {
+                            let pcount = max_param_index(&stmt);
+                            statement_param_counts.insert(name.clone(), pcount);
+                            statements.insert(name, stmt);
+                            conn.send_parse_complete()?;
+                        }
+                        Err(e) => {
+                            extended_error = true;
+                            conn.send_error(&e.to_string())?;
+                        }
+                    }
                 }
                 Some(FrontendMessage::Bind {
                     portal,
@@ -291,43 +309,41 @@ fn handle_client(
                             continue;
                         }
                     };
-                    let bound = substitute_params(&template, &params);
-                    portals.insert(portal, bound);
-                    conn.send_bind_complete()?;
+                    match bind_params_into_stmt(&template, &params) {
+                        Ok(bound) => {
+                            portals.insert(portal, bound);
+                            conn.send_bind_complete()?;
+                        }
+                        Err(e) => {
+                            extended_error = true;
+                            conn.send_error(&e.to_string())?;
+                        }
+                    }
                 }
                 Some(FrontendMessage::Describe { kind, name }) => {
                     if extended_error {
                         continue;
                     }
-                    // For a statement (S) the spec also asks us to send
-                    // ParameterDescription first. For a portal (P) we
-                    // skip directly to row info.
                     if kind == b'S' {
-                        let pcount = statements
-                            .get(&name)
-                            .map(|s| count_placeholders(s))
-                            .unwrap_or(0);
+                        let pcount = statement_param_counts.get(&name).copied().unwrap_or(0);
                         conn.send_parameter_description(pcount)?;
                     }
-                    let sql = match kind {
-                        b'P' => portals.get(&name).cloned(),
-                        _ => statements.get(&name).cloned(),
-                    };
-                    let sql = sql.unwrap_or_default();
-                    // For Describe-statement we don't yet know parameter
-                    // values; analyzer would fail on placeholders. Send
-                    // NoData and let the client figure it out from
-                    // RowDescription that arrives after Bind+Describe-portal.
-                    if kind == b'S' || sql.is_empty() {
+                    if kind == b'S' {
+                        // Describe-statement doesn't yet know parameter
+                        // values; we'd need to bind+analyze to know the
+                        // exact RowDescription. Defer to Describe-portal.
                         conn.send_no_data()?;
                     } else {
-                        match describe_columns(&sql, &catalog) {
-                            Ok(Some(cols)) => conn.send_row_description(&cols)?,
-                            Ok(None) => conn.send_no_data()?,
-                            Err(e) => {
-                                extended_error = true;
-                                conn.send_error(&e.to_string())?;
-                            }
+                        match portals.get(&name) {
+                            None => conn.send_no_data()?,
+                            Some(stmt) => match describe_columns_for_stmt(stmt, &catalog) {
+                                Ok(Some(cols)) => conn.send_row_description(&cols)?,
+                                Ok(None) => conn.send_no_data()?,
+                                Err(e) => {
+                                    extended_error = true;
+                                    conn.send_error(&e.to_string())?;
+                                }
+                            },
                         }
                     }
                 }
@@ -335,7 +351,7 @@ fn handle_client(
                     if extended_error {
                         continue;
                     }
-                    let sql = match portals.get(&portal) {
+                    let stmt = match portals.get(&portal) {
                         Some(s) => s.clone(),
                         None => {
                             extended_error = true;
@@ -345,8 +361,8 @@ fn handle_client(
                             continue;
                         }
                     };
-                    if let Err(e) = run_query_with_options(
-                        &sql,
+                    if let Err(e) = run_parsed_with_options(
+                        &stmt,
                         &mut conn,
                         &bpm,
                         &lock_manager,
@@ -365,6 +381,7 @@ fn handle_client(
                 Some(FrontendMessage::Close { kind, name }) => {
                     if kind == b'S' {
                         statements.remove(&name);
+                        statement_param_counts.remove(&name);
                     } else {
                         portals.remove(&name);
                     }
@@ -417,14 +434,15 @@ fn run_query(
     tx: &mut Transaction,
     instance: &InstanceHandle,
 ) -> Result<()> {
-    run_query_with_options(sql, conn, bpm, lm, wal, tm, catalog, tx, instance, true)
+    let stmt = parse(sql)?;
+    run_parsed_with_options(&stmt, conn, bpm, lm, wal, tm, catalog, tx, instance, true)
 }
 
 /// `send_row_description` controls whether to emit `T` before data rows.
 /// Simple-Q always wants it; extended-protocol Execute wants it suppressed
 /// because the client already received it from the prior Describe.
-fn run_query_with_options(
-    sql: &str,
+fn run_parsed_with_options(
+    stmt: &crate::ast::Statement,
     conn: &mut Connection<TcpStream>,
     bpm: &BufferPool,
     lm: &LockManager,
@@ -435,8 +453,7 @@ fn run_query_with_options(
     instance: &InstanceHandle,
     send_row_description: bool,
 ) -> Result<()> {
-    let stmt = parse(sql)?;
-    let analyzed = analyze(catalog, &stmt)?;
+    let analyzed = analyze(catalog, stmt)?;
 
     match &analyzed {
         AnalyzedStatement::Select(s) => {
@@ -765,11 +782,306 @@ fn decode_copy_field(raw: &[u8], dt: DataType, nullable: bool) -> Result<Value> 
 }
 
 
+/// Walk a parsed Statement looking for the highest `$N` Param index.
+/// Used by Describe-statement to emit ParameterDescription without
+/// having to walk the original SQL text.
+fn max_param_index(s: &crate::ast::Statement) -> usize {
+    use crate::ast::Statement;
+    let mut n = 0;
+    visit_stmt_exprs(s, &mut |e| {
+        n = n.max(max_param_in_expr(e));
+    });
+    n
+}
+
+fn max_param_in_expr(e: &crate::ast::Expr) -> usize {
+    use crate::ast::{Expr, FuncArgs};
+    match e {
+        Expr::Param(n) => *n,
+        Expr::Literal(_) | Expr::Column { .. } => 0,
+        Expr::BinaryOp { left, right, .. } => {
+            max_param_in_expr(left).max(max_param_in_expr(right))
+        }
+        Expr::UnaryOp { expr, .. } | Expr::IsNull { expr, .. } => max_param_in_expr(expr),
+        Expr::FuncCall { args, .. } => match args {
+            FuncArgs::Star => 0,
+            FuncArgs::Exprs(es) => es.iter().map(max_param_in_expr).max().unwrap_or(0),
+        },
+    }
+}
+
+/// Walk every Expr inside a Statement, calling `f` on each. Used both
+/// by `max_param_index` (read-only) and as a template for the param
+/// substitution path below (which mutates clones).
+fn visit_stmt_exprs<F: FnMut(&crate::ast::Expr)>(s: &crate::ast::Statement, f: &mut F) {
+    use crate::ast::{FromClause, SelectColumn, Statement};
+    fn walk_from<F: FnMut(&crate::ast::Expr)>(fc: &FromClause, f: &mut F) {
+        match fc {
+            FromClause::Empty | FromClause::Table(_) => {}
+            FromClause::Join { left, on, .. } => {
+                walk_from(left, f);
+                f(on);
+            }
+        }
+    }
+    match s {
+        Statement::Select(sel) => {
+            for c in &sel.columns {
+                if let SelectColumn::Expr { expr, .. } = c {
+                    f(expr);
+                }
+            }
+            walk_from(&sel.from, f);
+            if let Some(w) = &sel.where_clause {
+                f(w);
+            }
+            for g in &sel.group_by {
+                f(g);
+            }
+            if let Some(h) = &sel.having {
+                f(h);
+            }
+            for o in &sel.order_by {
+                f(&o.expr);
+            }
+        }
+        Statement::Insert(ins) => {
+            for row in &ins.rows {
+                for e in row {
+                    f(e);
+                }
+            }
+        }
+        Statement::Delete(d) => {
+            if let Some(w) = &d.where_clause {
+                f(w);
+            }
+        }
+        Statement::Update(u) => {
+            for a in &u.assignments {
+                f(&a.value);
+            }
+            if let Some(w) = &u.where_clause {
+                f(w);
+            }
+        }
+        Statement::CreateTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropTable(_)
+        | Statement::DropIndex(_)
+        | Statement::TruncateTable(_)
+        | Statement::AlterTable(_)
+        | Statement::CreateSequence(_)
+        | Statement::DropSequence(_)
+        | Statement::Vacuum(_)
+        | Statement::Analyze(_)
+        | Statement::Copy(_)
+        | Statement::Begin
+        | Statement::Commit
+        | Statement::Rollback
+        | Statement::Checkpoint => {}
+    }
+}
+
+/// Decode one Bind parameter (text format) into an AST literal.
+fn param_to_literal(p: &Option<Vec<u8>>) -> crate::ast::Literal {
+    use crate::ast::Literal;
+    match p {
+        None => Literal::Null,
+        Some(bytes) => {
+            let s = std::str::from_utf8(bytes).unwrap_or("");
+            if let Ok(n) = s.parse::<i64>() {
+                return Literal::Integer(n);
+            }
+            if let Ok(f) = s.parse::<f64>() {
+                return Literal::Float(f);
+            }
+            Literal::String(s.to_string())
+        }
+    }
+}
+
+/// Substitute every `Expr::Param(N)` in `e` with the bound value's literal.
+fn replace_params_in_expr(
+    e: &crate::ast::Expr,
+    lits: &[crate::ast::Literal],
+) -> Result<crate::ast::Expr> {
+    use crate::ast::{Expr, FuncArgs};
+    Ok(match e {
+        Expr::Param(n) => {
+            let lit = lits
+                .get(*n - 1)
+                .ok_or_else(|| anyhow::anyhow!("missing value for parameter ${n}"))?
+                .clone();
+            Expr::Literal(lit)
+        }
+        Expr::Literal(_) | Expr::Column { .. } => e.clone(),
+        Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
+            left: Box::new(replace_params_in_expr(left, lits)?),
+            op: *op,
+            right: Box::new(replace_params_in_expr(right, lits)?),
+        },
+        Expr::UnaryOp { op, expr } => Expr::UnaryOp {
+            op: *op,
+            expr: Box::new(replace_params_in_expr(expr, lits)?),
+        },
+        Expr::IsNull { expr, negated } => Expr::IsNull {
+            expr: Box::new(replace_params_in_expr(expr, lits)?),
+            negated: *negated,
+        },
+        Expr::FuncCall { name, args } => Expr::FuncCall {
+            name: name.clone(),
+            args: match args {
+                FuncArgs::Star => FuncArgs::Star,
+                FuncArgs::Exprs(es) => FuncArgs::Exprs(
+                    es.iter()
+                        .map(|e| replace_params_in_expr(e, lits))
+                        .collect::<Result<_>>()?,
+                ),
+            },
+        },
+    })
+}
+
+/// Clone a parsed Statement and substitute every `$N` Param with the
+/// corresponding bound value (decoded as an AST Literal). The returned
+/// Statement is plan-able by `analyze` because no Param nodes remain.
+fn bind_params_into_stmt(
+    s: &crate::ast::Statement,
+    params: &[Option<Vec<u8>>],
+) -> Result<crate::ast::Statement> {
+    use crate::ast::{FromClause, SelectColumn, Statement};
+    let lits: Vec<crate::ast::Literal> = params.iter().map(param_to_literal).collect();
+    fn walk_from(
+        fc: &FromClause,
+        lits: &[crate::ast::Literal],
+    ) -> Result<FromClause> {
+        Ok(match fc {
+            FromClause::Empty => FromClause::Empty,
+            FromClause::Table(t) => FromClause::Table(t.clone()),
+            FromClause::Join {
+                left,
+                right,
+                join_type,
+                on,
+            } => FromClause::Join {
+                left: Box::new(walk_from(left, lits)?),
+                right: right.clone(),
+                join_type: *join_type,
+                on: replace_params_in_expr(on, lits)?,
+            },
+        })
+    }
+    Ok(match s {
+        Statement::Select(sel) => {
+            let mut new_sel = sel.clone();
+            new_sel.columns = sel
+                .columns
+                .iter()
+                .map(|c| match c {
+                    SelectColumn::Asterisk => Ok(SelectColumn::Asterisk),
+                    SelectColumn::Expr { expr, alias } => Ok(SelectColumn::Expr {
+                        expr: replace_params_in_expr(expr, &lits)?,
+                        alias: alias.clone(),
+                    }),
+                })
+                .collect::<Result<_>>()?;
+            new_sel.from = walk_from(&sel.from, &lits)?;
+            new_sel.where_clause = sel
+                .where_clause
+                .as_ref()
+                .map(|w| replace_params_in_expr(w, &lits))
+                .transpose()?;
+            new_sel.group_by = sel
+                .group_by
+                .iter()
+                .map(|g| replace_params_in_expr(g, &lits))
+                .collect::<Result<_>>()?;
+            new_sel.having = sel
+                .having
+                .as_ref()
+                .map(|h| replace_params_in_expr(h, &lits))
+                .transpose()?;
+            new_sel.order_by = sel
+                .order_by
+                .iter()
+                .map(|o| {
+                    Ok(crate::ast::OrderBy {
+                        expr: replace_params_in_expr(&o.expr, &lits)?,
+                        dir: o.dir,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Statement::Select(new_sel)
+        }
+        Statement::Insert(ins) => {
+            let mut new_ins = ins.clone();
+            new_ins.rows = ins
+                .rows
+                .iter()
+                .map(|row| {
+                    row.iter()
+                        .map(|e| replace_params_in_expr(e, &lits))
+                        .collect::<Result<_>>()
+                })
+                .collect::<Result<_>>()?;
+            Statement::Insert(new_ins)
+        }
+        Statement::Delete(d) => {
+            let mut nd = d.clone();
+            nd.where_clause = d
+                .where_clause
+                .as_ref()
+                .map(|w| replace_params_in_expr(w, &lits))
+                .transpose()?;
+            Statement::Delete(nd)
+        }
+        Statement::Update(u) => {
+            let mut nu = u.clone();
+            nu.assignments = u
+                .assignments
+                .iter()
+                .map(|a| {
+                    Ok(crate::ast::Assignment {
+                        column: a.column.clone(),
+                        value: replace_params_in_expr(&a.value, &lits)?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            nu.where_clause = u
+                .where_clause
+                .as_ref()
+                .map(|w| replace_params_in_expr(w, &lits))
+                .transpose()?;
+            Statement::Update(nu)
+        }
+        // Non-DML statements either have no Expr at all or carry only
+        // parser-time literals (DEFAULT / CHECK / FK), which we treat
+        // as already-bound — no Param substitution needed.
+        other => other.clone(),
+    })
+}
+
+/// AST-based RowDescription helper for Describe-portal in the extended
+/// protocol. The portal carries an already-bound Statement, so we just
+/// analyze + project.
+fn describe_columns_for_stmt(
+    stmt: &crate::ast::Statement,
+    catalog: &Catalog,
+) -> Result<Option<Vec<ColumnDesc>>> {
+    let analyzed = analyze(catalog, stmt)?;
+    Ok(match analyzed {
+        AnalyzedStatement::Select(s) => Some(s.select_items.iter().map(column_desc_for).collect()),
+        _ => None,
+    })
+}
+
 /// Replace `$N` placeholders in `sql` with the textual form of the
 /// corresponding `params` entry. Numeric values are inlined raw; everything
 /// else is wrapped in single quotes (with `'` doubled). NULL params become
 /// the SQL keyword `NULL`. Skips placeholders that occur inside quoted
 /// string literals.
+#[allow(dead_code)]
 fn substitute_params(sql: &str, params: &[Option<Vec<u8>>]) -> String {
     let chars: Vec<char> = sql.chars().collect();
     let mut out = String::with_capacity(sql.len());

@@ -241,6 +241,29 @@ impl Page {
         Ok(())
     }
 
+    /// Write the HOT-chain forward pointer (`t_ctid`) into an existing
+    /// MVCC tuple. Used by UPDATE when the new row replaces the old in
+    /// place: IndexScan readers can follow the pointer past the deleted
+    /// (xmax = my-tx) old row to its live successor without going through
+    /// the index again.
+    pub fn set_tuple_ctid(&mut self, slot_id: SlotId, ctid: (u32, u16)) -> Result<()> {
+        if slot_id >= self.tuple_count() {
+            bail!("slot {slot_id} out of range");
+        }
+        let (offset, length) = self.read_slot(slot_id);
+        if length == 0 {
+            bail!("slot {slot_id} tombstoned");
+        }
+        if (length as usize) < crate::tuple::MVCC_HEADER_SIZE {
+            bail!("slot {slot_id} too short for MVCC header");
+        }
+        let p_off = offset as usize + crate::tuple::TCTID_PAGE_OFF;
+        let s_off = offset as usize + crate::tuple::TCTID_SLOT_OFF;
+        self.data[p_off..p_off + 4].copy_from_slice(&ctid.0.to_le_bytes());
+        self.data[s_off..s_off + 2].copy_from_slice(&ctid.1.to_le_bytes());
+        Ok(())
+    }
+
     /// Compact the data area in place. Tombstoned slots (length=0) keep
     /// their slot id but free up their byte range; live slots get repacked
     /// against the back of the page. Slot ids are preserved so external

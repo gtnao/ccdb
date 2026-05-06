@@ -543,6 +543,7 @@ impl<'a> Analyzer<'a> {
                 }
                 bail!("unknown function '{name}'")
             }
+            Expr::Param(n) => bail!("unbound parameter ${n} — Bind must replace it first"),
         }
     }
 
@@ -887,6 +888,7 @@ impl<'a> Analyzer<'a> {
                     data_type: result_type,
                 }))
             }
+            Expr::Param(n) => bail!("unbound parameter ${n} — Bind must replace it first"),
         }
     }
 
@@ -1504,7 +1506,7 @@ fn substitute_aliases(e: &Expr, aliases: &[(String, Expr)]) -> Expr {
             }
             e.clone()
         }
-        Expr::Column { .. } | Expr::Literal(_) => e.clone(),
+        Expr::Column { .. } | Expr::Literal(_) | Expr::Param(_) => e.clone(),
         Expr::BinaryOp { left, op, right } => Expr::BinaryOp {
             left: Box::new(substitute_aliases(left, aliases)),
             op: *op,
@@ -1627,7 +1629,7 @@ fn extract_bool_literal(e: &Expr) -> Result<bool> {
 /// pipeline even without a GROUP BY clause.
 fn contains_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::Literal(_) | Expr::Column { .. } => false,
+        Expr::Literal(_) | Expr::Column { .. } | Expr::Param(_) => false,
         Expr::BinaryOp { left, right, .. } => {
             contains_aggregate(left) || contains_aggregate(right)
         }

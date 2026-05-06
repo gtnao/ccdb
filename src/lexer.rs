@@ -99,6 +99,8 @@ pub enum Token {
     Plus,      // +
     Minus,     // -
     Slash,     // /
+    /// `$N` extended-protocol parameter (N ≥ 1).
+    Param(usize),
 }
 
 pub struct Lexer {
@@ -207,6 +209,17 @@ impl Lexer {
                     }
                     _ => Token::Gt,
                 }
+            }
+            '$' => {
+                self.bump();
+                let mut s = String::new();
+                while matches!(self.peek(), Some(c) if c.is_ascii_digit()) {
+                    s.push(self.bump().unwrap());
+                }
+                if s.is_empty() {
+                    bail!("`$` not followed by parameter index");
+                }
+                Token::Param(s.parse()?)
             }
             '\'' => self.read_string()?,
             d if d.is_ascii_digit() => self.read_integer()?,

@@ -308,6 +308,11 @@ pub enum Expr {
         name: String,
         args: FuncArgs,
     },
+    /// `$N` parameter placeholder for the extended-protocol Parse/Bind
+    /// flow. The parser emits these; Bind walks the AST and replaces
+    /// every occurrence with a Literal. The analyzer rejects any Param
+    /// that survives — they're invalid in a finished query plan.
+    Param(usize),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -419,6 +424,7 @@ impl std::fmt::Display for Expr {
                 }
                 write!(f, ")")
             }
+            Expr::Param(n) => write!(f, "${n}"),
         }
     }
 }

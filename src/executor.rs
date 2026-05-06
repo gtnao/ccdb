@@ -116,12 +116,15 @@ impl Executor for SeqScan<'_> {
                 let page = guard.read();
                 let next = page.next_page_id();
                 let tc = page.tuple_count();
+                let page_all_visible = page.all_visible();
                 let mut out = None;
                 while self.cur_slot < tc {
                     if let Some(raw) = page.get_tuple(self.cur_slot) {
                         let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &self.schema)?;
                         self.cur_slot += 1;
-                        if visibility::is_visible(xmin, xmax, &self.snapshot, self.tm) {
+                        let vis = page_all_visible
+                            || visibility::is_visible(xmin, xmax, &self.snapshot, self.tm);
+                        if vis {
                             out = Some(values);
                             break;
                         }
@@ -276,19 +279,14 @@ impl Executor for IndexScan<'_> {
                 self.cursor = None;
                 return Ok(None);
             }
-            // Visibility filter at the heap level. The same row can match the
-            // index multiple times if it was updated in place; visibility
-            // ensures we surface only the snapshot's chosen version.
-            let g = self.bpm.fetch_page(rid.0)?;
-            let p = g.read();
-            let Some(raw) = p.get_tuple(rid.1) else {
-                continue; // tombstoned slot
-            };
-            let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &self.schema)?;
-            if !visibility::is_visible(xmin, xmax, &self.snapshot, self.tm) {
-                continue;
+            // Heap visibility — with HOT chain follow. The leaf entry
+            // may point at a row whose key has been "moved" to a
+            // newer-still-same-key version via t_ctid. Follow the chain
+            // until we find a visible tuple or the chain ends.
+            match follow_chain_visible(self.bpm, &self.schema, &self.snapshot, self.tm, rid)? {
+                Some((_rid, values)) => return Ok(Some(Tuple::new(values))),
+                None => continue,
             }
-            return Ok(Some(Tuple::new(values)));
         }
     }
 }
@@ -2274,6 +2272,42 @@ fn rewrite_catalog_row(
     Ok(())
 }
 
+/// Walk the t_ctid chain from `start_rid` looking for a tuple visible to
+/// `snapshot`. Returns the first visible (rid, values) pair, or None if
+/// the chain ends without finding one. Bounded chain length so a corrupt
+/// pointer can't loop forever.
+fn follow_chain_visible(
+    bpm: &BufferPool,
+    schema: &Schema,
+    snapshot: &Snapshot,
+    tm: &TransactionManager,
+    start_rid: Rid,
+) -> Result<Option<(Rid, Vec<Value>)>> {
+    const MAX_CHAIN: usize = 32;
+    let mut cur = start_rid;
+    for _ in 0..MAX_CHAIN {
+        let g = bpm.fetch_page(cur.0)?;
+        let p = g.read();
+        let Some(raw) = p.get_tuple(cur.1) else {
+            return Ok(None);
+        };
+        let (xmin, xmax, ctid, values) =
+            crate::tuple::deserialize_tuple_mvcc_full(raw, schema)?;
+        let page_av = p.all_visible();
+        drop(p);
+        drop(g);
+        let visible = page_av || visibility::is_visible(xmin, xmax, snapshot, tm);
+        if visible {
+            return Ok(Some((cur, values)));
+        }
+        if crate::tuple::is_no_ctid(ctid) {
+            return Ok(None);
+        }
+        cur = (ctid.0, ctid.1);
+    }
+    Ok(None)
+}
+
 /// Confirm every FOREIGN KEY on `table_id` is satisfied by the candidate
 /// row. NULL FK values are allowed (PG semantics: a NULL key references
 /// nothing). Otherwise a visible row with `ref_column = value` must
@@ -3081,22 +3115,22 @@ fn matching_rows(
             if past {
                 break;
             }
-            let g = bpm.fetch_page(rid.0)?;
-            let p = g.read();
-            let Some(raw) = p.get_tuple(rid.1) else {
+            // Follow the t_ctid chain to find the live successor of a
+            // possibly-stale index entry. Without this, a HOT-update
+            // index lookup would land on the tombstoned old row and
+            // miss the new one.
+            let Some((live_rid, values)) =
+                follow_chain_visible(bpm, &schema, snapshot, tm, rid)?
+            else {
                 continue;
             };
-            let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &schema)?;
-            if !visibility::is_visible(xmin, xmax, snapshot, tm) {
-                continue;
-            }
             // Re-check the full predicate: stale index entries, AND-clauses
             // beyond the indexable one, etc.
             let t = Tuple::new(values.clone());
             if !matches(where_clause.as_ref(), &t)? {
                 continue;
             }
-            out.push((rid.0, rid.1, values));
+            out.push((live_rid.0, live_rid.1, values));
         }
         return Ok((schema, out));
     }
@@ -3132,10 +3166,17 @@ fn visible_rows(
         let page = guard.read();
         let next = page.next_page_id();
         let tc = page.tuple_count();
+        // Page-level VM fast path: every live tuple on an all_visible
+        // page is visible to every active snapshot, so the per-tuple
+        // MVCC check (and its CLOG / ATT lookups) collapses to a
+        // single byte read.
+        let page_all_visible = page.all_visible();
         for slot in 0..tc {
             if let Some(raw) = page.get_tuple(slot) {
                 let (xmin, xmax, values) = deserialize_tuple_mvcc(raw, &schema)?;
-                if visibility::is_visible(xmin, xmax, snapshot, tm) {
+                let vis = page_all_visible
+                    || visibility::is_visible(xmin, xmax, snapshot, tm);
+                if vis {
                     out.push((cur, slot, values));
                 }
             }
@@ -3474,6 +3515,23 @@ fn perform_update(
             enforce_fk_on_child_write(
                 bpm, &tm_for_fk, catalog, stmt.table_id, &new_values, tx,
             )?;
+
+            // HOT-update gate: if no indexed column changes value, the
+            // existing index entry already points (transitively) to the
+            // right row. We skip the per-index re-insert and instead
+            // record a t_ctid forward pointer on the old tuple so
+            // IndexScan / matching_rows can step from a stale RID to
+            // the live successor.
+            let touched: std::collections::HashSet<usize> =
+                stmt.assignments.iter().map(|a| a.column_index).collect();
+            let any_index_col_touched = catalog
+                .indexes_for_table(stmt.table_id)?
+                .iter()
+                .any(|i| touched.contains(&i.column_index));
+            let do_hot = !any_index_col_touched;
+
+            // Tombstone old + WAL Delete (always — same shape for HOT and
+            // non-HOT).
             {
                 let g = bpm.fetch_page(pid)?;
                 let mut p = g.write();
@@ -3493,23 +3551,33 @@ fn perform_update(
             lm.lock(tx.id(), new_rid, LockMode::Exclusive)
                 .map_err(|e| anyhow::anyhow!("X-lock on {new_rid:?}: {e}"))?;
             tx.add_lock(new_rid);
-            let tm_arc = Arc::clone(tx.tm());
-            // A 23505 here means another concurrent UPDATE on the same
-            // unique key beat us between our matching_rows snapshot and
-            // our own new-row index_insert. Treat it as a serialization
-            // conflict and let the outer loop redo the statement against
-            // a fresh snapshot — at which point matching_rows finds the
-            // *other* tx's new version and we update that instead. Real
-            // user-visible 23505 (true duplicate-key INSERT) goes through
-            // perform_insert, not here.
-            match index_insert_for_row_with_lm(
-                bpm, Some(lm), wal, Some(&tm_arc), catalog, tx, stmt.table_id, &new_values, new_rid,
-            ) {
-                Ok(()) => {}
-                Err(e) if e.to_string().contains("SQLSTATE 23505") => {
-                    continue 'restart;
+
+            if do_hot {
+                // Stamp the chain pointer. Readers now find the new row
+                // by following old.t_ctid.
+                let g = bpm.fetch_page(pid)?;
+                g.write().set_tuple_ctid(slot, new_rid)?;
+            } else {
+                let tm_arc = Arc::clone(tx.tm());
+                // Same race-handling as before: a 23505 from a concurrent
+                // committed UPDATE feeds back into the outer restart.
+                match index_insert_for_row_with_lm(
+                    bpm,
+                    Some(lm),
+                    wal,
+                    Some(&tm_arc),
+                    catalog,
+                    tx,
+                    stmt.table_id,
+                    &new_values,
+                    new_rid,
+                ) {
+                    Ok(()) => {}
+                    Err(e) if e.to_string().contains("SQLSTATE 23505") => {
+                        continue 'restart;
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) => return Err(e),
             }
             count += 1;
         }
