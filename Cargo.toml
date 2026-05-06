@@ -13,5 +13,8 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 panic = "abort"
-debug = false
-strip = "symbols"
+# Keep line tables + frame pointers so external profilers (samply,
+# `sample`, instruments) can resolve symbols. Stripping was saving
+# ~MB on the binary at the cost of unreadable flamegraphs.
+debug = "line-tables-only"
+strip = "none"
