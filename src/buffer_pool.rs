@@ -23,8 +23,29 @@
 //! atomically without touching any lock.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+/// PageId-keyed maps were spending ~150 sample-hits/22s in
+/// SipHasher::write before this. PageId is a 32-bit integer that
+/// is already well-distributed (sequential allocation), so a plain
+/// multiplicative hash with the Fibonacci constant is plenty for
+/// HashMap's purposes and several times cheaper than SipHash.
+#[derive(Default, Clone, Copy)]
+struct IntHasher(u64);
+impl Hasher for IntHasher {
+    #[inline] fn finish(&self) -> u64 { self.0.wrapping_mul(0x9E3779B97F4A7C15) }
+    #[inline] fn write_u32(&mut self, n: u32) { self.0 = n as u64; }
+    #[inline] fn write_u64(&mut self, n: u64) { self.0 = n; }
+    fn write(&mut self, bytes: &[u8]) {
+        // Fallback. PageId always goes through write_u32 since u32
+        // implements Hash via write_u32 directly, so this is dead
+        // weight at runtime — present only because Hasher requires it.
+        for &b in bytes { self.0 = self.0.wrapping_mul(0x100000001B3) ^ (b as u64); }
+    }
+}
+type PageMap<V> = HashMap<PageId, V, BuildHasherDefault<IntHasher>>;
 
 use anyhow::Result;
 
@@ -120,9 +141,9 @@ impl ClockReplacer {
 
 struct Shard {
     frames: Vec<Frame>,
-    page_table: RwLock<HashMap<PageId, usize>>,
+    page_table: RwLock<PageMap<usize>>,
     replacer: ClockReplacer,
-    dpt: Mutex<HashMap<PageId, Lsn>>,
+    dpt: Mutex<PageMap<Lsn>>,
     free_list: Mutex<Vec<PageId>>,
     free_frames: Mutex<Vec<usize>>,
     /// Per-shard cap. Each shard has `total_capacity / NUM_SHARDS` frames.
@@ -156,9 +177,9 @@ impl BufferPool {
             let free_frames: Vec<usize> = (0..per_shard).rev().collect();
             shards.push(Shard {
                 frames,
-                page_table: RwLock::new(HashMap::new()),
+                page_table: RwLock::new(PageMap::default()),
                 replacer: ClockReplacer::new(per_shard),
-                dpt: Mutex::new(HashMap::new()),
+                dpt: Mutex::new(PageMap::default()),
                 free_list: Mutex::new(Vec::new()),
                 free_frames: Mutex::new(free_frames),
                 capacity: per_shard,
@@ -264,7 +285,7 @@ impl BufferPool {
     fn pick_or_evict(
         &self,
         sh: &Shard,
-        pt: &mut std::sync::RwLockWriteGuard<'_, HashMap<PageId, usize>>,
+        pt: &mut std::sync::RwLockWriteGuard<'_, PageMap<usize>>,
     ) -> Result<usize> {
         if let Some(fid) = sh.free_frames.lock().unwrap().pop() {
             return Ok(fid);
@@ -281,7 +302,7 @@ impl BufferPool {
         &self,
         sh: &Shard,
         fid: usize,
-        pt: &mut std::sync::RwLockWriteGuard<'_, HashMap<PageId, usize>>,
+        pt: &mut std::sync::RwLockWriteGuard<'_, PageMap<usize>>,
     ) -> Result<()> {
         let frame = &sh.frames[fid];
         if let Some(pid) = frame.page_id() {
