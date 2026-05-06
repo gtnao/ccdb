@@ -91,12 +91,10 @@ impl Instance {
             tm.set_next_txn_id(max_id + 1);
         }
 
-        // Background WAL writer: periodic fsync so commit-side flush_to
-        // can hand off to a single shared syscall. 10 ms is the PG-style
-        // wal_writer_delay sweet spot — short enough that commit latency
-        // stays bounded, long enough that idle sweeps don't burn CPU /
-        // syscall bandwidth.
-        let _writer = Arc::clone(&wal).spawn_writer(std::time::Duration::from_millis(10));
+        // Background WAL writer: idle interval is the *fallback* sleep;
+        // committers wake the writer on demand via flush_cond, so this
+        // is just a safety net for the "nothing happening" case.
+        let _writer = Arc::clone(&wal).spawn_writer(std::time::Duration::from_millis(50));
 
         let catalog = Arc::new(Catalog::new(bpm.clone(), Arc::clone(&tm)));
         let lock_manager = Arc::new(LockManager::new());

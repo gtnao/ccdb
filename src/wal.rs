@@ -382,14 +382,22 @@ impl WalManager {
         })
     }
 
-    /// Spawn a background thread that periodically flushes the WAL.
-    /// Concurrent `flush_to(lsn)` callers can wait for this thread's
-    /// next fsync via the cond, sharing one syscall instead of paying
-    /// one each. Stops cleanly when `request_writer_stop` is invoked.
-    pub fn spawn_writer(self: std::sync::Arc<Self>, interval: std::time::Duration) -> std::thread::JoinHandle<()> {
+    /// Spawn a background thread that flushes the WAL on demand.
+    ///
+    /// The writer waits on `flush_cond` until either a committer wakes
+    /// it (via `flush_to`) or `idle` elapses as a safety net for the
+    /// "nothing happening" case. On wake it runs `flush()`, which
+    /// fsyncs and broadcasts to any waiting committers — group-commit:
+    /// N concurrent committers share one syscall.
+    ///
+    /// Stops cleanly when `request_writer_stop` is invoked.
+    pub fn spawn_writer(self: std::sync::Arc<Self>, idle: std::time::Duration) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             while !self.writer_stop.load(Ordering::SeqCst) {
-                std::thread::sleep(interval);
+                {
+                    let g = self.flush_cond_lock.lock().unwrap();
+                    let _ = self.flush_cond.wait_timeout(g, idle).unwrap();
+                }
                 let _ = self.flush();
             }
             // Final flush so anything written before shutdown is durable.
@@ -447,7 +455,10 @@ impl WalManager {
         if self.flushed_lsn.load(Ordering::SeqCst) >= lsn {
             return Ok(());
         }
-        // Wait briefly for the bg writer to flush past us.
+        // Kick the bg writer awake — it sleeps on flush_cond until a
+        // committer signals there's something to flush.
+        self.flush_cond.notify_all();
+        // Wait briefly for it to flush past us.
         let g = self.flush_cond_lock.lock().unwrap();
         let timeout = std::time::Duration::from_millis(2);
         let (_g, timed_out) = self
