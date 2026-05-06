@@ -14,11 +14,32 @@
 //! when we get there.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
 use crate::page::Rid;
 use crate::transaction_manager::{TransactionManager, TxnStatus};
+
+/// Rid is `(PageId u32, slot u16)`; SipHash on a 6-byte tuple was
+/// showing up in TPC-B profiles. This is a tiny multiplicative
+/// hasher tuned for the (u32, u16) shape — page bits get a Fibonacci
+/// shuffle, slot is xor-folded in.
+#[derive(Default, Clone, Copy)]
+struct RidHasher(u64);
+impl Hasher for RidHasher {
+    #[inline] fn finish(&self) -> u64 { self.0.wrapping_mul(0x9E3779B97F4A7C15) }
+    #[inline] fn write_u32(&mut self, n: u32) {
+        self.0 = self.0.wrapping_mul(0x9E3779B97F4A7C15) ^ n as u64;
+    }
+    #[inline] fn write_u16(&mut self, n: u16) {
+        self.0 = self.0.wrapping_mul(0x9E3779B97F4A7C15) ^ n as u64;
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes { self.0 = self.0.wrapping_mul(0x100000001B3) ^ b as u64; }
+    }
+}
+type RidMap<V> = HashMap<Rid, V, BuildHasherDefault<RidHasher>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LockMode {
@@ -95,7 +116,7 @@ impl LockState {
 /// `lock` / `unlock_all` on different rids only block under the same
 /// shard's lock — not the global table.
 struct Shard {
-    table: Mutex<HashMap<Rid, LockState>>,
+    table: Mutex<RidMap<LockState>>,
     cond: Condvar,
 }
 
@@ -124,7 +145,7 @@ impl LockManager {
     pub fn with_timeout(timeout: Duration) -> Self {
         let shards = (0..NUM_SHARDS)
             .map(|_| Shard {
-                table: Mutex::new(HashMap::new()),
+                table: Mutex::new(RidMap::default()),
                 cond: Condvar::new(),
             })
             .collect();
