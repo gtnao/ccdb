@@ -391,9 +391,15 @@ impl<S: Read + Write> Connection<S> {
     // --- low level ---
 
     fn write_message(&mut self, msg_type: u8, body: &[u8]) -> Result<()> {
+        // Header (tag + length) is built on the stack to avoid the
+        // per-message heap allocation a "concat into a Vec" form
+        // pays. Two write_all calls instead of three; the body is
+        // passed straight through.
         let len = (body.len() + 4) as i32;
-        self.stream.write_all(&[msg_type])?;
-        self.stream.write_all(&len.to_be_bytes())?;
+        let mut hdr = [0u8; 5];
+        hdr[0] = msg_type;
+        hdr[1..5].copy_from_slice(&len.to_be_bytes());
+        self.stream.write_all(&hdr)?;
         self.stream.write_all(body)?;
         self.stream.flush()?;
         Ok(())
